@@ -84,7 +84,7 @@ Each effective `FM_HOME` contains private operational directories.
 
 - Task metadata, append-only status events, and endpoint signals.
 - Watcher and wake-queue coordination, away-mode state, and generated Relay artifacts.
-- The unchanged-state wake record `state/.wake-hash` (`fm_wake_gate` in `bin/fm-wake-lib.sh` owns its fields and the forced-wake interval).
+- The unchanged-state wake record `state/.wake-hash` (`fm_wake_gate` in `bin/fm-wake-lib.sh` owns its fields and the forced-wake interval) and the optional stop order `state/HOLD` (`bin/fm-hold.sh` sets it, `fm_hold_refuse` in `bin/fm-wake-lib.sh` owns the check that makes spawn, relaunch and the secondmate auto-relaunch refuse with exit 75 until its `until=` time).
 - Inactive terminal-outcome receipts under `state/terminal-outcomes/`.
 - Enabled extension working namespaces under `state/extensions/`.
 - Parent-side remote ledger copies under `state/secondmate-summary-cache/`.

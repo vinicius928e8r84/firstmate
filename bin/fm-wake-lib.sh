@@ -3108,3 +3108,62 @@ fm_wake_gate() {  # <subject-key> [task-id] [state-dir]
   rm -f "$file.seen.$$" 2>/dev/null
   [ "$absorb" -eq 0 ]
 }
+
+# state/HOLD: the one operator file that stops the fleet from starting work. It holds
+# optional `until=<epoch or ISO UTC>` and `reason=<text>` lines (bin/fm-hold.sh sets,
+# clears and shows it). While it exists and its `until` has not passed, every launching
+# path - bin/fm-spawn.sh (fresh and --relaunch), bin/fm-control.sh relaunch and the
+# watcher's secondmate auto-relaunch - calls fm_hold_refuse and stops; an expired
+# `until` means no HOLD. An unreadable file or an `until` that cannot be parsed counts
+# as a HOLD in force, because refusing is the safe error for a stop order.
+# shellcheck disable=SC2034 # Read by the launching scripts that call fm_hold_refuse.
+FM_HOLD_EXIT=75
+
+fm_hold_file() { printf '%s\n' "${FM_HOLD_FILE:-$STATE/HOLD}"; }
+
+# 0 when a HOLD is in force; sets FM_HOLD_UNTIL (epoch, empty when open-ended) and FM_HOLD_REASON.
+fm_hold_active() {
+  local file line value now epoch
+  FM_HOLD_UNTIL='' FM_HOLD_REASON=''
+  file=$(fm_hold_file)
+  [ -e "$file" ] || [ -L "$file" ] || return 1
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    FM_HOLD_REASON='the HOLD file is not a readable regular file'
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      reason=*) FM_HOLD_REASON=${line#reason=} ;;
+      until=*)
+        value=${line#until=}
+        case "$value" in
+          '') ;;
+          *[!0-9]*)
+            _fm_wake_require_classify
+            if epoch=$(fm_utc_iso_to_epoch "$value" 2>/dev/null) && [ -n "$epoch" ]; then
+              FM_HOLD_UNTIL=$epoch
+            else
+              FM_HOLD_REASON="${FM_HOLD_REASON:+$FM_HOLD_REASON; }until=$value is not an epoch or ISO UTC time, so the HOLD stays in force"
+              FM_HOLD_UNTIL=''
+            fi
+            ;;
+          *) FM_HOLD_UNTIL=$value ;;
+        esac
+        ;;
+    esac
+  done < "$file"
+  [ -n "$FM_HOLD_UNTIL" ] || return 0
+  now=$(date +%s)
+  [ "$now" -lt "$FM_HOLD_UNTIL" ]
+}
+
+# 0 to proceed; 1 after printing the refusal when a HOLD is in force. Callers exit
+# FM_HOLD_EXIT (75, "try later", the same code a capacity refusal uses).
+fm_hold_refuse() {  # <what is being refused>
+  fm_hold_active || return 0
+  printf 'error: %s refused: %s is present%s%s. Run bin/fm-hold.sh clear (or wait for its until= time) to resume.\n' \
+    "$1" "$(fm_hold_file)" \
+    "${FM_HOLD_REASON:+ ($FM_HOLD_REASON)}" \
+    "${FM_HOLD_UNTIL:+, in force until epoch $FM_HOLD_UNTIL}" >&2
+  return 1
+}

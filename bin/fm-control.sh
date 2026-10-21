@@ -299,7 +299,10 @@ if [ -n "$control_want_value" ]; then
   die "--$control_want_value requires a value"
 fi
 
-if [ "$VERB" != relaunch ]; then
+if [ "$VERB" = relaunch ]; then
+  # state/HOLD stops a relaunch before the old agent is touched (bin/fm-wake-lib.sh owns the check).
+  fm_hold_refuse "relaunch of $RAW_ID" || exit "$FM_HOLD_EXIT"
+else
   [ "$HARNESS_SET" = 0 ] && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] && [ "$NOTE_SET" = 0 ] \
     || die "--harness, --model, --effort, and --note apply to 'relaunch' only"
 fi

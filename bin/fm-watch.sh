@@ -1118,6 +1118,9 @@ secondmate_liveness_tick() {
       relaunchable)
         if [ -e "$bound_marker" ] || [ -L "$bound_marker" ]; then
           :
+        elif fm_hold_active; then
+          # state/HOLD: no attempt, ledger row, kill or wake while the stop order stands.
+          triage_log "secondmate $id relaunch held by $(fm_hold_file)${FM_HOLD_REASON:+ ($FM_HOLD_REASON)}; endpoint left $FM_SM_LIVE_STATE"
         elif ! attempts=$(fm_secondmate_liveness_recent_attempts "$id" "$SECONDMATE_LIVENESS_WINDOW_SECS"); then
           err="relaunch ledger is unreadable; endpoint left $FM_SM_LIVE_STATE"
         elif [ "$attempts" -ge "$SECONDMATE_LIVENESS_MAX_ATTEMPTS" ]; then
