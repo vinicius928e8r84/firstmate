@@ -412,6 +412,12 @@ A candidate must meet all of these conditions:
 - The task's ordinary metadata must be absent.
 - The candidate must have exactly one tab and exactly one pane.
 
+Before any lock or per-candidate API call, one cheap local prefilter runs over the whole candidate list.
+It parses the home's journals once without a subprocess per journal, takes one API snapshot for the run, and declines a candidate that has no unique journal, has live task metadata, or already fails the exact topology grammar in that one snapshot.
+The prefilter only ever declines; a candidate it passes repeats the complete locked proof below.
+The run is bounded by `FM_HERDR_CLEANUP_BUDGET` seconds (default 40).
+Candidates not reached inside it are reported on one `deferred` warning line, are never closed on a weaker proof, and are retried by the next locked session start.
+
 Firstmate then cleans up the candidate in this order:
 
 1. Acquire the existing task-id spawn lock, and then the shared named-session presentation lock.
@@ -432,6 +438,8 @@ The process proof requires all of these:
 - A sleeping or idle shell state.
 
 The proof retries strict single samples for a bounded settle window, because an idle interactive shell transiently hosts short-lived prompt helpers.
+Cleanup additionally ends that window after `FM_HERDR_CLEANUP_PROOF_WINDOW` seconds (default 4) and at least two samples, so a busy pane costs a few samples instead of every retry on a host where each Herdr call is slow.
+Ending early only refuses; a pass still requires one fully clean sample.
 A genuinely busy pane fails every sample.
 Any foreground command, child process, active shell job, unknown shell, unreadable process table, missing field, or API error preserves the pane.
 
