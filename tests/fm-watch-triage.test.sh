@@ -1243,13 +1243,19 @@ unknown_alive_stale_case() {  # <evidence: status|worktree|none>
 }
 
 test_unknown_alive_stale_is_bounded_after_its_first_alarm() {
+  # These cases pin the watcher's own re-surface cadence, so the unchanged-state gate (tests/fm-wake-gate.test.sh) is forced open.
+  export FM_WAKE_HASH_FORCE_SECS=0
   unknown_alive_stale_case status
   unknown_alive_stale_case worktree
+  unset FM_WAKE_HASH_FORCE_SECS
   pass "an unknown-but-alive pane with progress evidence alarms once per bounded pause-resurface window"
 }
 
 test_unknown_alive_stale_without_progress_keeps_surfacing() {
+  # These cases pin the watcher's own re-surface cadence, so the unchanged-state gate (tests/fm-wake-gate.test.sh) is forced open.
+  export FM_WAKE_HASH_FORCE_SECS=0
   unknown_alive_stale_case none
+  unset FM_WAKE_HASH_FORCE_SECS
   pass "an unknown-but-alive pane without progress evidence keeps surfacing every new hash"
 }
 
@@ -2357,7 +2363,8 @@ test_terminal_stale_surfaced() {
   window="test:fm-done"
   printf 'finished, awaiting review' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/done.meta"
-  printf 'done: PR https://example.test/pr/3\n' > "$state/done.status"
+  # A done: line is excluded here on purpose: tests/fm-wake-gate.test.sh owns the done gate.
+  printf 'needs-decision: pick A or B\n' > "$state/done.status"
   sig=$(seen_sig "$state/done.status"); printf '%s' "$sig" > "$state/.seen-done_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "finished, awaiting review")
@@ -6315,6 +6322,10 @@ test_terminal_first_sight_drops_a_finished_write_deferral_chain() {
 
   # Same pane, first sight again, but nothing overrides the status line now, so it
   # surfaces. That path drops the idle-window timer, so it must drop the chain too.
+  # The line becomes a needs-decision: because a stale pane behind done: no longer
+  # surfaces at all (tests/fm-wake-gate.test.sh owns that gate).
+  printf 'needs-decision: pick the validation target\n' > "$state/chain-first.status"
+  sig=$(seen_sig "$state/chain-first.status"); printf '%s' "$sig" > "$state/.seen-chain-first_status"
   rm -f "$state/.stale-$key" "$state/.stale-since-$key"
   printf '1\n' > "$state/.count-$key"
   : > "$state/.writing-since-$key"

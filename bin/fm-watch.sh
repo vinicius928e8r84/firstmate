@@ -2581,8 +2581,15 @@ captain_call_stale_bound() {  # <window-key> <task>
 # Both records of an ordinary crew wait bound it (see task_captain_call_open
 # above): the status line the worker declared, and the backlog hold firstmate
 # recorded once the captain took the work in hand.
+# 0 when the task's latest status line is a done: report.
+status_last_is_done() {  # <status-file>
+  local line
+  line=$(last_status_line "$1")
+  [ -n "$line" ] && [ "$(status_line_verb "$line")" = "done" ]
+}
+
 surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
-  local win=$1 h=$2 dialog=${3-} key task last declared=1 bounded=1 throttled=1 until now reason=''
+  local win=$1 h=$2 dialog=${3-} key task last declared=1 bounded=1 throttled=1 gated=1 until now reason=''
   key=$(window_key "$win")
   task=$(window_to_task "$win" "$STATE")
   last=$(status_declared_wait_line "$STATE/$task.status")
@@ -2620,6 +2627,12 @@ surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
   elif [ -n "$STALE_WAIT_DECLARATION" ]; then
     bounded=0
   fi
+  # A declared wait keeps its own bounded re-surface cadence; the gate is for undeclared quiet panes.
+  if [ "$throttled" -ne 0 ] && [ "$declared" -ne 0 ] && ! fm_wake_gate "stale:$win:nonterminal" "$task"; then
+    triage_log "absorbed non-terminal stale (state unchanged since this alarm was delivered): $win"
+    throttled=0
+    gated=0
+  fi
   if [ "$throttled" -ne 0 ]; then
     reason=$(stale_reason_naming_dialog "stale: $win" "$dialog")
     fm_wake_append stale "$win" "$reason" || exit 1
@@ -2645,7 +2658,7 @@ surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
     clear_pause_state "$key"
   fi
   if [ "$throttled" -eq 0 ]; then
-    triage_log "absorbed non-terminal stale (declared wait or open captain call already re-surfaced this window): $win"
+    [ "$gated" -eq 0 ] || triage_log "absorbed non-terminal stale (declared wait or open captain call already re-surfaced this window): $win"
     return 0
   fi
   wake "$reason"
@@ -3904,6 +3917,14 @@ EOF
               date +%s > "$ssf"
               clear_write_tracking "$key"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
+            elif status_last_is_done "$STATE/$task.status"; then
+              # A finished task has nothing left to supervise: its done: line was
+              # already presented as a signal, so a pane going quiet behind it is
+              # not an alarm. Teardown, not a wake, retires it.
+              printf '%s' "$h" > "$sf"
+              rm -f "$ssf"
+              clear_write_tracking "$key"
+              triage_log "absorbed stale (latest status is done): $w"
             elif captain_call_stale_bound "$key" "$task"; then
               # The line is captain-relevant and stays so, but the backlog says
               # the captain already holds this work: further NEW pane hashes with
@@ -3917,6 +3938,11 @@ EOF
               wedge_episode_end "$key" 0 1
               clear_write_tracking "$key"
               triage_log "absorbed stale (open captain call already surfaced for this status): $w"
+            elif ! fm_wake_gate "stale:$w:terminal" "$task"; then
+              printf '%s' "$h" > "$sf"
+              rm -f "$ssf"
+              clear_write_tracking "$key"
+              triage_log "absorbed stale (state unchanged since this alarm was delivered): $w"
             else
               stale_reason=$(stale_reason_naming_dialog "stale: $w" "$dialog")
               fm_wake_append stale "$w" "$stale_reason" || exit 1
@@ -4076,9 +4102,14 @@ EOF
     # without exiting); the away-mode daemon, when present, owns triage and wants
     # every heartbeat.
     if afk_present; then
-      fm_wake_append heartbeat heartbeat heartbeat || exit 1
+      if fm_wake_gate heartbeat; then
+        fm_wake_append heartbeat heartbeat heartbeat || exit 1
+        touch "$STATE/.last-heartbeat"
+        wake "heartbeat"
+      fi
       touch "$STATE/.last-heartbeat"
-      wake "heartbeat"
+      echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
+      triage_log "absorbed heartbeat (state unchanged since the last delivered heartbeat)"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant event the per-wake path absorbed by mistake.
       # Enqueue first, then record every status log surfaced through its end so the

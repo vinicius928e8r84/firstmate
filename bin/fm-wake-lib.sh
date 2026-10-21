@@ -3047,3 +3047,64 @@ EOF
 
   return 0
 }
+
+# Unchanged-state gate for stale and heartbeat wakes (docs/configuration.md owns
+# the state/.wake-hash record). The model is woken for a repeat alarm only when
+# something it could act on changed. A heartbeat is judged against the whole-fleet
+# digest (the last line of every state/*.status, the backlog and the captain
+# asks); a stale alarm about one task is judged against that task's own digest (its
+# last status line plus the backlog and ask lines naming it), so unrelated traffic
+# cannot re-arm it. state/.wake-hash holds the fleet digest, the epoch the record
+# was last forced, and one seen=<subject>=<digest> line per alarm already delivered.
+# A new subject or a changed digest always delivers, a repeat is absorbed, and
+# every FM_WAKE_HASH_FORCE_SECS (default 6h) the record resets so a genuinely stuck
+# worker is never hidden. Event wakes (new status line, check result, failure,
+# open decision, unread steering) never pass through here.
+FM_WAKE_HASH_FORCE_SECS="${FM_WAKE_HASH_FORCE_SECS:-21600}"
+
+fm_wake_state_digest() {  # [state-dir] [task-id]
+  local state=${1:-$STATE} task=${2:-} data f
+  data="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+  {
+    if [ -n "$task" ]; then
+      printf '%s\n' "$(tail -n 1 "$state/$task.status" 2>/dev/null)"
+      grep -F -- "$task" "$data/backlog.md" "$data/captain-asks.tsv" 2>/dev/null
+    else
+      for f in "$state"/*.status; do
+        [ -f "$f" ] || continue
+        printf '%s\t%s\n' "${f##*/}" "$(tail -n 1 "$f" 2>/dev/null)"
+      done
+      cat "$data/backlog.md" "$data/captain-asks.tsv" 2>/dev/null
+    fi
+  } | LC_ALL=C cksum | tr -s ' \t' '--'
+}
+
+# 0 = deliver the wake (and remember the subject), 1 = absorb it as unchanged.
+fm_wake_gate() {  # <subject-key> [task-id] [state-dir]
+  local key=$1 task=${2:-} state=${3:-$STATE} file fleet scoped now forced_at absorb=0 line
+  file="$state/.wake-hash"
+  fleet=$(fm_wake_state_digest "$state") || return 0
+  scoped=$fleet
+  [ -z "$task" ] || scoped=$(fm_wake_state_digest "$state" "$task") || return 0
+  now=$(date +%s)
+  forced_at=$(sed -n 's/^forced_at=//p' "$file" 2>/dev/null | head -n 1)
+  case "$forced_at" in ''|*[!0-9]*) forced_at=0 ;; esac
+  if [ $((now - forced_at)) -ge "$FM_WAKE_HASH_FORCE_SECS" ]; then
+    forced_at=$now
+    : > "$file.seen.$$"
+  else
+    grep -Fxq -- "seen=$key=$scoped" "$file" 2>/dev/null && absorb=1
+    # keep every other subject's record; this key is rewritten below
+    while IFS= read -r line; do
+      case "$line" in "seen=$key="*) ;; seen=*) printf '%s\n' "$line" ;; esac
+    done 2>/dev/null < "$file" > "$file.seen.$$"
+  fi
+  {
+    printf 'hash=%s\nforced_at=%s\n' "$fleet" "$forced_at"
+    cat "$file.seen.$$" 2>/dev/null
+    printf 'seen=%s=%s\n' "$key" "$scoped"
+  } > "$file.tmp.$$" 2>/dev/null
+  mv -f "$file.tmp.$$" "$file" 2>/dev/null || rm -f "$file.tmp.$$" 2>/dev/null
+  rm -f "$file.seen.$$" 2>/dev/null
+  [ "$absorb" -eq 0 ]
+}
