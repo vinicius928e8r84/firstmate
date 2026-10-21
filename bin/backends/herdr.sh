@@ -614,8 +614,20 @@ fm_backend_herdr_projection_journal_field() {  # <journal> <key>
 # fm_backend_herdr_projection_journal_snapshot: validate a version 1 attempt
 # journal or a version 2 exact projection binding without sourcing shell code.
 # Version 2 sets FM_BACKEND_HERDR_JOURNAL_* globals for same-process callers.
+# The journal is read in ONE pass with no subprocess: each key must occur on
+# exactly one line, its value is everything after that line's first "=", and the
+# newline count must be 3 (version 1) or 12 (version 2). The earlier shape
+# forked grep, cut, and wc for every field, about 40 processes per journal, which
+# made a walk over the home's journals cost minutes under host CPU contention
+# (fm_backend_herdr_projection_journal_field remains for single-field readers).
 fm_backend_herdr_projection_journal_snapshot() {  # <journal> <task-id>
-  local journal=$1 id=$2 lines expected_label expected_task_label exact
+  local journal=$1 id=$2 line lines=0 expected_label expected_task_label exact
+  local n_version=0 n_task_id=0 n_projection_id=0 n_home=0 n_session=0
+  local n_workspace_id=0 n_tab_id=0 n_pane_id=0 n_parent_workspace_id=0
+  local n_parent_label=0 n_workspace_label=0 n_task_label=0
+  local v_version='' v_task_id='' v_projection_id='' v_home='' v_session=''
+  local v_workspace_id='' v_tab_id='' v_pane_id='' v_parent_workspace_id=''
+  local v_parent_label='' v_workspace_label='' v_task_label=''
   FM_BACKEND_HERDR_JOURNAL_VERSION=""
   FM_BACKEND_HERDR_JOURNAL_TASK_ID=""
   FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID=""
@@ -629,10 +641,33 @@ fm_backend_herdr_projection_journal_snapshot() {  # <journal> <task-id>
   FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL=""
   FM_BACKEND_HERDR_JOURNAL_TASK_LABEL=""
   [ -f "$journal" ] && [ ! -L "$journal" ] || return 1
-  lines=$(wc -l < "$journal" 2>/dev/null | tr -d '[:space:]')
-  FM_BACKEND_HERDR_JOURNAL_VERSION=$(fm_backend_herdr_projection_journal_field "$journal" version) || return 1
-  FM_BACKEND_HERDR_JOURNAL_TASK_ID=$(fm_backend_herdr_projection_journal_field "$journal" task_id) || return 1
-  FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID=$(fm_backend_herdr_projection_journal_field "$journal" projection_id) || return 1
+  while :; do
+    if IFS= read -r line; then
+      lines=$((lines + 1))
+    elif [ -z "$line" ]; then
+      break
+    fi
+    case $line in
+      version=*) n_version=$((n_version + 1)); v_version=${line#*=} ;;
+      task_id=*) n_task_id=$((n_task_id + 1)); v_task_id=${line#*=} ;;
+      projection_id=*) n_projection_id=$((n_projection_id + 1)); v_projection_id=${line#*=} ;;
+      home=*) n_home=$((n_home + 1)); v_home=${line#*=} ;;
+      session=*) n_session=$((n_session + 1)); v_session=${line#*=} ;;
+      workspace_id=*) n_workspace_id=$((n_workspace_id + 1)); v_workspace_id=${line#*=} ;;
+      tab_id=*) n_tab_id=$((n_tab_id + 1)); v_tab_id=${line#*=} ;;
+      pane_id=*) n_pane_id=$((n_pane_id + 1)); v_pane_id=${line#*=} ;;
+      parent_workspace_id=*) n_parent_workspace_id=$((n_parent_workspace_id + 1)); v_parent_workspace_id=${line#*=} ;;
+      parent_label=*) n_parent_label=$((n_parent_label + 1)); v_parent_label=${line#*=} ;;
+      workspace_label=*) n_workspace_label=$((n_workspace_label + 1)); v_workspace_label=${line#*=} ;;
+      task_label=*) n_task_label=$((n_task_label + 1)); v_task_label=${line#*=} ;;
+    esac
+  done 2>/dev/null < "$journal"
+  [ "$n_version" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_VERSION=$v_version
+  [ "$n_task_id" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_TASK_ID=$v_task_id
+  [ "$n_projection_id" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID=$v_projection_id
   [ "$FM_BACKEND_HERDR_JOURNAL_TASK_ID" = "$id" ] || return 1
   [ "${#FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID}" -eq 22 ] || return 1
   case "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID" in
@@ -643,15 +678,24 @@ fm_backend_herdr_projection_journal_snapshot() {  # <journal> <task-id>
     2:12) ;;
     *) return 1 ;;
   esac
-  FM_BACKEND_HERDR_JOURNAL_HOME=$(fm_backend_herdr_projection_journal_field "$journal" home) || return 1
-  FM_BACKEND_HERDR_JOURNAL_SESSION=$(fm_backend_herdr_projection_journal_field "$journal" session) || return 1
-  FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID=$(fm_backend_herdr_projection_journal_field "$journal" workspace_id) || return 1
-  FM_BACKEND_HERDR_JOURNAL_TAB_ID=$(fm_backend_herdr_projection_journal_field "$journal" tab_id) || return 1
-  FM_BACKEND_HERDR_JOURNAL_PANE_ID=$(fm_backend_herdr_projection_journal_field "$journal" pane_id) || return 1
-  FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID=$(fm_backend_herdr_projection_journal_field "$journal" parent_workspace_id) || return 1
-  FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL=$(fm_backend_herdr_projection_journal_field "$journal" parent_label) || return 1
-  FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL=$(fm_backend_herdr_projection_journal_field "$journal" workspace_label) || return 1
-  FM_BACKEND_HERDR_JOURNAL_TASK_LABEL=$(fm_backend_herdr_projection_journal_field "$journal" task_label) || return 1
+  [ "$n_home" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_HOME=$v_home
+  [ "$n_session" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_SESSION=$v_session
+  [ "$n_workspace_id" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID=$v_workspace_id
+  [ "$n_tab_id" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_TAB_ID=$v_tab_id
+  [ "$n_pane_id" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_PANE_ID=$v_pane_id
+  [ "$n_parent_workspace_id" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID=$v_parent_workspace_id
+  [ "$n_parent_label" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL=$v_parent_label
+  [ "$n_workspace_label" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL=$v_workspace_label
+  [ "$n_task_label" = 1 ] || return 1
+  FM_BACKEND_HERDR_JOURNAL_TASK_LABEL=$v_task_label
   case "$FM_BACKEND_HERDR_JOURNAL_HOME" in
     /*) ;;
     *) return 1 ;;
@@ -669,7 +713,8 @@ fm_backend_herdr_projection_journal_snapshot() {  # <journal> <task-id>
   [ -n "$FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL" ] \
     && [ -n "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" ] \
     && [ -n "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL" ] || return 1
-  expected_label=$(fm_backend_herdr_projection_workspace_label "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID")
+  fm_backend_herdr_projection_workspace_label_into expected_label \
+    "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID"
   expected_task_label="fm-$id"
   [ "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" = "$expected_label" ] \
     && [ "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL" = "$expected_task_label" ]
@@ -750,8 +795,8 @@ fm_backend_herdr_projection_journal_replace_endpoint() {  # <journal> <task-id> 
 # Removes firstmate/, 2ndmate-<id>/, and a presentation-level fm- owner
 # prefix when present. The ordinary task tab remains fm-<id> and is not
 # built by this helper.
-fm_backend_herdr_projection_concise_task_label() {  # <task-id>
-  local task=$1
+fm_backend_herdr_projection_concise_task_label_into() {  # <out-var> <task-id>
+  local task=$2
   case "$task" in
     firstmate/*) task=${task#firstmate/} ;;
     2ndmate-*/*) task=${task#*/} ;;
@@ -759,15 +804,29 @@ fm_backend_herdr_projection_concise_task_label() {  # <task-id>
   case "$task" in
     fm-*) task=${task#fm-} ;;
   esac
-  printf '%s' "$task"
+  printf -v "$1" '%s' "$task"
+}
+
+fm_backend_herdr_projection_concise_task_label() {  # <task-id>
+  local label
+  fm_backend_herdr_projection_concise_task_label_into label "$1"
+  printf '%s' "$label"
 }
 
 # fm_backend_herdr_projection_workspace_label: presentation-only child label.
 # Format is literal U+2514 BOX DRAWINGS LIGHT UP AND RIGHT, one space, the
 # concise task label, then the unchanged · p:<full-22-char-token> suffix.
 # Labels and tokens remain non-authoritative correlators only.
+fm_backend_herdr_projection_workspace_label_into() {  # <out-var> <task-id> <projection-id>
+  local concise
+  fm_backend_herdr_projection_concise_task_label_into concise "$2"
+  printf -v "$1" '└ %s · p:%s' "$concise" "$3"
+}
+
 fm_backend_herdr_projection_workspace_label() {  # <task-id> <projection-id>
-  printf '└ %s · p:%s' "$(fm_backend_herdr_projection_concise_task_label "$1")" "$2"
+  local label
+  fm_backend_herdr_projection_workspace_label_into label "$1" "$2"
+  printf '%s' "$label"
 }
 
 # fm_backend_herdr_presentation_session_lock_path: one account-private lock
@@ -1399,17 +1458,29 @@ fm_backend_herdr_pid_is_bare_shell() {  # <ps-bin> <pid>
 # its prompt, spawning starship as a second foreground process for a few
 # samples), so the proof retries strict single samples for a bounded settle
 # window and succeeds on the first fully clean one; a genuinely busy pane
-# fails every sample and still refuses.
+# fails every sample and still refuses. FM_BACKEND_HERDR_IDLE_SHELL_PROOF_WINDOW
+# (seconds, unset by default) additionally ends the retries once that much wall
+# time has passed after at least two samples.
 # This is the single owner of the idle-shell proof; the session-start
 # projection cleanup and every pane-death close path both rely on it.
 fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
   local attempt=0 max_attempts=${FM_BACKEND_HERDR_IDLE_SHELL_PROOF_POLLS:-10}
+  local window=${FM_BACKEND_HERDR_IDLE_SHELL_PROOF_WINDOW:-} started=$SECONDS
+  case "$window" in *[!0-9]*) window= ;; esac
   while :; do
     if fm_backend_herdr_pane_idle_shell_sample "$1" "$2"; then
       return 0
     fi
     attempt=$((attempt + 1))
     [ "$attempt" -lt "$max_attempts" ] || return 1
+    # An optional wall-clock cap on the settle window, for a caller that runs
+    # on the session-start path: a sample costs one Herdr API call, so on a
+    # CPU-contended host the whole attempt count can take tens of seconds for a
+    # pane that is simply busy. Stopping early only refuses; a pass still needs
+    # one fully clean sample, and two samples are always taken.
+    if [ -n "$window" ] && [ "$attempt" -ge 2 ] && [ $((SECONDS - started)) -ge "$window" ]; then
+      return 1
+    fi
     sleep 0.1
   done
 }

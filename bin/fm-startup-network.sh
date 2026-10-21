@@ -570,7 +570,10 @@ EOF
   # retains its own tighter per-scan bound inside this outer bound. Findings
   # need no report translation: the scan writes its ordinary durable
   # inactive-outcome wakes directly. A child shell composes the two executable
-  # owners only so fm_run_timed can govern them as one process group.
+  # owners only so fm_run_timed can govern them as one process group. The scan
+  # reads local task state and the sweeps probe remote hosts and project
+  # clones, so neither waits for the other: they run concurrently and the
+  # stage ends when both have, with the sweeps' status as its own.
   # The sweeps get whatever the lock waits above left of the stage budget.
   budget=$(seconds_until "$stage_deadline")
   if [ "$sweep_locked" -eq 1 ]; then
@@ -579,8 +582,17 @@ EOF
       FM_BOOTSTRAP_NETWORK=only FM_BOOTSTRAP_NETWORK_LOCK_PID="$lock_pid" \
       bash -c '
         script_dir=$1
-        "$script_dir/fm-inactive-reconcile.sh" scan --startup >/dev/null 2>&1 || true
-        exec "$script_dir/fm-bootstrap.sh"
+        (
+          . "$script_dir/fm-timing-lib.sh"
+          scan_stamp=$(fm_timing_now_ms)
+          "$script_dir/fm-inactive-reconcile.sh" scan --startup >/dev/null 2>&1 || true
+          fm_timing_record phase inactive-scan "$scan_stamp"
+        ) &
+        scan_pid=$!
+        "$script_dir/fm-bootstrap.sh"
+        sweeps_rc=$?
+        wait "$scan_pid" || true
+        exit "$sweeps_rc"
       ' _ "$SCRIPT_DIR" >"$out" 2>&1 || rc=$?
   else
     fm_run_timed "$budget" env FM_BOOTSTRAP_NETWORK=only FM_BOOTSTRAP_DETECT_ONLY=1 \
