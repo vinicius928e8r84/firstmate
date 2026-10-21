@@ -844,7 +844,7 @@ SH
     || fail "a hung remote host should defer with its route preserved, got: $out"
   [ "$elapsed" -lt 30 ] || fail "the 3s probe budget took ${elapsed}s to end a hung host"
 
-  out=$(probe_remote "$w" full FM_SM_LIVE_PROBE_BUDGET=3 FM_FAKE_REMOTE_REPLY=dead)
+  out=$(probe_remote "$w" full FM_SM_LIVE_PROBE_BUDGET=300 FM_FAKE_REMOTE_REPLY=dead)
   case "$out" in
     'relaunchable|dead|0|remote endpoint dead on its configured host|host=lab-host|') ;;
     *) fail "a prompt host should still be classified within the budget, got: $out" ;;

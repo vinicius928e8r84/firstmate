@@ -144,7 +144,7 @@ fm_sm_live_remote() {  # <id> <fm-command> [args...]
 # fm_secondmate_liveness_probe <meta> <id> <full|poll>
 #
 # In full mode a remote route's whole probe (readiness doctor, state, route) is
-# bounded by FM_SM_LIVE_PROBE_BUDGET seconds (default 45). A probe cut off by it
+# bounded by FM_SM_LIVE_PROBE_BUDGET seconds (default 60). A probe cut off by it
 # is the same unknown-remote-completion verdict as exit 255 - skipped, route
 # preserved, never evidence of death - and says so with a "deferred" reason; the
 # watcher's secondmate liveness tick repeats the probe, so nothing is dropped.
@@ -172,8 +172,8 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
   FM_SM_LIVE_CAUSE='' FM_SM_LIVE_WHERE='' FM_SM_LIVE_REASON='' FM_SM_LIVE_LINE=''
   local window harness remote_host remote_rc out agent_state readiness_reason route_out remote_backend
   local probe_budget
-  probe_budget=${FM_SM_LIVE_PROBE_BUDGET:-45}
-  case "$probe_budget" in ''|*[!0-9]*|0) probe_budget=45 ;; esac
+  probe_budget=${FM_SM_LIVE_PROBE_BUDGET:-60}
+  case "$probe_budget" in ''|*[!0-9]*|0) probe_budget=60 ;; esac
   window=$(fm_meta_get "$meta" window)
   [ -n "$window" ] || { FM_SM_LIVE_STATUS=silent; return 0; }
   harness=$(fm_meta_get "$meta" harness)

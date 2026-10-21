@@ -292,6 +292,10 @@ bootstrap_parallel_finish() {
     [ -f "$f" ] || continue
     SECONDMATE_RESPAWNED_IDS="$SECONDMATE_RESPAWNED_IDS $(tr -d '\n' < "$f")"
   done
+  for f in "$BOOTSTRAP_PAR_DIR"/deferred.*; do
+    [ -f "$f" ] || continue
+    SECONDMATE_DEFERRED_IDS="$SECONDMATE_DEFERRED_IDS $(tr -d '\n' < "$f")"
+  done
   rm -rf "$BOOTSTRAP_PAR_DIR"
   unset FM_BOOTSTRAP_PARALLEL_DIR BOOTSTRAP_PAR_DIR BOOTSTRAP_PAR_N
 }
@@ -300,6 +304,17 @@ secondmate_note_respawned() {  # <id>
   SECONDMATE_RESPAWNED_IDS="$SECONDMATE_RESPAWNED_IDS $1"
   [ -n "${FM_BOOTSTRAP_PARALLEL_DIR:-}" ] || return 0
   printf '%s\n' "$1" > "$FM_BOOTSTRAP_PARALLEL_DIR/respawned.$1"
+}
+
+# A secondmate whose remote liveness probe ran out its budget this run is not
+# reachable right now, so the convergence sweep that follows it skips that mate
+# rather than spend its own, longer budget on the same silent host. Both sweeps
+# are idempotent, so the next start repeats the convergence.
+SECONDMATE_DEFERRED_IDS=""
+secondmate_note_deferred() {  # <id>
+  SECONDMATE_DEFERRED_IDS="$SECONDMATE_DEFERRED_IDS $1"
+  [ -n "${FM_BOOTSTRAP_PARALLEL_DIR:-}" ] || return 0
+  printf '%s\n' "$1" > "$FM_BOOTSTRAP_PARALLEL_DIR/deferred.$1"
 }
 
 fleet_sync_origin_backed_project_count() {
@@ -628,6 +643,12 @@ secondmate_sync() {
 
   secondmate_sync_remote_one() {  # <id> <home> <remote-host>
     local id=$1 _home=$2 remote_host=$3
+    case " $SECONDMATE_DEFERRED_IDS " in
+      *" $id "*)
+        echo "SECONDMATE_SYNC: secondmate $id: skipped: deferred: its liveness probe on $remote_host exceeded its budget in this run, so convergence waits for the next start"
+        return 0
+        ;;
+    esac
     local sync_out='' sync_rc inherit_out='' inherit_rc nudge_needed remote_marker remote_pending converged out remote_lock remote_generation
     local budget deadline left
     budget=$(remote_convergence_budget)
@@ -772,6 +793,7 @@ secondmate_liveness_sweep() {
   [ -d "$STATE" ] || return 0
   local meta id remote_host label __fm_timing_stamp parallel=0
   SECONDMATE_RESPAWNED_IDS=""
+  SECONDMATE_DEFERRED_IDS=""
   if bootstrap_parallel_begin; then
     parallel=1
   fi
@@ -832,6 +854,9 @@ secondmate_liveness_one() {  # <meta> <id>
       ;;
     skipped)
       echo "SECONDMATE_LIVENESS: secondmate $id: skipped: $FM_SM_LIVE_REASON"
+      case "$FM_SM_LIVE_REASON" in
+        deferred:*) secondmate_note_deferred "$id" ;;
+      esac
       ;;
   esac
   fm_secondmate_liveness_unlock "$id"
@@ -1304,6 +1329,7 @@ backlog_inflight_ids() {
   printf '%s\n' "$out" | LC_ALL=C awk '
     /^count: [0-9]+$/ { count = $2 + 0; have_count = 1; next }
     /^tasks\[[0-9]+\]\{/ { in_rows = 1; next }
+    in_rows && /^[^ ]/ { in_rows = 0 }
     in_rows && /^  [^ ]/ { id = $0; sub(/^  /, "", id); sub(/,.*/, "", id); print id; rows++; next }
     END { exit !(have_count && rows + 0 == count) }
   '

@@ -456,6 +456,8 @@ case "${1:-}" in
         printf 'count: 3\n'
         printf 'tasks[3]{id,state,kind,repo,title}:\n'
         printf '  live-1,in_flight,ship,alpha,"first"\n  live-2,in_flight,ship,alpha,"second"\n  live-3,in_flight,ship,alpha,"third"\n'
+        # the real listing ends with an indented help hint that is not a row
+        printf 'help[1]:\n  - Run `tasks-axi show <id>` for full notes on a task\n'
         ;;
       *) printf 'count: 0\ntasks[0]{id,state,kind,repo,title}:\n' ;;
     esac
