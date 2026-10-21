@@ -427,4 +427,85 @@ grep -q '^BACKLOG_RECONCILE: wedged-task: ' "$DIGEST" \
   || fail "the wedged item must be reported by name as a partial reconcile: $(cat "$DIGEST")"
 pass "an unreachable backlog backend degrades to a loud partial reconcile naming the item it could not read"
 
+# --- half three: owned in-flight records are read in one listing -------------
+# The reconcile sweep once ran one `tasks-axi show` per owned record, a whole
+# tasks-axi process each, so a home with a live fleet spent a minute or more of
+# every start on rows it then left alone. A record whose row one complete
+# in-flight listing names needs no probe; a record that listing does not name
+# still takes the per-item read, and the queued-row heal is unchanged.
+
+BATCH="$TMP_ROOT/batch"
+BATCH_HOME="$BATCH/home"
+BATCH_FAKEBIN="$BATCH/fakebin"
+BATCH_LOG="$BATCH/tasks-axi.log"
+mkdir -p "$BATCH_HOME/state" "$BATCH_HOME/data" "$BATCH_HOME/config" "$BATCH_FAKEBIN"
+fm_fake_exit0 "$BATCH_FAKEBIN" tmux node chrome-devtools-axi gh treehouse
+cat > "$BATCH_FAKEBIN/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_TEST_BATCH_LOG:?}"
+case "${1:-}" in
+  --version) printf '%s\n' '0.2.6'; exit 0 ;;
+  update) [ "${2:-}" = --help ] && printf '%s\n' 'usage: tasks-axi update <id> [flags]' '  --body-file <path>' '  --archive-body'; exit 0 ;;
+  mv) [ "${2:-}" = --help ] && printf '%s\n' 'usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>'; exit 0 ;;
+  hold) [ "${2:-}" = --help ] && printf '%s\n' 'usage: tasks-axi hold <id> [flags]' '  --kind captain' '  --until <date>'; exit 0 ;;
+  list)
+    case "$*" in
+      *"--state in_flight"*)
+        if [ -e "${FM_TEST_BATCH_LIST_FAILS:-/nonexistent}" ]; then exit 1; fi
+        printf 'count: 3\n'
+        printf 'tasks[3]{id,state,kind,repo,title}:\n'
+        printf '  live-1,in_flight,ship,alpha,"first"\n  live-2,in_flight,ship,alpha,"second"\n  live-3,in_flight,ship,alpha,"third"\n'
+        ;;
+      *) printf 'count: 0\ntasks[0]{id,state,kind,repo,title}:\n' ;;
+    esac
+    exit 0
+    ;;
+  show)
+    if [ "${2:-}" = healme ]; then
+      printf '  state: queued\n  held: no\n  blocked: no\n'
+      exit 0
+    fi
+    printf 'code: NOT_FOUND\n' >&2
+    exit 1
+    ;;
+  start) exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$BATCH_FAKEBIN/tasks-axi"
+printf '# Backlog\n' > "$BATCH_HOME/data/backlog.md"
+for batch_id in live-1 live-2 live-3 healme stranger; do
+  fm_write_meta "$BATCH_HOME/state/$batch_id.meta" \
+    "window=firstmate:fm-$batch_id" "worktree=/nonexistent/$batch_id" \
+    'project=alpha' 'harness=claude' 'mode=no-mistakes' 'yolo=off'
+done
+
+run_batch_bootstrap() {  # extra env assignments as arguments
+  : > "$BATCH_LOG"
+  env "$@" FM_TEST_BATCH_LOG="$BATCH_LOG" FM_HOME="$BATCH_HOME" FM_BOOTSTRAP_NETWORK=skip \
+    PATH="$BATCH_FAKEBIN:$BASE_PATH" "$ROOT/bin/fm-bootstrap.sh" > "$BATCH/bootstrap.out" 2>&1 || true
+}
+
+run_batch_bootstrap FM_TEST_UNUSED=1
+[ "$(grep -c '^list .*--state in_flight' "$BATCH_LOG")" -eq 1 ] \
+  || fail "the sweep did not read the in-flight rows in one listing: $(cat "$BATCH_LOG")"
+for batch_id in live-1 live-2 live-3; do
+  grep -q "^show $batch_id" "$BATCH_LOG" \
+    && fail "an in-flight record was read one by one although the listing named it: $(cat "$BATCH_LOG")"
+done
+grep -q '^show healme' "$BATCH_LOG" || fail "a record the listing did not name skipped its authoritative read: $(cat "$BATCH_LOG")"
+grep -q '^show stranger' "$BATCH_LOG" || fail "an unlisted record skipped its authoritative read: $(cat "$BATCH_LOG")"
+grep -q '^start healme' "$BATCH_LOG" || fail "the queued-row heal no longer runs: $(cat "$BATCH_LOG")"
+grep -q 'marked healme in flight' "$BATCH/bootstrap.out" || fail "the heal was not reported: $(cat "$BATCH/bootstrap.out")"
+pass "reconcile names every in-flight record from one listing and still reads and heals the rest"
+
+: > "$BATCH/list-fails"
+run_batch_bootstrap FM_TEST_BATCH_LIST_FAILS="$BATCH/list-fails"
+for batch_id in live-1 live-2 live-3 healme stranger; do
+  grep -q "^show $batch_id" "$BATCH_LOG" \
+    || fail "a failed listing must fall back to the per-item read of $batch_id: $(cat "$BATCH_LOG")"
+done
+pass "a failed in-flight listing falls back to the authoritative per-item read for every record"
+
 echo "# fm-backlog-read-bound.test.sh: all assertions passed"

@@ -22,11 +22,13 @@
 # FM_REMOTE_READINESS_OUT always holds the output of the last run, which carries
 # the check lines, the remaining human: gaps, and their exact operator actions.
 
+# The FM_REMOTE_READINESS_* results are consumed by the sourcing caller, so every
+# assignment here reads as unused to ShellCheck.
+# shellcheck disable=SC2034
+
 # shellcheck source=bin/fm-timeout-lib.sh
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/fm-timeout-lib.sh"
 
-# Consumed by the sourcing caller, so every assignment reads as unused here.
-# shellcheck disable=SC2034
 FM_REMOTE_READINESS_OUT=
 FM_REMOTE_READINESS_TIMED_OUT=0
 

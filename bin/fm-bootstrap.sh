@@ -1289,8 +1289,36 @@ crew_dispatch_validate() {
 # restart rather than waiting for a parent's cross-home nudge; the fleet
 # snapshot's classifier and bin/fm-secondmate-reconcile.sh's nudge stay as
 # backstops for what this cannot see. Never reads or writes another home.
+# One in-flight listing in place of one `tasks-axi show` per owned record.
+# Prints the id of every in-flight row, one per line, and succeeds only when the
+# listing is demonstrably complete (the reported count equals the rows parsed).
+# A row listed here is in flight, so the per-item probe would have read a state
+# other than "queued no no" and done nothing; every id this does not name, and
+# every failure or doubt, still takes the authoritative per-item probe. Each
+# `show` is a whole tasks-axi process, a second or more on a contended host,
+# and a home carries one record per live task.
+backlog_inflight_ids() {
+  local out
+  out=$(FM_TASKS_AXI_TIMEOUT=${FM_BACKLOG_ROW_TIMEOUT_SECS:-10} \
+    fm_backlog_row_list "$DATA" --state in_flight --limit 100000) || return 1
+  printf '%s\n' "$out" | LC_ALL=C awk '
+    /^count: [0-9]+$/ { count = $2 + 0; have_count = 1; next }
+    /^tasks\[[0-9]+\]\{/ { in_rows = 1; next }
+    in_rows && /^  [^ ]/ { id = $0; sub(/^  /, "", id); sub(/,.*/, "", id); print id; rows++; next }
+    END { exit !(have_count && rows + 0 == count) }
+  '
+}
+
+backlog_inflight_listed() {  # <id> <newline-separated-ids>
+  case $'\n'"$2"$'\n' in
+    *$'\n'"$1"$'\n'*) return 0 ;;
+  esac
+  return 1
+}
+
 backlog_record_reconcile() {
   local marker meta control_lock meta_lock id row label has_record=0 gate_status
+  local inflight_ids='' inflight_known=0
   # A fresh home with no state directory has no physical task records to pair.
   # Keep bootstrap diagnostics working without creating state just for a no-op.
   [ -e "$STATE" ] || [ -L "$STATE" ] || return 0
@@ -1366,6 +1394,9 @@ backlog_record_reconcile() {
     break
   done
   [ "$has_record" = 1 ] || return 0
+  if inflight_ids=$(backlog_inflight_ids); then
+    inflight_known=1
+  fi
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || [ -L "$meta" ] || continue
     if ! fm_backlog_record_present "$meta" "task record" "$STATE"; then
@@ -1387,7 +1418,9 @@ backlog_record_reconcile() {
     if [ "$(fm_meta_get "$meta" kind)" != secondmate ] \
        && [ "$(fm_meta_get "$meta" cleanup_recovery)" != orca ]; then
       row=
-      if fm_backlog_row_probe "$DATA" "$id"; then
+      if [ "$inflight_known" = 1 ] && backlog_inflight_listed "$id" "$inflight_ids"; then
+        :
+      elif fm_backlog_row_probe "$DATA" "$id"; then
         row=$FM_BACKLOG_ROW_STATE
       elif [ "$FM_BACKLOG_ROW_RESULT" != not_found ]; then
         echo "BACKLOG_RECONCILE: $id: worker record exists but its backlog item could not be read: $FM_BACKLOG_ROW_ERROR"
