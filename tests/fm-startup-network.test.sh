@@ -818,7 +818,9 @@ GITHUB_TOKEN=ghp_supersecretvalue" \
     "the timing artifact carried a command line through"
   assert_grep 'unrecordable' "$home/state/.startup-network.timings" \
     "free text was silently dropped instead of being marked unrecordable"
-  lines=$(grep -c . "$home/state/.startup-network.timings")
+  # The stage's own inactive-scan record is not the stand-in sweep's, so it is
+  # left out of the count this forgery check is about.
+  lines=$(grep -v $'\tinactive-scan\t' "$home/state/.startup-network.timings" | grep -c .)
   [ "$lines" -eq 2 ] \
     || fail "one sweep record plus the stage total should be 2 lines, got $lines"
 
