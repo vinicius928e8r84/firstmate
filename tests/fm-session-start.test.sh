@@ -557,6 +557,17 @@ SH
   chmod +x "$fakebin/herdr"
 }
 
+# make_fake_nice_noop <fakebin>: the locked start launches the home summary
+# refresh detached through nice, and that refresh would keep reading the hung
+# fake endpoint after the digest returns. A test that counts leftover hung
+# processes is about the digest's own per-task bound, so the refresh is dropped
+# for it; the detached launch itself is covered by
+# test_home_summary_refresh_does_not_block_the_digest.
+make_fake_nice_noop() {
+  printf '#!/bin/sh\nexit 0\n' > "$1/nice"
+  chmod +x "$1/nice"
+}
+
 # run_session_start <home> <root> <path>
 # Drop every harness env marker from bin/fm-harness.sh detect_own so the
 # surrounding interactive shell cannot leak past the suite's fake ps harness.
@@ -1544,14 +1555,15 @@ EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
   make_fake_herdr_hanging_read "$fakebin" "p-live" "p-slow"
+  make_fake_nice_noop "$fakebin"
 
   printf 'window=sess:p-slow\nkind=ship\nbackend=herdr\n' > "$home/state/task-a-slow.meta"
   printf 'window=sess:p-live\nkind=ship\nbackend=herdr\n' > "$home/state/task-z-live.meta"
 
-  # The same fake hangs the side-band home summary before the endpoint section.
-  # Bound that unrelated refresh at 5s instead of paying its production 60s;
-  # the endpoint's own 2s bound and descendant-cleanup assertions stay real.
-  out=$(FM_HOME_SUMMARY_TIMEOUT=5 FM_SESSION_START_ENDPOINT_TIMEOUT=2 \
+  # The same fake would hang the side-band home summary, which make_fake_nice_noop
+  # drops here; the endpoint's own 2s bound and descendant-cleanup assertions
+  # stay real.
+  out=$(FM_SESSION_START_ENDPOINT_TIMEOUT=2 \
     run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
 
   expect_code 0 "$status" "a hung endpoint read must not fail the digest"
@@ -1580,13 +1592,14 @@ EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
   make_fake_herdr_hanging_read "$fakebin" "p-live" "p-slow"
+  make_fake_nice_noop "$fakebin"
 
   printf 'window=sess:p-slow\nkind=ship\nbackend=herdr\n' > "$home/state/task-a-slow.meta"
   printf 'window=sess:p-live\nkind=ship\nbackend=herdr\n' > "$home/state/task-z-live.meta"
 
-  # Only the unrelated summary gets a shorter fixture budget. The invalid
-  # endpoint value must still fall back to the real 10s production bound.
-  out=$(FM_HOME_SUMMARY_TIMEOUT=5 FM_SESSION_START_ENDPOINT_TIMEOUT=00 \
+  # The invalid endpoint value must still fall back to the real 10s production
+  # bound.
+  out=$(FM_SESSION_START_ENDPOINT_TIMEOUT=00 \
     run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
 
   expect_code 0 "$status" "a padded-zero per-read bound must not fail the digest"
