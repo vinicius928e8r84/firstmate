@@ -218,6 +218,113 @@ EOF
   pass "Pi extension reports external healthy watcher output"
 }
 
+# Drives the inline drain and turn-end acknowledgement (bin/fm-wake-inline.sh).
+# The arm stub prints a healthy-watcher line so the extension raises its owned
+# failure wake, which is the cheapest real route into sendWake. The drain stub
+# stands in for bin/fm-wake-drain.sh and logs every acknowledgement it receives.
+# <case> <drain-mode ok|fail> <consume yes|no> <stop-reason>
+run_pi_inline_wake_case() {
+  local name=$1 mode=$2 consume=$3 stop=$4 repo home drain
+  repo="$TMP_ROOT/pi-inline-$name-root"
+  home="$TMP_ROOT/pi-inline-$name-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  cp "$ROOT/bin/fm-wake-inline.sh" "$repo/bin/fm-wake-inline.sh"
+  chmod +x "$repo/bin/fm-wake-inline.sh"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'watcher: healthy pid=1 (beacon 0s)\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  drain="$TMP_ROOT/pi-inline-$name-drain.sh"
+  cat > "$drain" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --ack-through ]; then
+  printf 'ack %s\n' "$*" >> "$INLINE_ACK_LOG"
+  exit 0
+fi
+[ "$INLINE_DRAIN_MODE" = ok ] || { echo "wake drain: boom" >&2; exit 1; }
+printf 'signal one done: PR https://example.test/pull/1\n'
+printf 'WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 7 --recovery-generation gen1\n' >&2
+SH
+  chmod +x "$drain"
+  : > "$TMP_ROOT/pi-inline-$name-acks.log"
+  PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" \
+    FM_WAKE_INLINE_DRAIN="$drain" INLINE_DRAIN_MODE="$mode" INLINE_ACK_LOG="$TMP_ROOT/pi-inline-$name-acks.log" \
+    INLINE_CONSUME="$consume" INLINE_STOP="$stop" \
+    FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 FM_WATCH_REARM_RETRY_LIMIT=2 \
+    node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let commandHandler = null;
+let prompt = "";
+const pi = {
+  on(name, fn) { handlers.set(name, fn); },
+  registerCommand(name, options) { if (name === "fm-watch-arm-pi") commandHandler = options.handler; },
+  registerTool() {},
+  sendUserMessage: async (message) => { prompt = message; },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await commandHandler("", { ui: { notify() {} } });
+for (let i = 0; i < 400 && !prompt; i += 1) await new Promise((r) => setTimeout(r, 20));
+console.log(`PROMPT-START\n${prompt}\nPROMPT-END`);
+const settle = async () => { await handlers.get("agent_settled")?.(); };
+await settle();
+if (process.env.INLINE_CONSUME === "yes") {
+  handlers.get("message_start")?.({ message: { role: "user", content: [{ type: "text", text: prompt }] } });
+}
+handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: process.env.INLINE_STOP }] });
+await settle();
+process.exit(0);
+EOF
+}
+
+test_pi_wake_is_drained_inline_and_acknowledged_when_the_run_settles() {
+  local out acks
+  out=$(run_pi_inline_wake_case clean ok yes stop)
+  acks=$(cat "$TMP_ROOT/pi-inline-clean-acks.log")
+  case "$out" in *"WAKE DRAIN (bin/fm-wake-drain.sh already ran"*) ;; *) fail "wake text carries no inline drain: $out" ;; esac
+  case "$out" in *"signal one done: PR https://example.test/pull/1"*) ;; *) fail "wake text lost the drained rows: $out" ;; esac
+  case "$out" in *"Run bin/fm-wake-drain.sh first"*) fail "an inline wake still tells the model to drain: $out" ;; esac
+  case "$out" in *"WAKE_ACK_REQUIRED"*) fail "the ack line leaked into the wake text: $out" ;; esac
+  case "$out" in *"acknowledges wakes through 7"*) ;; *) fail "wake text does not announce the automatic acknowledgement: $out" ;; esac
+  [ "$acks" = "ack --ack-through 7 --recovery-generation gen1" ] \
+    || fail "the settled run must acknowledge exactly the drained cutoff once, got: $acks"
+  pass "Pi wake carries the drain inline and the settled run acknowledges it"
+}
+
+test_pi_wake_is_not_acknowledged_before_it_is_consumed() {
+  local acks
+  run_pi_inline_wake_case unconsumed ok no stop > /dev/null
+  acks=$(cat "$TMP_ROOT/pi-inline-unconsumed-acks.log")
+  [ -z "$acks" ] || fail "a wake Pi accepted but the model never read was acknowledged: $acks"
+  pass "Pi wake is not acknowledged until the model's run consumed it"
+}
+
+test_pi_aborted_or_errored_run_leaves_the_wake_unacknowledged() {
+  local stop acks
+  for stop in aborted error length; do
+    run_pi_inline_wake_case "run-$stop" ok yes "$stop" > /dev/null
+    acks=$(cat "$TMP_ROOT/pi-inline-run-$stop-acks.log")
+    [ -z "$acks" ] || fail "a run that ended '$stop' acknowledged its wake: $acks"
+  done
+  pass "Pi aborted, errored, and truncated runs leave their wake durable"
+}
+
+test_pi_failing_inline_drain_falls_back_to_the_model_drain() {
+  local out acks
+  out=$(run_pi_inline_wake_case fallback fail yes stop)
+  acks=$(cat "$TMP_ROOT/pi-inline-fallback-acks.log")
+  case "$out" in *"Run bin/fm-wake-drain.sh first and handle the queued wake."*) ;; *) fail "fallback lost the model drain instruction: $out" ;; esac
+  case "$out" in *"WAKE DRAIN"*) fail "a failed inline drain still claims an inline drain: $out" ;; esac
+  [ -z "$acks" ] || fail "a fallback wake must leave acknowledgement to the model, got: $acks"
+  pass "Pi wake falls back to the model drain when the inline drain fails"
+}
+
 test_pi_tool_returns_agent_tool_result() {
   local repo home plugin out status
   repo="$TMP_ROOT/pi-tool-result-root"
@@ -5679,6 +5786,10 @@ EOF
 }
 
 test_pi_extension_reports_external_healthy_watcher
+test_pi_wake_is_drained_inline_and_acknowledged_when_the_run_settles
+test_pi_wake_is_not_acknowledged_before_it_is_consumed
+test_pi_aborted_or_errored_run_leaves_the_wake_unacknowledged
+test_pi_failing_inline_drain_falls_back_to_the_model_drain
 test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop
 test_pi_scheduled_retry_call_is_owned_noop

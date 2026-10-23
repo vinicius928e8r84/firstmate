@@ -1,8 +1,10 @@
 Mode: Pi extension background wake.
 
 When this session owns supervision, in either posture:
-1. Drain first with `bin/fm-wake-drain.sh`.
-   After handling all emitted wakes and reconciling open decisions and unread status lines, run the exact `--ack-through` command printed as `WAKE_ACK_REQUIRED`; until then the work remains durable for idempotent re-handling after interruption.
+1. A watcher wake arrives with `bin/fm-wake-drain.sh` already run: the wake message carries the drain's own presentation under `WAKE DRAIN`, and the extension runs the acknowledgement (`bin/fm-wake-inline.sh`) when the run that read it settles cleanly.
+   Do not drain or acknowledge that wake again; an aborted, errored, or truncated run acknowledges nothing, so the work stays durable and is presented again by the next drain.
+   Drain first with `bin/fm-wake-drain.sh` and run the exact `--ack-through` command printed as `WAKE_ACK_REQUIRED` only when a wake message tells you to drain (the inline drain was unavailable or `FM_WAKE_INLINE=0`), and at session start.
+   Either way, reconcile open decisions and unread status lines before treating the wake as handled.
 2. Confirm the Pi primary auto-loaded both project extensions (plain `pi` or `pi-signed`, after approving project trust once per clone); if not, restart the selected executable with `-e __FM_PI_TURNEND_EXT__ -e __FM_PI_EXT__` as a trust-free fallback.
 3. Initial process cycle only: make the one required `fm_watch_arm_pi` call; if startup already owned the fleet lock, this is an ownership-based no-op.
    Use `/fm-watch-arm-pi` only as a human-entered fallback.

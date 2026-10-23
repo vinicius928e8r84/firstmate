@@ -36,12 +36,13 @@
 // consumption changes.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Text, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { runCommandAsync } from "./lib/fm-async-exec.ts";
 import { registerFirstmateTool } from "./lib/fm-native-contract.ts";
 import {
   afkPostureRecordPresent,
@@ -147,6 +148,7 @@ const fmRoot = process.env.FM_ROOT_OVERRIDE || root;
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
+const inlineScript = `${fmRoot}/bin/fm-wake-inline.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
 const handoffDir = `${state}/extensions/pi-primary-watch`;
 const actionableHandoff = `${handoffDir}/session-replacement-actionable.json`;
@@ -164,6 +166,7 @@ const armReadyTimeoutMs = positiveInteger(
   process.platform === "win32" ? 35000 : 12000,
 );
 const armRetireTimeoutMs = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 1000);
+const inlineDrainTimeoutMs = positiveInteger("FM_WAKE_INLINE_TIMEOUT_MS", 60000);
 const repairOnlyHint = "call fm_watch_arm_pi again only after a later notification says the cycle is missing, failed, or unhealthy";
 const shuttingDownMessage = "watcher: not armed - Pi session is shutting down";
 
@@ -652,21 +655,114 @@ export default function (pi: ExtensionAPI) {
     !calmPresentation.stockExportRendering &&
     !calmTranscriptClassIsVisible(itemClass);
 
+  // Inline drain and turn-end acknowledgement (bin/fm-wake-inline.sh owns the
+  // pair). The wake text carries what the model's first call used to fetch,
+  // and the acknowledgement that call's last step used to send runs when the
+  // run that consumed the text settles cleanly. Anything that stops the pair
+  // (kill switch, missing or failing script, aborted or errored turn) leaves
+  // the rows durable and the model told to drain itself, exactly as before.
+  type InlineAck = { sequence: number; generation: string };
+  const inlineWakes = new Map<string, InlineAck>();
+  let consumedInlineAcks: InlineAck[] = [];
+  let lastRunClean = true;
+
+  async function inlineDrain(): Promise<{ text: string; ack: InlineAck | null } | null> {
+    if (process.env.FM_WAKE_INLINE === "0" || !existsSync(inlineScript)) return null;
+    const ackFile = `${state}/.inline-ack.${process.pid}.${Date.now()}`;
+    try {
+      const timeout = new Promise<null>((resolveTimeout) => {
+        const timer = setTimeout(() => resolveTimeout(null), inlineDrainTimeoutMs);
+        timer.unref();
+      });
+      const run = runCommandAsync("bash", [inlineScript, "drain", "--ack-out", ackFile], {
+        cwd: fmRoot,
+        env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_CONFIG_OVERRIDE: config, FM_ROOT_OVERRIDE: fmRoot },
+      });
+      const result = await Promise.race([run, timeout]);
+      if (!result || result.status !== 0) {
+        appendExtensionLog(`inline-drain unavailable status=${result ? String(result.status) : "timeout"}`);
+        return null;
+      }
+      let ack: InlineAck | null = null;
+      try {
+        const [sequence, generation] = readFileSync(ackFile, "utf8").trim().split(" ");
+        if (/^[0-9]+$/.test(sequence ?? "") && /^[A-Za-z0-9._-]+$/.test(generation ?? "")) {
+          ack = { sequence: Number(sequence), generation };
+        }
+      } catch (error) {
+        if (nodeErrorCode(error) !== "ENOENT") return null;
+      }
+      return { text: result.stdout.trimEnd(), ack };
+    } finally {
+      try {
+        unlinkSync(ackFile);
+      } catch {}
+    }
+  }
+
+  async function wakeBody(message: string): Promise<{ text: string; ack: InlineAck | null }> {
+    const inline = await inlineDrain();
+    if (!inline) {
+      return {
+        text: `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. Watcher continuity is extension-owned.`,
+        ack: null,
+      };
+    }
+    const ackNote = inline.ack
+      ? ` Do not run its --ack-through command either: the Pi extension acknowledges wakes through ${inline.ack.sequence} when this turn ends cleanly.`
+      : "";
+    return {
+      text:
+        `FIRSTMATE WATCHER WAKE: ${message}\n\n` +
+        `WAKE DRAIN (bin/fm-wake-drain.sh already ran for this wake; do not run it again.${ackNote}):\n` +
+        `${inline.text || "(the queue held nothing further)"}\n\n` +
+        "Handle the wake. Watcher continuity is extension-owned.",
+      ack: inline.ack,
+    };
+  }
+
+  function consumeInline(text: string): void {
+    const ack = inlineWakes.get(text);
+    if (!ack) return;
+    inlineWakes.delete(text);
+    consumedInlineAcks.push(ack);
+  }
+
+  async function acknowledgeConsumedWakes(): Promise<void> {
+    const acks = consumedInlineAcks;
+    consumedInlineAcks = [];
+    if (acks.length === 0) return;
+    if (!lastRunClean) {
+      appendExtensionLog(`inline-ack skipped reason=unclean-run wakes=${acks.length}`);
+      return;
+    }
+    const newest = acks.reduce((best, item) => (item.sequence >= best.sequence ? item : best));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = await runCommandAsync("bash", [inlineScript, "ack", String(newest.sequence), newest.generation], {
+        cwd: fmRoot,
+        env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_CONFIG_OVERRIDE: config, FM_ROOT_OVERRIDE: fmRoot },
+      });
+      appendExtensionLog(`inline-ack through=${newest.sequence} attempt=${attempt} status=${String(result.status)}`);
+      if (result.status === 0) return;
+    }
+  }
+
   async function sendWake(
     owner: SessionGeneration,
     message: string,
     pending?: PendingActionableClose,
   ): Promise<boolean> {
     if (!generationIsLive(owner)) return false;
-    const content = encodeFirstmateOperationalInput(
-      "watcher",
-      `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. Watcher continuity is extension-owned.`,
-    );
+    const body = await wakeBody(message);
+    if (!generationIsLive(owner)) return false;
+    const content = encodeFirstmateOperationalInput("watcher", body.text);
+    if (body.ack) inlineWakes.set(content, body.ack);
     if (pending) owner.unconsumedWakes.set(pending.token, { content, pending });
     try {
       await pi.sendUserMessage(content, { deliverAs: "followUp" });
     } catch (error) {
       if (pending) owner.unconsumedWakes.delete(pending.token);
+      inlineWakes.delete(content);
       throw error;
     }
     // Accepted by Pi. A generation replaced while Pi was accepting it may
@@ -1228,11 +1324,25 @@ export default function (pi: ExtensionAPI) {
   pi.on?.("before_agent_start", (event) => {
     // A custom message cannot consume a pending user wake, even with equal text.
     if (!("prompt" in event)) return;
+    consumeInline(event.prompt);
     consumeWake(generation, event.prompt);
   });
   pi.on?.("message_start", (event) => {
     if (event.message.role !== "user") return;
-    consumeWake(generation, userMessageText(event.message.content));
+    const text = userMessageText(event.message.content);
+    consumeInline(text);
+    consumeWake(generation, text);
+  });
+  // A run counts as handled only when its last assistant message ended on its
+  // own; an aborted, errored, or truncated run leaves its wakes unacknowledged.
+  pi.on?.("agent_end", (event) => {
+    const messages = Array.isArray(event.messages) ? event.messages : [];
+    const last = [...messages].reverse().find((message) => (message as { role?: unknown }).role === "assistant");
+    const stopReason = String((last as { stopReason?: unknown } | undefined)?.stopReason ?? "stop");
+    lastRunClean = !["aborted", "error", "length"].includes(stopReason);
+  });
+  pi.on?.("agent_settled", async () => {
+    await acknowledgeConsumedWakes();
   });
 
   pi.on?.("session_start", async () => {
