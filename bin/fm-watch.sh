@@ -2565,6 +2565,13 @@ captain_call_stale_bound() {  # <window-key> <task>
   stale_wait_throttled "$key" "$STALE_WAIT_DECLARATION"
 }
 
+# 0 when the task's latest status line is a done: report.
+status_last_is_done() {  # <status-file>
+  local line
+  line=$(last_status_line "$1")
+  [ -n "$line" ] && [ "$(status_line_verb "$line")" = "done" ]
+}
+
 # Surface a stale pane no classifier could resolve, so firstmate inspects it: it
 # may have finished through an interactive menu that wrote no status, be waiting on
 # a decision, or be wedged. pause_state_class deliberately answers `none` for a
@@ -2584,13 +2591,6 @@ captain_call_stale_bound() {  # <window-key> <task>
 # Both records of an ordinary crew wait bound it (see task_captain_call_open
 # above): the status line the worker declared, and the backlog hold firstmate
 # recorded once the captain took the work in hand.
-# 0 when the task's latest status line is a done: report.
-status_last_is_done() {  # <status-file>
-  local line
-  line=$(last_status_line "$1")
-  [ -n "$line" ] && [ "$(status_line_verb "$line")" = "done" ]
-}
-
 surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
   local win=$1 h=$2 dialog=${3-} key task last declared=1 bounded=1 throttled=1 gated=1 until now reason=''
   key=$(window_key "$win")
@@ -3920,10 +3920,11 @@ EOF
               date +%s > "$ssf"
               clear_write_tracking "$key"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
-            elif status_last_is_done "$STATE/$task.status"; then
+            elif status_last_is_done "$STATE/$task.status" && ! task_captain_call_open "$task"; then
               # A finished task has nothing left to supervise: its done: line was
               # already presented as a signal, so a pane going quiet behind it is
-              # not an alarm. Teardown, not a wake, retires it.
+              # not an alarm. Teardown, not a wake, retires it. Work held for the
+              # captain keeps its bounded reminder, so it is excluded here.
               printf '%s' "$h" > "$sf"
               rm -f "$ssf"
               clear_write_tracking "$key"

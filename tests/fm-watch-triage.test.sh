@@ -4734,8 +4734,10 @@ test_stale_churn_without_a_captain_call_still_alarms() {
   local spec name line dir state out capture round wakes
   command -v tasks-axi >/dev/null 2>&1 \
     || { echo "skip: tasks-axi not found (unheld stale alarm)"; return 0; }
+  # A done: delivery no longer alarms on a stale pane (tests/fm-wake-gate.test.sh owns that),
+  # and these cases pin the per-hash alarm itself, so the unchanged-state gate is forced open.
+  export FM_WAKE_HASH_FORCE_SECS=0
   for spec in \
-    'unheld-delivery|done: PR https://example.invalid/pull/1 checks green' \
     'unheld-blocker|blocked: cannot reach the release host' \
     'unheld-worker-line|working: still tidying the branch'
   do
@@ -4754,6 +4756,7 @@ test_stale_churn_without_a_captain_call_still_alarms() {
       round=$((round + 1))
     done
   done
+  unset FM_WAKE_HASH_FORCE_SECS
   pass "a stale window with no open captain call keeps alarming on every new hash"
 }
 
