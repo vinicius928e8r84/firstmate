@@ -1072,6 +1072,12 @@ DRAIN_LOCK_HELD=false
 printf 'WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through %s --recovery-generation %s\n' \
   "$ACK_THROUGH" "${RECOVERY_MARKER_TOKEN##*:}" >&2
 
+# Shadow log (bin/fm-wake-shadow.sh): a record of what was presented, for a later
+# comparison of a cheaper triage with the model's own outcome. Observational only.
+if printf '%s\n' "$RAW_ROWS" | awk -F '\t' '$3 == "signal" || $3 == "check" { found = 1 } END { exit !found }'; then
+  printf '%s\n' "$RAW_ROWS" | "$SCRIPT_DIR/fm-wake-shadow.sh" record >/dev/null 2>&1 || true
+fi
+
 (print_status_presentation "$RAW_ROWS") || true
 print_branch_outcomes_section || BRANCH_OUTCOMES_RC=1
 assert_watcher_liveness
