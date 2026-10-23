@@ -212,6 +212,24 @@ The branch prompt's "Verdict: routine or captain" section owns the distinction b
 The generated [Pi supervision protocol](supervision-protocols/pi.md) owns main's event ownership, acknowledgement duty, and conversational treatment for merged outcomes, while the persisted entry itself owns captain visibility.
 A task-level routine no-change outcome or a no-change heartbeat explicitly reported with `silent=true` is delivered without a rendered note; the branch prompt owns task-level eligibility, and every other routine outcome still appends a rendered, sailboat-prefixed note.
 
+## Worker context cap (config/worker-context-cap)
+
+A worker session re-reads its whole context on every model call, so a long task pays for a large context hundreds of times.
+Pi compacts automatically once the context passes the model's window minus `compaction.reserveTokens`, which is how the primary session is capped.
+Gitignored `config/worker-context-cap` extends that cap to the Pi workers of named projects, one entry per line:
+
+```
+# <project> <cap-tokens> <model-id> <window-tokens>
+modo-caverna 250000 claude-opus-5-5 1000000
+```
+
+`<project>` is the registered project name, `<model-id>` is the worker's model without its provider prefix, and `<window-tokens>` is that model's context window as `pi --list-models` reports it.
+`bin/fm-spawn.sh` writes a git-excluded `.pi/settings.json` into the worker's worktree with `reserveTokens` equal to window minus cap, only for a Pi or pi-signed ship or scout whose project and model are both listed.
+A model or project the file does not name is never capped, so a smaller-window model cannot be handed a reserve larger than its window, and an entry whose window is under 100000 tokens above its cap is ignored.
+A worktree that already has its own `.pi/settings.json` keeps it, and cleanup and relaunch retire only the file that carries the task's own marker.
+The script header of `bin/fm-worker-context-cap.sh` owns the arithmetic and the settings it writes.
+Project settings load only for a trusted worktree, which is the same trust the worker's launch already needs.
+
 ## Pi supervision branch gate (config/supervision-branch)
 
 One word in gitignored `config/supervision-branch`, or in `FM_SUPERVISION_BRANCH`, which wins over the file, sets whether the branch takes attended wakes:

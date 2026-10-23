@@ -5884,6 +5884,22 @@ export default function (pi: any) {
   });
 }
 EOF
+    # Worker context cap (bin/fm-worker-context-cap.sh owns the config and the
+    # arithmetic): a listed project/model pair gets a project-level Pi settings
+    # file that makes auto-compaction trigger near the cap. Written into the
+    # worktree like the OpenCode plugin above and git-excluded; a worktree that
+    # already has its own .pi/settings.json (tracked or not) is left alone.
+    if [ "$KIND" != secondmate ]; then
+      cap_settings=$("$FM_ROOT/bin/fm-worker-context-cap.sh" settings "$(basename "$PROJ_ABS")" "$MODEL" "$ID" 2>/dev/null) || cap_settings=
+      if [ -n "$cap_settings" ]; then
+        if [ -e "$WT/.pi/settings.json" ] || git -C "$WT" ls-files --error-unmatch .pi/settings.json >/dev/null 2>&1; then
+          echo "note: $ID: worker context cap not applied, $WT/.pi/settings.json already exists" >&2
+        else
+          mkdir -p "$WT/.pi" && printf '%s\n' "$cap_settings" >"$WT/.pi/settings.json"
+          exclude_path '.pi/settings.json'
+        fi
+      fi
+    fi
     ;;
   omp)
     # Written OUTSIDE the worktree like Pi's, but for a different reason: omp
