@@ -1130,6 +1130,79 @@ EOF
   pass ".pi primary extension: no-tool and multi-tool runs each inject exactly one guard follow-up"
 }
 
+test_pi_guard_selfheals_before_waking_the_model() {
+  local repo home ext flag log out status
+  repo="$TMP_ROOT/pi-guard-selfheal-root"
+  home="$TMP_ROOT/pi-guard-selfheal-home"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  flag="$TMP_ROOT/pi-guard-selfheal.healed"
+  log="$TMP_ROOT/pi-guard-selfheal.log"
+  rm -f "$flag" "$log"
+  mkdir -p "$repo/.pi/extensions/lib" "$repo/bin" "$home/state"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$repo/.pi/extensions/lib/fm-operational-input.ts"
+  cp "$ROOT/bin/fm-operational-input.sh" "$repo/bin/fm-operational-input.sh"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'guard\n' >> "${FM_GUARD_LOG:?}"
+[ -e "${FM_HEALED_FLAG:?}" ] && exit 0
+echo "watcher cycle missing" >&2
+exit 2
+SH
+  cat > "$repo/bin/fm-arm-pretool-check.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh" "$repo/bin/fm-arm-pretool-check.sh"
+  out=$(PLUGIN="$ext" FM_HOME="$home" FM_GUARD_LOG="$log" FM_HEALED_FLAG="$flag" FM_GUARD_SELFHEAL_WAIT_MS=1 node --input-type=module 2>&1 <<'EOF'
+import { rmSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const bus = new Map();
+let prompts = 0;
+let heals = 0;
+let healWorks = true;
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  events: {
+    on(name, fn) { bus.set(name, fn); },
+    emit(name, data) { bus.get(name)?.(data); },
+  },
+  async sendUserMessage() { prompts += 1; },
+};
+pi.events.on("fm:watch-selfheal", (request) => {
+  heals += 1;
+  request.accepted = true;
+  request.settlement = (async () => {
+    if (healWorks) writeFileSync(process.env.FM_HEALED_FLAG, "healed\n");
+    return healWorks;
+  })();
+});
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+const settled = handlers.get("agent_settled");
+
+await settled({ type: "agent_settled" }, {});
+if (prompts !== 0) throw new Error(`a healed cycle still woke the model ${prompts} time(s)`);
+if (heals !== 1) throw new Error(`expected one heal request, saw ${heals}`);
+
+// A heal that cannot repair the cycle: the model is woken after the bounded attempts, as before.
+rmSync(process.env.FM_HEALED_FLAG, { force: true });
+healWorks = false;
+heals = 0;
+await settled({ type: "agent_settled" }, {});
+if (prompts !== 1) throw new Error(`an unhealable cycle must wake the model once, saw ${prompts}`);
+if (heals !== 2) throw new Error(`expected the default two bounded heal attempts, saw ${heals}`);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi guard must self-heal before waking the model: $out"
+  [ -z "$out" ] || fail "Pi guard self-heal test printed output: $out"
+  pass ".pi primary extension: guard asks the watcher to self-heal, wakes the model only if it cannot"
+}
+
 test_pi_extension_retries_after_followup_delivery_failure() {
   local repo home ext out status
   repo="$TMP_ROOT/pi-delivery-failure-root"
@@ -2353,6 +2426,7 @@ test_codex_hook_uses_process_pwd_when_payload_cwd_is_outside_root
 test_codex_hook_ignores_nested_git_root_guard
 test_opencode_plugin_anchors_guard_to_worktree
 test_pi_extension_injects_once_per_logical_agent_run
+test_pi_guard_selfheals_before_waking_the_model
 test_pi_extension_retries_after_followup_delivery_failure
 test_pi_extension_keeps_marker_of_live_ancestor_session
 test_hook_claude_mode_reblocks_stop_hook_active_when_unhealthy

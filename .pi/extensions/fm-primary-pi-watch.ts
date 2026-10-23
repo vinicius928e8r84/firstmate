@@ -119,6 +119,8 @@ type SessionGeneration = {
   // still delivering the wake it was started for; its bounded retry runs once
   // that delivery settles instead of being skipped by the single-flight guard.
   deferredClose: { message: string; predecessorArmPid: string } | null;
+  // A self-heal sequence is running after the retry ladder was exhausted.
+  healing: boolean;
 };
 
 function refreshWatchToolShell(
@@ -158,6 +160,12 @@ const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(exte
 const retryBaseMs = positiveInteger("FM_WATCH_REARM_RETRY_BASE_MS", 250);
 const retryMaxMs = positiveInteger("FM_WATCH_REARM_RETRY_MAX_MS", 4000);
 const retryLimit = positiveInteger("FM_WATCH_REARM_RETRY_LIMIT", 5);
+// Self-heal rounds that follow an exhausted continuity retry ladder before the
+// model is told. Each round waits twice as long as the last, starting at eight
+// times the ladder's cap (32 s by default), so a host overloaded for a few
+// minutes recovers without a model turn. Zero disables them.
+const selfHealRounds = nonNegativeInteger("FM_WATCH_SELFHEAL_ROUNDS", 3);
+const selfHealDelayMs = positiveInteger("FM_WATCH_SELFHEAL_DELAY_MS", retryMaxMs * 8);
 // 35s on Windows so the budget stays above arm's MSYS confirm default (30s in
 // bin/fm-watch-arm.sh): a slow but successful Git Bash cold start must not be
 // SIGTERMed mid-confirmation. Conditioned on win32 so other platforms keep 12s.
@@ -168,6 +176,10 @@ const armReadyTimeoutMs = positiveInteger(
 const armRetireTimeoutMs = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 1000);
 const inlineDrainTimeoutMs = positiveInteger("FM_WAKE_INLINE_TIMEOUT_MS", 60000);
 const repairOnlyHint = "call fm_watch_arm_pi again only after a later notification says the cycle is missing, failed, or unhealthy";
+// Request/answer event shared with .pi/extensions/fm-primary-turnend-guard.ts,
+// which carries the same literal: the guard emits a request object and reads
+// accepted and settlement back synchronously, like the branch dispatch offer.
+const FM_WATCH_SELFHEAL_EVENT = "fm:watch-selfheal";
 const shuttingDownMessage = "watcher: not armed - Pi session is shutting down";
 
 let nextHandoffId = 0;
@@ -212,6 +224,13 @@ const retiringGenerations = new Set<SessionGeneration>();
 const armRetired = new WeakSet<ChildProcess>();
 const armRecovery = new WeakMap<ChildProcess, { generation: string; watcherPid: string }>();
 const armPendingActionable = new WeakMap<ChildProcess, PendingActionableClose>();
+
+function nonNegativeInteger(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
 
 function positiveInteger(name: string, fallback: number): number {
   const value = Number(process.env[name]);
@@ -554,6 +573,7 @@ function createGeneration(): SessionGeneration {
     cleanupFailure: "",
     unconsumedWakes: new Map(),
     deferredClose: null,
+    healing: false,
   };
 }
 
@@ -1138,6 +1158,46 @@ export default function (pi: ExtensionAPI) {
     return { failure: `${failure}\nwatcher: FAILED - Pi extension could not restore watcher continuity after ${retryLimit} retries` };
   }
 
+  // The retry ladder is spent. Before the model is told, keep trying on a
+  // slower schedule: the failures that reached the model were an overloaded
+  // host outlasting an eight-second ladder, not a watcher that cannot run.
+  // Anything else (a child already live, a retry already scheduled, a lost
+  // lock) ends the sequence, and the model hears of it only when every round
+  // has failed.
+  async function healContinuity(owner: SessionGeneration, message: string, predecessorArmPid: string): Promise<void> {
+    if (owner.healing) return;
+    owner.healing = true;
+    let outcome = "exhausted";
+    try {
+      for (let round = 1; round <= selfHealRounds; round += 1) {
+        await new Promise((resolveWait) => {
+          const timer = setTimeout(resolveWait, selfHealDelayMs * 2 ** (round - 1));
+          timer.unref();
+        });
+        if (!generationIsLive(owner)) return;
+        if (liveArmChild(owner) || owner.retryTimer) {
+          outcome = "recovered-elsewhere";
+          return;
+        }
+        if (lockOwnership() !== "owned") break;
+        const started = startArm(owner, predecessorArmPid);
+        const child = owner.child;
+        if (started.ok && child && await waitForReadiness(child)) {
+          owner.retryFailures = 0;
+          outcome = `healed round=${round}`;
+          return;
+        }
+        appendExtensionLog(`selfheal round=${round} start=${started.ok ? "unready" : "failed"}`);
+        if (started.ok && !(await retireArm(child))) break;
+      }
+    } finally {
+      owner.healing = false;
+      appendExtensionLog(`selfheal ${outcome}`);
+    }
+    if (!generationIsLive(owner)) return;
+    surfaceFailure(owner, `watcher: FAILED - Pi extension could not restore watcher continuity after ${retryLimit} retries${selfHealRounds > 0 ? ` and ${selfHealRounds} self-heal rounds` : ""}\n${message}`);
+  }
+
   function scheduleRetry(owner: SessionGeneration, message: string, predecessorArmPid: string): void {
     if (!generationIsLive(owner) || liveArmChild(owner) || owner.retryTimer) return;
     const ownership = lockOwnership();
@@ -1147,7 +1207,7 @@ export default function (pi: ExtensionAPI) {
     }
     owner.retryFailures += 1;
     if (owner.retryFailures > retryLimit) {
-      surfaceFailure(owner, `watcher: FAILED - Pi extension could not restore watcher continuity after ${retryLimit} retries\n${message}`);
+      void healContinuity(owner, message, predecessorArmPid);
       return;
     }
     const timer = setTimeout(() => {
@@ -1320,6 +1380,47 @@ export default function (pi: ExtensionAPI) {
     if (loadFailure) surfaceFailure(owner, `${loadFailure}\n${result.message}`);
     return result;
   }
+
+  // Self-heal on request from the turn-end guard extension (same event bus).
+  // The guard asks before it wakes the model: a cycle that is only between
+  // retries, or that has no child at all, is repaired here without a model
+  // turn. Settles true once a child is established and ready; false when it
+  // cannot be (lock not owned, readiness timeout), and the guard then wakes
+  // the model exactly as it did before.
+  async function healWatcherNow(): Promise<boolean> {
+    const owner = generation;
+    if (!generationIsLive(owner) || lockOwnership() !== "owned") return false;
+    // A cycle that spent its retry budget starts a fresh one: the next child's
+    // failures are counted from zero rather than surfacing at once.
+    if (!liveArmChild(owner) && !owner.retryTimer) owner.retryFailures = 0;
+    const started = activateOwnedWatch(owner);
+    if (!started.ok) return false;
+    const deadline = Date.now() + armReadyTimeoutMs;
+    while (Date.now() < deadline) {
+      const child = liveArmChild(owner);
+      if (child) {
+        const ready = await waitForReadiness(child);
+        appendExtensionLog(`selfheal ready=${String(ready)} pid=${child.pid ?? "none"}`);
+        return ready;
+      }
+      if (!owner.retryTimer && generationIsLive(owner)) {
+        const retried = startArm(owner);
+        if (!retried.ok) return false;
+      }
+      await new Promise((resolveWait) => {
+        const timer = setTimeout(resolveWait, 100);
+        timer.unref();
+      });
+    }
+    appendExtensionLog("selfheal ready=timeout");
+    return false;
+  }
+
+  pi.events?.on?.(FM_WATCH_SELFHEAL_EVENT, (data) => {
+    const request = data as { accepted?: boolean; settlement?: Promise<boolean> | null };
+    request.accepted = true;
+    request.settlement = healWatcherNow().catch(() => false);
+  });
 
   pi.on?.("before_agent_start", (event) => {
     // A custom message cannot consume a pending user wake, even with equal text.

@@ -160,6 +160,11 @@ If the unready arm does not retire within that bound, the adapter keeps ownershi
 When that retained arm later closes, its actual close is classified as a new supervised event without replaying the earlier fallback.
 After the configured retry bound is exhausted, the adapter delivers the original wake with a typed continuity-restoration failure, even if every successor arm hung without reporting readiness.
 
+A Pi continuity retry (a watcher that closed with no wake in hand) that spends its bound is not yet surfaced: the adapter first runs self-heal rounds, each a lock-verified fresh start with a readiness wait, at doubling delays (`FM_WATCH_SELFHEAL_ROUNDS`, `FM_WATCH_SELFHEAL_DELAY_MS`).
+A round that finds a live child or a scheduled retry ends the sequence silently, and only the last failed round tells the model.
+The turn-end guard extension asks the watcher extension for the same repair over the shared event bus before it wakes the model (`FM_GUARD_SELFHEAL_ATTEMPTS`), and the guard predicate still decides afterwards.
+A wake that already carries an actionable close is never delayed by these rounds.
+
 This is deliberate Option B ordering.
 Whenever restoration succeeds, the fleet is protected before the model handles the wake.
 When restoration does not succeed, the model is never left blind.
