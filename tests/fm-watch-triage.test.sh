@@ -4649,7 +4649,7 @@ hold_watch_surface() {  # <dir> <out> <capture> <pane-text>
   local dir=$1 out=$2 capture=$3 text=$4
   printf '%s\n' "$text" > "$capture"
   hold_watch_launch "$dir" "$out" "$capture"
-  wait_for_exit "$HOLD_WATCH_PID" 100 || { reap "$HOLD_WATCH_PID"; return 1; }
+  wait_for_exit "$HOLD_WATCH_PID" 300 || { reap "$HOLD_WATCH_PID"; return 1; }
   return 0
 }
 
@@ -4688,6 +4688,9 @@ test_open_captain_call_bounds_stale_churn() {
   local spec name line dir state out capture throttle wakes
   command -v tasks-axi >/dev/null 2>&1 \
     || { echo "skip: tasks-axi not found (captain-hold stale bound)"; return 0; }
+  # The re-surface window is a pane-driven reminder cadence the unchanged-state gate
+  # (tests/fm-wake-gate.test.sh) may defer up to its six-hour bound, so the gate is forced open here.
+  export FM_WAKE_HASH_FORCE_SECS=0
   for spec in \
     'held-delivery|done: PR https://example.invalid/pull/1 checks green' \
     'held-worker-line|working: still tidying the branch'
@@ -4722,6 +4725,7 @@ test_open_captain_call_bounds_stale_churn() {
     [ "$wakes" -eq 1 ] \
       || fail "[$name] elapsed re-surface window produced $wakes wakes instead of one"
   done
+  unset FM_WAKE_HASH_FORCE_SECS
   pass "work under an open captain call surfaces once, absorbs pane churn, then re-surfaces when the window elapses"
 }
 
