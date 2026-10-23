@@ -68,6 +68,12 @@ unset FM_TASK_ID
 # against an ambient override sets TASKS_AXI_FILE itself.
 unset TASKS_AXI_FILE TASKS_AXI_BACKEND
 
+# The Pi supervision branch is off unless a home's config/supervision-branch
+# (or this variable) turns it on. Suites that exercise the branch's own
+# behavior run it in the earlier always-on mode, so the operator's gate file
+# never decides what a test sees; the gate cases set their own value.
+export FM_SUPERVISION_BRANCH=legacy
+
 # Clear the Rex block identity an operator's terminal exports. Run directly
 # inside a Rex block, the suite would otherwise auto-detect the rex backend
 # (bin/fm-backend.sh's fm_backend_detect) and place fixture tasks into the

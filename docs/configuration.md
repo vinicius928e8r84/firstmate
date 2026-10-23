@@ -177,7 +177,7 @@ This preference is local to each Firstmate home and is not part of secondmate in
 On a Pi primary, an in-process supervision branch handles eligible task-local wake rows and selected heartbeat reviews.
 Main-only rows stay on the captain-facing path.
 [docs/pi-supervision-branch.md](pi-supervision-branch.md) defines its conversation lifecycle, row eligibility, mixed-queue dispatch, heartbeat routing, and pre-drain recheck.
-Supervision is default-on: once a Pi primary session owns this home's fleet lock, the branch is eligible for every task with no captain grant file required.
+Supervision is off until `config/supervision-branch` turns it on ([gate](#pi-supervision-branch-gate-configsupervision-branch)); once it is on and a Pi primary session owns this home's fleet lock, the branch is eligible for every task with no captain grant file required.
 
 Bash absorbs a genuinely no-op heartbeat before it reaches Pi.
 Every watcher-failure alarm stays on the captain-facing main path.
@@ -211,6 +211,29 @@ The branch prompt's "Verdict: routine or captain" section owns the distinction b
 
 The generated [Pi supervision protocol](supervision-protocols/pi.md) owns main's event ownership, acknowledgement duty, and conversational treatment for merged outcomes, while the persisted entry itself owns captain visibility.
 A task-level routine no-change outcome or a no-change heartbeat explicitly reported with `silent=true` is delivered without a rendered note; the branch prompt owns task-level eligibility, and every other routine outcome still appends a rendered, sailboat-prefixed note.
+
+## Pi supervision branch gate (config/supervision-branch)
+
+One word in gitignored `config/supervision-branch`, or in `FM_SUPERVISION_BRANCH`, which wins over the file, sets whether the branch takes attended wakes:
+
+| Word | Meaning |
+| --- | --- |
+| absent, `off`, anything else | The branch declines every attended offer and main handles the wake as it always could. This is the default. |
+| `triage` | The branch takes attended wakes only while `state/wake-shadow.jsonl` holds rows and the model it would run is not a Claude model: the `config/supervision-branch-model` pin when there is one, otherwise main's own model. A Claude pin, or following a Claude main, declines. |
+| `legacy` | The earlier always-on behavior on any model, for homes that want it back. |
+
+The away-posture record `state/.afk-contract` bypasses the gate: the branch takes every row exactly as [pi-supervision-branch.md](pi-supervision-branch.md#postures) describes, whatever the gate says.
+The extension reads the gate at every offer, so a change applies to the next wake with no restart.
+
+To turn on no-op triage:
+
+1. Let the shadow log collect check and signal wakes for a few working days (`bin/fm-wake-shadow.sh summary` counts them; the script header owns the log format).
+2. Pin a non-Claude branch model with `/supervision-model` (it writes `config/supervision-branch-model`) and an effort.
+3. Write `triage` to `config/supervision-branch`.
+
+To turn it off again, delete the file or write `off`; the next wake goes to main.
+The branch can only reduce Claude spend this way: a gate that is on but cannot satisfy the shadow-log or non-Claude conditions behaves as off.
+Pass the equivalence check from the shadow log before relying on it: among the wakes the candidate rule marks `noop`, the model's own outcome must show no mutating turn over at least 300 wakes.
 
 ## Pi supervision branch model and effort (config/supervision-branch-model, config/supervision-branch-effort)
 

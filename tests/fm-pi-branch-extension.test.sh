@@ -1798,6 +1798,84 @@ EOF
   pass "branch prompt_cache_key is stable per home across sessions and distinct between homes"
 }
 
+# The attended branch gate (config/supervision-branch, docs/configuration.md "Pi
+# supervision branch gate"). The suite runs under FM_SUPERVISION_BRANCH=legacy
+# (tests/lib.sh) so the older cases keep their always-on branch; this one drives
+# the gate itself: off by default, triage only with a shadow log and a
+# non-Claude model, legacy as before, and the away posture untouched.
+test_branch_gate_defaults_off_and_triage_needs_a_shadow_log_and_a_non_claude_model() {
+  local repo home out status
+  repo="$TMP_ROOT/gate-root"
+  home="$TMP_ROOT/gate-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, defaultSessionCtx, home }; })()`);
+const { fire, dispatch, defaultSessionCtx, home } = globalThis.__t;
+import { rmSync, writeFileSync } from "node:fs";
+
+const verdict = (label) => {
+  const offer = dispatch(`signal: gate ${label}`);
+  offer.settlement?.catch(() => {});
+  return offer.accepted;
+};
+const setMode = (value) => {
+  if (value === undefined) delete process.env.FM_SUPERVISION_BRANCH;
+  else process.env.FM_SUPERVISION_BRANCH = value;
+};
+await fire("session_start", {}, defaultSessionCtx);
+
+// 1. Nothing configured: off. The wake stays with main.
+setMode(undefined);
+if (verdict("unset")) throw new Error("the branch accepted a wake with no gate configured");
+setMode("off");
+if (verdict("off")) throw new Error("the branch accepted a wake with the gate off");
+setMode("nonsense");
+if (verdict("nonsense")) throw new Error("an unrecognized gate word must mean off");
+
+// 2. The config file works like the environment variable, which wins over it.
+writeFileSync(`${home}/config/supervision-branch`, "triage\n");
+setMode(undefined);
+if (verdict("file-no-shadow")) throw new Error("triage accepted a wake with no shadow log");
+setMode("off");
+if (verdict("env-wins")) throw new Error("the environment variable did not win over the file");
+setMode(undefined);
+
+// 3. Triage with a shadow log still refuses a Claude model: main's own (provider anthropic) ...
+writeFileSync(`${home}/state/wake-shadow.jsonl`, '{"v":1}\n');
+if (verdict("claude-main")) throw new Error("triage accepted a wake while following a Claude main model");
+// ... or a Claude pin.
+writeFileSync(`${home}/config/supervision-branch-model`, "claude-bridge/claude-sonnet-5-5\n");
+if (verdict("claude-pin")) throw new Error("triage accepted a wake with a Claude pin");
+
+// 4. A non-Claude pin is accepted.
+writeFileSync(`${home}/config/supervision-branch-model`, "openai-codex/gpt-6-luna\n");
+if (!verdict("non-claude-pin")) throw new Error("triage refused a wake with a shadow log and a non-Claude pin");
+
+// 5. An empty shadow log is no log.
+writeFileSync(`${home}/state/wake-shadow.jsonl`, "");
+if (verdict("empty-shadow")) throw new Error("triage accepted a wake with an empty shadow log");
+
+// 6. legacy is the earlier always-on behavior, any model, no log needed.
+rmSync(`${home}/state/wake-shadow.jsonl`);
+rmSync(`${home}/config/supervision-branch-model`);
+setMode("legacy");
+if (!verdict("legacy")) throw new Error("legacy refused a wake");
+
+// 7. The away posture record keeps the earlier behavior whatever the gate says.
+setMode("off");
+writeFileSync(`${home}/state/.afk-contract`, "away\n");
+if (!verdict("away")) throw new Error("the away posture was refused by an off gate");
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "branch gate: $out"
+  pass "the branch gate is off by default, triage needs a shadow log and a non-Claude model, legacy and the away posture keep the earlier behavior"
+}
+
 test_branch_default_on_heartbeat_afk_and_fallback() {
   local repo broken home out status
   repo="$TMP_ROOT/gating-root"
@@ -6202,6 +6280,7 @@ test_branch_dispatch_resolves_terminal_keyed_orca_stale_row
 test_branch_dispatch_keeps_project_with_canonical_owner
 test_branch_dispatch_routes_secondmate_signal_by_new_span
 test_branch_cache_key_is_per_home_stable
+test_branch_gate_defaults_off_and_triage_needs_a_shadow_log_and_a_non_claude_model
 test_branch_default_on_heartbeat_afk_and_fallback
 test_away_record_parks_main_and_presents_after_archive
 test_away_unchanged_held_outcome_reaches_the_captain_once_until_a_new_event
