@@ -3928,7 +3928,7 @@ EOF
               # not an alarm. Teardown, not a wake, retires it. Work held for the
               # captain keeps its bounded reminder, so it is excluded here.
               printf '%s' "$h" > "$sf"
-              rm -f "$ssf"
+              wedge_episode_end "$key" 0 1
               clear_write_tracking "$key"
               triage_log "absorbed stale (latest status is done): $w"
             elif captain_call_stale_bound "$key" "$task"; then
@@ -3947,7 +3947,7 @@ EOF
             elif ! fm_wake_gate_check "stale:$w:terminal" "$task"; then
               fm_wake_gate_record
               printf '%s' "$h" > "$sf"
-              rm -f "$ssf"
+              wedge_episode_end "$key" 0 1
               clear_write_tracking "$key"
               triage_log "absorbed stale (state unchanged since this alarm was delivered): $w"
             else
@@ -4115,6 +4115,8 @@ EOF
         fm_wake_gate_record
         touch "$STATE/.last-heartbeat"
         wake "heartbeat"
+      else
+        fm_wake_gate_record
       fi
       touch "$STATE/.last-heartbeat"
       echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
