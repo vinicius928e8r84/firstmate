@@ -243,6 +243,7 @@ if [ "${1:-}" = --ack-through ]; then
   printf 'ack %s\n' "$*" >> "$INLINE_ACK_LOG"
   exit 0
 fi
+[ "$INLINE_DRAIN_MODE" = slow ] && { sleep "${INLINE_SLEEP:-2}"; INLINE_DRAIN_MODE=ok; }
 [ "$INLINE_DRAIN_MODE" = ok ] || { echo "wake drain: boom" >&2; exit 1; }
 printf 'signal one done: PR https://example.test/pull/1\n'
 printf 'WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 7 --recovery-generation gen1\n' >&2
@@ -279,6 +280,7 @@ if (process.env.INLINE_CONSUME === "yes") {
 }
 handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: process.env.INLINE_STOP }] });
 await settle();
+await new Promise((r) => setTimeout(r, Number(process.env.INLINE_LINGER_MS || 0)));
 process.exit(0);
 EOF
 }
@@ -323,6 +325,27 @@ test_pi_failing_inline_drain_falls_back_to_the_model_drain() {
   case "$out" in *"WAKE DRAIN"*) fail "a failed inline drain still claims an inline drain: $out" ;; esac
   [ -z "$acks" ] || fail "a fallback wake must leave acknowledgement to the model, got: $acks"
   pass "Pi wake falls back to the model drain when the inline drain fails"
+}
+
+test_pi_slow_inline_drain_under_the_default_cap_stays_inline() {
+  local out acks
+  out=$(INLINE_SLEEP=2 run_pi_inline_wake_case slow slow yes stop)
+  acks=$(cat "$TMP_ROOT/pi-inline-slow-acks.log")
+  case "$out" in *"WAKE DRAIN (bin/fm-wake-drain.sh already ran"*) ;; *) fail "a slow but successful drain fell back to the model: $out" ;; esac
+  [ "$acks" = "ack --ack-through 7 --recovery-generation gen1" ] || fail "slow inline drain was not acknowledged once: $acks"
+  grep -Eq 'positiveInteger\("FM_WAKE_INLINE_TIMEOUT_MS", (1[89]|[2-9][0-9])[0-9]{4}\)' "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" \
+    || fail "default inline drain cap must cover a loaded host's 45-60 s drain (>= 180 s)"
+  pass "Pi slow inline drain under the default cap stays inline and is acknowledged"
+}
+
+test_pi_timed_out_inline_drain_falls_back_and_leaves_no_orphan_ack_file() {
+  local out left
+  out=$(FM_WAKE_INLINE_TIMEOUT_MS=500 INLINE_SLEEP=2 INLINE_LINGER_MS=3500 run_pi_inline_wake_case timeout slow yes stop)
+  case "$out" in *"Run bin/fm-wake-drain.sh first and handle the queued wake."*) ;; *) fail "timed-out inline drain did not fall back: $out" ;; esac
+  case "$out" in *"WAKE DRAIN ("*) fail "timed-out inline drain still claims an inline drain: $out" ;; esac
+  left=$(find "$TMP_ROOT/pi-inline-timeout-home/state" -maxdepth 1 -name '.inline-ack.*' | head -n 1)
+  [ -z "$left" ] || fail "timed-out inline drain left an orphan ack file: $left"
+  pass "Pi timed-out inline drain falls back and removes its late ack file"
 }
 
 # Self-heal on request (the turn-end guard asks over the shared event bus before
@@ -5994,6 +6017,8 @@ test_pi_wake_is_drained_inline_and_acknowledged_when_the_run_settles
 test_pi_wake_is_not_acknowledged_before_it_is_consumed
 test_pi_aborted_or_errored_run_leaves_the_wake_unacknowledged
 test_pi_failing_inline_drain_falls_back_to_the_model_drain
+test_pi_slow_inline_drain_under_the_default_cap_stays_inline
+test_pi_timed_out_inline_drain_falls_back_and_leaves_no_orphan_ack_file
 test_pi_selfheal_request_restarts_an_exhausted_cycle_once
 test_pi_selfheal_request_is_refused_without_the_session_lock
 test_pi_selfheal_rounds_recover_before_the_model_is_told

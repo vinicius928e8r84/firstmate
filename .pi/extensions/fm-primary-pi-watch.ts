@@ -174,7 +174,11 @@ const armReadyTimeoutMs = positiveInteger(
   process.platform === "win32" ? 35000 : 12000,
 );
 const armRetireTimeoutMs = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 1000);
-const inlineDrainTimeoutMs = positiveInteger("FM_WAKE_INLINE_TIMEOUT_MS", 60000);
+// The drain itself takes 45-60 s on a loaded 4-core host (measured 48.7 s on
+// 24/10 at load 6-7), so a 60 s cap timed out on every wake and the model ran
+// the same drain again. The model's own drain is no faster, so a longer cap
+// costs no wall time and keeps the pair out of the model.
+const inlineDrainTimeoutMs = positiveInteger("FM_WAKE_INLINE_TIMEOUT_MS", 300000);
 const repairOnlyHint = "call fm_watch_arm_pi again only after a later notification says the cycle is missing, failed, or unhealthy";
 // Request/answer event shared with .pi/extensions/fm-primary-turnend-guard.ts,
 // which carries the same literal: the guard emits a request object and reads
@@ -699,6 +703,15 @@ export default function (pi: ExtensionAPI) {
         env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_CONFIG_OVERRIDE: config, FM_ROOT_OVERRIDE: fmRoot },
       });
       const result = await Promise.race([run, timeout]);
+      if (!result) {
+        // The drain keeps running and writes the ack file after this call has
+        // given up; remove it once it settles so no orphan is left in state/.
+        void run.then(() => {
+          try {
+            unlinkSync(ackFile);
+          } catch {}
+        });
+      }
       if (!result || result.status !== 0) {
         appendExtensionLog(`inline-drain unavailable status=${result ? String(result.status) : "timeout"}`);
         return null;
