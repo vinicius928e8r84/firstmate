@@ -320,6 +320,15 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
 fm_secondmate_liveness_relaunch() {  # <meta> <id> [timeout-secs]
   local meta=$1 id=$2 timeout=${3:-} relaunch_lock wait_seconds rc=0
   FM_SM_LIVE_OUT='' FM_SM_LIVE_RC=0
+  # state/HOLD stops every launching path, the bootstrap sweep included.
+  fm_sm_live_require_locks || return 1
+  if command -v fm_hold_refuse >/dev/null 2>&1 \
+      && ! FM_SM_LIVE_OUT=$(fm_hold_refuse "relaunch of $id" 2>&1); then
+    FM_SM_LIVE_STATUS=skipped
+    FM_SM_LIVE_REASON="state/HOLD is in force; endpoint left $FM_SM_LIVE_STATE"
+    FM_SM_LIVE_RC=1
+    return 1
+  fi
   if ! fm_secondmate_liveness_recent_attempts "$id" 0 >/dev/null; then
     FM_SM_LIVE_STATUS=skipped
     FM_SM_LIVE_REASON="relaunch ledger $STATE/.secondmate-relaunch-$id is unreadable; endpoint left $FM_SM_LIVE_STATE"

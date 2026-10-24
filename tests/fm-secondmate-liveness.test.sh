@@ -405,6 +405,23 @@ test_sweep_respawns_confirmed_dead_secondmate() {
   pass "sweep: a confirmed-dead secondmate endpoint is killed and respawned"
 }
 
+test_sweep_refuses_relaunch_under_hold() {
+  local w fb tmuxfb log out
+  w=$(new_world sweep-hold)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  printf 'reason=test hold\n' > "$w/home/state/HOLD"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log")
+
+  assert_not_contains "$(cat "$log")" "new-window" \
+    "a HOLD must stop the bootstrap sweep from relaunching a dead secondmate"
+  assert_not_contains "$(cat "$log")" "kill-window" \
+    "a HOLD must leave the dead endpoint untouched"
+  pass "sweep: state/HOLD stops a secondmate relaunch"
+}
+
 test_sweep_recovers_the_durable_secondmate_account() {
   local w fb tmuxfb log out
   w=$(new_world sweep-account)
@@ -858,6 +875,7 @@ test_herdr_agent_state_preserves_husk_classifier
 test_agent_state_dispatcher_and_compatibility
 test_sweep_respawns_confirmed_dead_secondmate
 test_sweep_recovers_the_durable_secondmate_account
+test_sweep_refuses_relaunch_under_hold
 test_sweep_serializes_distinct_secondmate_relaunches
 test_sweep_leaves_alive_secondmate_untouched
 test_sweep_respawns_authoritatively_missing_pi_secondmate
