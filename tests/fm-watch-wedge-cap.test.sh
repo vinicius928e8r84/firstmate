@@ -1640,7 +1640,9 @@ drive_first_sight_release() {  # <route>
       mode="absorb"
       ;;
     surface-terminal)
-      printf 'done: implementation complete, ready to validate\n' > "$statusf"
+      # A done: line no longer surfaces a stale pane (tests/fm-wake-gate.test.sh owns
+      # that), so the route that does surface needs a different captain-relevant line.
+      printf 'blocked: cannot reach the release host\n' > "$statusf"
       fire_verdict='state: working · source: run-step · validating (running)'
       route_verdict='state: unknown · source: none · no run, no busy pane'
       mode="exit"
