@@ -2185,9 +2185,26 @@ command_open() {  # <task-id> [--identity] [--distinguish-absent]
   exit 2
 }
 
+# Mirror captain calls into the captain's pending-asks registry (data/tools/fm-asks.sh), so every
+# decision held here appears in "Seguem esperando voce" without the captain registering it by hand.
+# Best effort and local: absent tool or FM_ASKS_MIRROR=0 is a no-op; it never changes this script's exit code.
+asks_mirror() {
+  local action=$1 id=${2:-} tool=${FM_HOME:-/home/factory/firstmate}/data/tools/fm-asks.sh title="" reason=""
+  shift 2 || true
+  [ -n "$id" ] && [ "${FM_ASKS_MIRROR:-1}" = 1 ] && [ -x "$tool" ] || return 0
+  while [ $# -gt 0 ]; do
+    case "$1" in --title) title=${2:-}; shift ;; --reason) reason=${2:-}; shift ;; esac; shift || true
+  done
+  if [ "$action" = add ]; then
+    "$tool" add --key "hold-$id" "${title:-$id}${reason:+: $reason}" >/dev/null 2>&1 || true
+  else
+    "$tool" done "hold-$id" >/dev/null 2>&1 || true
+  fi
+}
+
 case "${1:-}" in
-  hold) shift; command_hold "$@" ;;
-  answer) shift; command_answer "$@" ;;
+  hold) shift; ( command_hold "$@" ); rc=$?; [ "$rc" -ne 0 ] || asks_mirror add "$@"; exit "$rc" ;;
+  answer) shift; ( command_answer "$@" ); rc=$?; [ "$rc" -ne 0 ] || asks_mirror done "${1:-}"; exit "$rc" ;;
   answers) shift; command_answers "$@" ;;
   reconcile-requests) shift; command_reconcile_requests "$@" ;;
   bind) shift; command_bind "$@" ;;
