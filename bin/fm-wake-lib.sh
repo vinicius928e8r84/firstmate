@@ -3079,34 +3079,65 @@ fm_wake_state_digest() {  # [state-dir] [task-id]
   } | LC_ALL=C cksum | tr -s ' \t' '--'
 }
 
-# 0 = deliver the wake (and remember the subject), 1 = absorb it as unchanged.
-fm_wake_gate() {  # <subject-key> [task-id] [state-dir]
-  local key=$1 task=${2:-} state=${3:-$STATE} file fleet scoped now forced_at absorb=0 line
+# Read-only half of the gate: 0 = deliver the wake, 1 = absorb it as unchanged.
+# It writes nothing, because a subject recorded ahead of its wake outlives a failed
+# append: the watcher exits with nothing queued, and the retry then reads the fresh
+# record and is absorbed, so a delayed alarm becomes a lost one. The caller records
+# the delivery with fm_wake_gate_record once its own append has succeeded.
+fm_wake_gate_check() {  # <subject-key> [task-id] [state-dir]
+  local key=$1 task=${2:-} state=${3:-$STATE} file now forced_at
   file="$state/.wake-hash"
-  fleet=$(fm_wake_state_digest "$state") || return 0
-  scoped=$fleet
-  [ -z "$task" ] || scoped=$(fm_wake_state_digest "$state" "$task") || return 0
+  FM_WAKE_GATE_KEY=''
+  FM_WAKE_GATE_FLEET=$(fm_wake_state_digest "$state") || return 0
+  FM_WAKE_GATE_SCOPED=$FM_WAKE_GATE_FLEET
+  [ -z "$task" ] || FM_WAKE_GATE_SCOPED=$(fm_wake_state_digest "$state" "$task") || return 0
   now=$(date +%s)
   forced_at=$(sed -n 's/^forced_at=//p' "$file" 2>/dev/null | head -n 1)
   case "$forced_at" in ''|*[!0-9]*) forced_at=0 ;; esac
+  FM_WAKE_GATE_KEY=$key
+  FM_WAKE_GATE_STATE=$state
+  FM_WAKE_GATE_FORCED_AT=$forced_at
+  FM_WAKE_GATE_RESET=0
   if [ $((now - forced_at)) -ge "$FM_WAKE_HASH_FORCE_SECS" ]; then
-    forced_at=$now
-    : > "$file.seen.$$"
-  else
-    grep -Fxq -- "seen=$key=$scoped" "$file" 2>/dev/null && absorb=1
+    FM_WAKE_GATE_FORCED_AT=$now
+    FM_WAKE_GATE_RESET=1
+    return 0
+  fi
+  ! grep -Fxq -- "seen=$key=$FM_WAKE_GATE_SCOPED" "$file" 2>/dev/null
+}
+
+# Record the subject judged by the last fm_wake_gate_check as delivered. A gate
+# that could not compute its digest checked nothing and records nothing.
+fm_wake_gate_record() {
+  local key=${FM_WAKE_GATE_KEY:-} state=${FM_WAKE_GATE_STATE:-} file line
+  [ -n "$key" ] || return 0
+  file="$state/.wake-hash"
+  : > "$file.seen.$$"
+  if [ "$FM_WAKE_GATE_RESET" -eq 0 ]; then
     # keep every other subject's record; this key is rewritten below
     while IFS= read -r line; do
       case "$line" in "seen=$key="*) ;; seen=*) printf '%s\n' "$line" ;; esac
     done 2>/dev/null < "$file" > "$file.seen.$$"
   fi
   {
-    printf 'hash=%s\nforced_at=%s\n' "$fleet" "$forced_at"
+    printf 'hash=%s\nforced_at=%s\n' "$FM_WAKE_GATE_FLEET" "$FM_WAKE_GATE_FORCED_AT"
     cat "$file.seen.$$" 2>/dev/null
-    printf 'seen=%s=%s\n' "$key" "$scoped"
+    printf 'seen=%s=%s\n' "$key" "$FM_WAKE_GATE_SCOPED"
   } > "$file.tmp.$$" 2>/dev/null
   mv -f "$file.tmp.$$" "$file" 2>/dev/null || rm -f "$file.tmp.$$" 2>/dev/null
   rm -f "$file.seen.$$" 2>/dev/null
-  [ "$absorb" -eq 0 ]
+  FM_WAKE_GATE_KEY=''
+  return 0
+}
+
+# 0 = deliver the wake (and remember the subject), 1 = absorb it as unchanged.
+# For a caller that appends a durable wake after the decision, use
+# fm_wake_gate_check and record only once that append has succeeded.
+fm_wake_gate() {  # <subject-key> [task-id] [state-dir]
+  local rc=0
+  fm_wake_gate_check "$@" || rc=$?
+  fm_wake_gate_record
+  return "$rc"
 }
 
 # state/HOLD: the one operator file that stops the fleet from starting work. It holds

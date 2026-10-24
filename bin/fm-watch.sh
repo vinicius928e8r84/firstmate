@@ -2631,7 +2631,8 @@ surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
     bounded=0
   fi
   # A declared wait keeps its own bounded re-surface cadence; the gate is for undeclared quiet panes.
-  if [ "$throttled" -ne 0 ] && [ "$declared" -ne 0 ] && ! fm_wake_gate "stale:$win:nonterminal" "$task"; then
+  if [ "$throttled" -ne 0 ] && [ "$declared" -ne 0 ] && ! fm_wake_gate_check "stale:$win:nonterminal" "$task"; then
+    fm_wake_gate_record
     triage_log "absorbed non-terminal stale (state unchanged since this alarm was delivered): $win"
     throttled=0
     gated=0
@@ -2639,6 +2640,7 @@ surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
   if [ "$throttled" -ne 0 ]; then
     reason=$(stale_reason_naming_dialog "stale: $win" "$dialog")
     fm_wake_append stale "$win" "$reason" || exit 1
+    fm_wake_gate_record
     stale_wait_record "$key"
   fi
   printf '%s' "$h" > "$STATE/.stale-$key"
@@ -3942,7 +3944,8 @@ EOF
               wedge_episode_end "$key" 0 1
               clear_write_tracking "$key"
               triage_log "absorbed stale (open captain call already surfaced for this status): $w"
-            elif ! fm_wake_gate "stale:$w:terminal" "$task"; then
+            elif ! fm_wake_gate_check "stale:$w:terminal" "$task"; then
+              fm_wake_gate_record
               printf '%s' "$h" > "$sf"
               rm -f "$ssf"
               clear_write_tracking "$key"
@@ -3950,6 +3953,7 @@ EOF
             else
               stale_reason=$(stale_reason_naming_dialog "stale: $w" "$dialog")
               fm_wake_append stale "$w" "$stale_reason" || exit 1
+              fm_wake_gate_record
               stale_wait_record "$key"
               printf '%s' "$h" > "$sf"
               # Pre-cap shape kept the count here (keep-count contract).
@@ -4106,8 +4110,9 @@ EOF
     # without exiting); the away-mode daemon, when present, owns triage and wants
     # every heartbeat.
     if afk_present; then
-      if fm_wake_gate heartbeat; then
+      if fm_wake_gate_check heartbeat; then
         fm_wake_append heartbeat heartbeat heartbeat || exit 1
+        fm_wake_gate_record
         touch "$STATE/.last-heartbeat"
         wake "heartbeat"
       fi

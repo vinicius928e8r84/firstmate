@@ -74,6 +74,27 @@ test_gate_new_subject_delivers_and_repeat_is_absorbed() {
   pass "the gate delivers a new subject once and absorbs an unchanged repeat"
 }
 
+# The record belongs to a wake that was delivered. A check alone leaves none, so a
+# watcher whose durable append failed and which exits is retried, not absorbed.
+test_gate_check_alone_records_nothing_until_the_delivery_is_recorded() {
+  local dir state
+  dir=$(make_case gate-check-only); state="$dir/state"; mkdir -p "$dir/data"
+  printf 'blocked: waiting on a review\n' > "$state/t1.status"
+  gate_check() {
+    FM_STATE_OVERRIDE=$state FM_DATA_OVERRIDE="$dir/data" bash -c '
+      . "$1"
+      fm_wake_gate_check stale:w1:terminal t1 || exit 1
+      [ "${2:-}" != record ] || fm_wake_gate_record
+    ' _ "$ROOT/bin/fm-wake-lib.sh" "${1:-}"
+  }
+  gate_check || fail "a first alarm was absorbed"
+  gate_check || fail "an alarm whose delivery was never recorded was absorbed on retry"
+  [ ! -e "$state/.wake-hash" ] || fail "a check with no recorded delivery left a gate record"
+  gate_check record || fail "the retry after an unrecorded check was absorbed"
+  gate_check && fail "a repeat after a recorded delivery was delivered"
+  pass "a gate check records nothing until the caller records the delivered wake"
+}
+
 test_gate_redelivers_when_the_tasks_own_state_changes() {
   local dir state
   dir=$(make_case gate-own-change); state="$dir/state"; mkdir -p "$dir/data"
@@ -218,6 +239,7 @@ SH
 }
 
 test_gate_new_subject_delivers_and_repeat_is_absorbed
+test_gate_check_alone_records_nothing_until_the_delivery_is_recorded
 test_gate_redelivers_when_the_tasks_own_state_changes
 test_gate_heartbeat_uses_the_whole_fleet_digest
 test_gate_forces_a_wake_after_the_interval

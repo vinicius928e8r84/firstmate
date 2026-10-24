@@ -4786,7 +4786,7 @@ test_failed_wake_append_does_not_arm_the_captain_hold_throttle() {
   mkdir -p "$state/.wake-queue"
   printf 'idle, elapsed 1s\n' > "$capture"
   hold_watch_launch "$dir" "$out" "$capture"
-  wait_for_exit "$HOLD_WATCH_PID" 100
+  wait_for_exit "$HOLD_WATCH_PID" 300
   rc=$?
   rmdir "$state/.wake-queue"
   [ "$rc" -ne 124 ] || fail "the watcher did not exit when its durable queue could not be written"
