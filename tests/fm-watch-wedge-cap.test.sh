@@ -1610,13 +1610,14 @@ test_wedge_cap_off_ignores_leftover_markers() {
 # for the rest of FM_CAP_HORIZON_SECS. The routes driven here are the ones that
 # need a crew-state verdict to pick between them - a captain-relevant status log
 # outranked by a live run, that same log with nothing overriding it, a
-# non-terminal pane absorbed because the crew is provably working, and the
+# non-terminal pane absorbed because the crew is provably working, a quiet pane
+# behind a done: line, a repeat alarm the unchanged-state gate absorbs, and the
 # away-posture one-shot the supervise daemon owns. The reset
 # routes are the ones the recovery and declared-wait cases drive: a pane that
 # leaves the stale path, and a declared wait and its lift.
 drive_first_sight_release() {  # <route>
   local route=$1 dir state fakebin out capture_file window key statusf
-  local fire_verdict route_verdict mode pid fresh_hash away_record=0
+  local fire_verdict route_verdict mode pid fresh_hash away_record=0 gate_record=0
   dir=$(make_case "wedge-cap-release-$route")
   state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
@@ -1646,6 +1647,21 @@ drive_first_sight_release() {  # <route>
       fire_verdict='state: working · source: run-step · validating (running)'
       route_verdict='state: unknown · source: none · no run, no busy pane'
       mode="exit"
+      ;;
+    done-absorb)
+      # A finished task's quiet pane is absorbed rather than surfaced.
+      printf 'done: implementation complete, ready to validate\n' > "$statusf"
+      fire_verdict='state: working · source: run-step · validating (running)'
+      route_verdict='state: unknown · source: none · no run, no busy pane'
+      mode="absorb"
+      ;;
+    gate-absorb)
+      # An alarm already delivered for this unchanged state is absorbed by the gate.
+      printf 'blocked: cannot reach the release host\n' > "$statusf"
+      fire_verdict='state: working · source: run-step · validating (running)'
+      route_verdict='state: unknown · source: none · no run, no busy pane'
+      mode="absorb"
+      gate_record=1
       ;;
     provably-working-nonterminal)
       printf 'working: still wedged\n' > "$statusf"
@@ -1683,6 +1699,11 @@ drive_first_sight_release() {  # <route>
   printf '1\n' > "$state/.count-$key"
   export FM_FAKE_CREW_STATE="$route_verdict"
   [ "$away_record" -eq 0 ] || date +%s > "$state/.afk"
+  if [ "$gate_record" -eq 1 ]; then
+    FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_wake_gate "$2" "$3"' _ \
+      "$ROOT/bin/fm-wake-lib.sh" "stale:$window:terminal" "wedge-cap-release-$route" \
+      || fail "could not plant the delivered-alarm record for the $route case"
+  fi
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
@@ -1741,6 +1762,8 @@ drive_first_sight_release() {  # <route>
 test_wedge_cap_releases_on_every_first_sight_route() {
   drive_first_sight_release provably-working-terminal
   drive_first_sight_release surface-terminal
+  drive_first_sight_release done-absorb
+  drive_first_sight_release gate-absorb
   drive_first_sight_release provably-working-nonterminal
   drive_first_sight_release away-first-sight
   pass "every first-sight route that ends a wedge episode releases that episode's cap and lets the next wedge escalate"
