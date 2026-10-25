@@ -34,8 +34,12 @@ When it is set, scripts still run from this repo's `bin/`, while `state/`, `data
 `FM_ROOT_OVERRIDE` overrides the firstmate repo root used by scripts, including the primary checkout watched by the worktree-tangle guard.
 When `FM_HOME` is unset, it also behaves as the old whole-root override.
 
-`bin/fm-send.sh` requires `FM_HOME` to be set before resolving a target.
-Unlike most scripts, it does not use the general fallback, because a steer must not silently resolve against the wrong home.
+Normal `bin/fm-send.sh` sends require `FM_HOME` to be set before resolving a
+target, but
+`bin/fm-send.sh --help` prints its usage without resolving a target or requiring
+`FM_HOME`.
+Normal sends do not use the general fallback, because a steer must not silently
+resolve against the wrong home.
 These variables override individual operational directories for tests and specialized harness setup:
 
 | Variable | Directory selected |
@@ -1021,6 +1025,7 @@ claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, and omp are empirica
 ### Harness restrictions and credentials
 
 `fm-spawn.sh` refuses kimi on cmux and Orca at preflight, because answering Kimi's folder-trust dialog needs a verified viewport-only capture those backends lack; [its adapter reference](../.agents/skills/harness-adapters/references/harness/kimi.md#readiness-gated-start) owns the trust-dialog handling.
+It also never answers a Kimi folder prompt that announces project MCP servers, pages what trusting would activate, or is collapsed for a short terminal, so no project MCP server starts without a consent decision that covers it; the launch fails with that reason, and the same adapter reference owns the exact rules.
 A cursor secondmate or primary runs the tracked project-scope `.cursor/hooks.json` in its own home and must be launched with `--trust`, or no project hook loads; [`docs/supervision-protocols/cursor.md`](supervision-protocols/cursor.md) owns its supervision protocol.
 
 Cursor typed-submit confirmation is verified on tmux and Herdr only.
