@@ -29,10 +29,13 @@ TMP_ROOT=$(fm_test_tmproot fm-watch-wedge-cap-tests)
 ack_stopped_cycle() {  # <state>
   local state=$1 err sequence generation deadline
   err="$state/.test-cycle-drain.err"
-  # A stopped watcher publishes its recovery episode from its own exit cleanup,
-  # which on a CPU-saturated host can finish after the stop is first observed. A
-  # drain that finds nothing to acknowledge yet is retried until a bounded,
-  # generous deadline; one that never finds it still fails.
+  # The watcher publishes its recovery episode synchronously in its own exit
+  # cleanup, so a stop observed by wait_for_exit or reap already has one. A drain
+  # can still come back empty on a saturated host: it exits 0 with "WAKE DRAIN
+  # SKIPPED ... retry on the next drain" when the queue lock is held past its
+  # presentation timeout, and detached side-band children can hold locks briefly
+  # after the watcher is gone. Such a drain is retried until a bounded, generous
+  # deadline; a stop that never publishes its episode still fails.
   deadline=$((SECONDS + 10 * FM_TEST_WAIT_SCALE))
   while :; do
     FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1

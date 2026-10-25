@@ -38,10 +38,13 @@ TMP_ROOT=$(fm_test_tmproot fm-watch-triage-tests)
 ack_stopped_cycle() {  # <state>
   local state=$1 err sequence generation deadline
   err="$state/.test-cycle-drain.err"
-  # A stopped watcher publishes its recovery episode from its own exit cleanup,
-  # which on a CPU-saturated host can finish after the stop is first observed. A
-  # drain that finds nothing to acknowledge yet is retried until a bounded,
-  # generous deadline; one that never finds it still fails.
+  # The watcher publishes its recovery episode synchronously in its own exit
+  # cleanup, so a stop observed by wait_for_exit or reap already has one. A drain
+  # can still come back empty on a saturated host: it exits 0 with "WAKE DRAIN
+  # SKIPPED ... retry on the next drain" when the queue lock is held past its
+  # presentation timeout, and detached side-band children can hold locks briefly
+  # after the watcher is gone. Such a drain is retried until a bounded, generous
+  # deadline; a stop that never publishes its episode still fails.
   deadline=$((SECONDS + 10 * FM_TEST_WAIT_SCALE))
   while :; do
     FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
@@ -4346,7 +4349,7 @@ test_wedge_guard_failures_fail_open() {
   local working='state: working · source: run-step · ci running'
   window="test:fm-wedge"; key=$(printf '%s' "$window" | tr ':/.' '___')
   for spec in \
-    'timeout|sleep 10' \
+    'timeout|sleep 600' \
     'nonzero|printf "%s\n" "{\"status\":\"CRITICAL\",\"recommendation\":\"r\"}"; exit 3' \
     'malformed|printf "%s\n" "CRITICAL ticket 7"' \
     'two-documents|printf "%s\n" "{\"status\":\"CRITICAL\",\"recommendation\":\"r\"}" "{\"status\":\"OK\",\"recommendation\":\"r\"}"' \
@@ -5253,7 +5256,10 @@ test_term_stops_a_watcher_blocked_inside_a_poll() {
   sig=$(seen_sig "$state/blocked.status"); printf '%s' "$sig" > "$state/.seen-blocked_status"
   # Opening the write end waits for the capture to open the read end, and the
   # holder then keeps it open without writing, so that capture blocks mid-poll.
-  ( exec 3> "$fifo"; : > "$dir/capture-blocked"; exec sleep 30 ) &
+  # It outlives the scaled stop budget below several times over: a watcher that
+  # only stops once the blocked capture returns (a deferred TERM) must fail this
+  # case, not pass it when the writer finally exits inside a stretched budget.
+  ( exec 3> "$fifo"; : > "$dir/capture-blocked"; exec sleep $(( 600 * FM_TEST_WAIT_SCALE )) ) &
   holder=$!
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$fifo" \
     FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -5316,7 +5322,7 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
   fi
   FM_STATE_OVERRIDE="$state" bash -c '
     . "$1" || exit 1
-    lock=$2 held=$3 release=$4 contended=$5 release_ticks=$6
+    lock=$2 held=$3 release=$4 contended=$5 release_ticks=$6 scale=$7
     fm_lock_acquire_wait_max "$lock" 5 || exit 1
     if [ -n "$release_ticks" ]; then
       record="$(fm_lock_link_owner "$lock")/pid"
@@ -5335,7 +5341,7 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
       writer=$!
       : > "$held"
       i=0
-      while [ ! -e "$contended" ] && [ ! -e "$release" ] && [ "$i" -lt 600 ]; do
+      while [ ! -e "$contended" ] && [ ! -e "$release" ] && [ "$i" -lt $(( 600 * scale )) ]; do
         sleep 0.1
         i=$((i + 1))
       done
@@ -5356,7 +5362,7 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
     else
       : > "$held"
       i=0
-      while [ ! -e "$release" ] && [ "$i" -lt 600 ]; do
+      while [ ! -e "$release" ] && [ "$i" -lt $(( 600 * scale )) ]; do
         sleep 0.1
         i=$((i + 1))
       done
@@ -5364,7 +5370,7 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
     fm_lock_release "$lock"
   ' _ "$ROOT/bin/fm-wake-lib.sh" "$state/.watcher-down.lock" "$dir/marker-lock-held" \
     "$dir/release-marker-lock" "$dir/marker-lock-contended" \
-    "$release_ticks" &
+    "$release_ticks" "$FM_TEST_WAIT_SCALE" &
   holder=$!
   i=0
   while [ ! -e "$dir/marker-lock-held" ] && [ "$i" -lt $(( 100 * FM_TEST_WAIT_SCALE )) ]; do
