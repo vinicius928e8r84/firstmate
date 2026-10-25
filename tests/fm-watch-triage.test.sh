@@ -5335,7 +5335,7 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
       writer=$!
       : > "$held"
       i=0
-      while [ ! -e "$contended" ] && [ ! -e "$release" ] && [ "$i" -lt $(( 600 * FM_TEST_WAIT_SCALE )) ]; do
+      while [ ! -e "$contended" ] && [ ! -e "$release" ] && [ "$i" -lt 600 ]; do
         sleep 0.1
         i=$((i + 1))
       done
@@ -5356,7 +5356,7 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
     else
       : > "$held"
       i=0
-      while [ ! -e "$release" ] && [ "$i" -lt $(( 600 * FM_TEST_WAIT_SCALE )) ]; do
+      while [ ! -e "$release" ] && [ "$i" -lt 600 ]; do
         sleep 0.1
         i=$((i + 1))
       done
