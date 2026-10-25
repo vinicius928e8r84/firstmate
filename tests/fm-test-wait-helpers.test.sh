@@ -10,11 +10,27 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
 
 test_default_budget_is_unchanged() {
-  local pid rc=0
+  local pid rc=0 out value
   sleep 3 &
   pid=$!
   FM_TEST_WAIT_SCALE='' wait_for_exit "$pid" 1 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 124 ] || fail "an unscaled one-tick budget did not stop a 3s process (rc=$rc)"
+  # The budget a hung process is reported against is printed, so the default is
+  # pinned without depending on how fast the host runs: unset, empty, zero and
+  # non-numeric scales must all leave a 5-tick budget at 5 ticks, never stretch it.
+  for value in UNSET '' 0 x 1; do
+    sleep 30 &
+    pid=$!
+    if [ "$value" = UNSET ]; then
+      out=$(unset FM_TEST_WAIT_SCALE; wait_for_exit "$pid" 5 2>&1 >/dev/null)
+    else
+      out=$(FM_TEST_WAIT_SCALE=$value wait_for_exit "$pid" 5 2>&1 >/dev/null)
+    fi
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    printf '%s' "$out" | grep -F 'exceeded 5 polls' >/dev/null \
+      || fail "scale '$value' did not leave a 5-tick budget at 5 ticks: $out"
+  done
   pass "without a scale the exit budget is the written tick count"
 }
 
