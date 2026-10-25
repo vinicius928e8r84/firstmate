@@ -45,7 +45,7 @@ ack_stopped_cycle_state() {  # <state>
     "$([ -e "$state/.watch.lock" ] || [ -L "$state/.watch.lock" ] && echo present || echo absent)" \
     "$lockpid" "$([ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null && echo yes || echo no)" \
     "$([ -e "$state/.wake-queue" ] && wc -c < "$state/.wake-queue" | tr -d '[:space:]' || echo none)" \
-    "$([ -e "$state/.last-watcher-beat" ] && echo "$(( $(date +%s) - $(stat -c %Y "$state/.last-watcher-beat") ))s" || echo none)" >&2
+    "$(beat=$(file_mtime "$state/.last-watcher-beat"); [ -n "$beat" ] && echo "$(( $(date +%s) - beat ))s" || echo none)" >&2
   tail -n 5 "$state/.watch-triage.log" 2>/dev/null | sed 's/^/ack_stopped_cycle triage: /' >&2
 }
 
