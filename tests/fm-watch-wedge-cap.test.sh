@@ -14,18 +14,35 @@ set -u
 
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
+
+# Every wait budget below is written in 0.1s ticks for an idle host. This suite
+# also runs on CPU-saturated machines, where one watcher's exit cleanup alone can
+# take longer than ten idle seconds, so wake-helpers' wait_for_exit and the waits
+# here are stretched by this factor. A watcher that really hangs still fails, only
+# later. Set FM_TEST_WAIT_SCALE=1 to get the idle-host budgets back.
+FM_TEST_WAIT_SCALE=${FM_TEST_WAIT_SCALE:-6}
+case "$FM_TEST_WAIT_SCALE" in ''|*[!0-9]*|0) FM_TEST_WAIT_SCALE=6 ;; esac
 # The fixture root for make_case, which reads TMP_ROOT at call time.
 # shellcheck disable=SC2034
 TMP_ROOT=$(fm_test_tmproot fm-watch-wedge-cap-tests)
 
 ack_stopped_cycle() {  # <state>
-  local state=$1 err sequence generation
+  local state=$1 err sequence generation deadline
   err="$state/.test-cycle-drain.err"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
-  sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
-  generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
-  rm -f "$err"
-  [ -n "$sequence" ] && [ -n "$generation" ] || return 1
+  # A stopped watcher publishes its recovery episode from its own exit cleanup,
+  # which on a CPU-saturated host can finish after the stop is first observed. A
+  # drain that finds nothing to acknowledge yet is retried until a bounded,
+  # generous deadline; one that never finds it still fails.
+  deadline=$((SECONDS + 10 * FM_TEST_WAIT_SCALE))
+  while :; do
+    FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
+    sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
+    generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
+    rm -f "$err"
+    [ -n "$sequence" ] && [ -n "$generation" ] && break
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 0.5
+  done
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
     --recovery-generation "$generation"
 }
@@ -44,6 +61,7 @@ is_live_non_zombie() {
 
 wait_for_exit() {
   local pid=$1 limit=${2:-50} i=0
+  limit=$((limit * FM_TEST_WAIT_SCALE))
   while [ "$i" -lt "$limit" ]; do
     if ! is_live_non_zombie "$pid"; then
       wait "$pid"
@@ -63,6 +81,7 @@ file_mtime() {
 
 wait_poll_cycle() {  # <state> <pid> [limit-ticks]
   local state=$1 pid=$2 limit=${3:-300} beat first now i=0
+  limit=$((limit * FM_TEST_WAIT_SCALE))
   beat="$state/.last-watcher-beat"
   rm -f "$beat"
   first=""
