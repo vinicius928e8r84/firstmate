@@ -36,7 +36,7 @@ case "$FM_TEST_WAIT_SCALE" in ''|*[!0-9]*|0) FM_TEST_WAIT_SCALE=6 ;; esac
 TMP_ROOT=$(fm_test_tmproot fm-watch-triage-tests)
 
 ack_stopped_cycle() {  # <state>
-  local state=$1 err sequence generation deadline
+  local state=$1 err sequence generation deadline rc
   err="$state/.test-cycle-drain.err"
   # The watcher publishes its recovery episode synchronously in its own exit
   # cleanup, so a stop observed by wait_for_exit or reap already has one. A drain
