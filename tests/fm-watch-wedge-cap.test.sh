@@ -36,18 +36,26 @@ ack_stopped_cycle() {  # <state>
   # presentation timeout, and detached side-band children can hold locks briefly
   # after the watcher is gone. Such a drain is retried until a bounded, generous
   # deadline; a stop that never publishes its episode still fails.
-  deadline=$((SECONDS + 10 * FM_TEST_WAIT_SCALE))
+  # A drain that exits non-zero (a presentation timeout, a queue lock lost under
+  # load) is retried the same way, and so is the acknowledging drain, which is
+  # idempotent for a generation already acknowledged.
+  deadline=$((SECONDS + 20 * FM_TEST_WAIT_SCALE))
   while :; do
-    FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
-    sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
-    generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
+    sequence= generation=
+    if FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err"; then
+      sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
+      generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
+    fi
     rm -f "$err"
     [ -n "$sequence" ] && [ -n "$generation" ] && break
     [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 0.5
   done
-  FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
-    --recovery-generation "$generation"
+  until FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
+    --recovery-generation "$generation"; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 0.5
+  done
 }
 
 reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
