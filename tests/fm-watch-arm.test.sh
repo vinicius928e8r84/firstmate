@@ -1830,6 +1830,72 @@ EOF
   pass "watch-arm: the OpenCode arm plugin decides with the shared supervision predicate"
 }
 
+# A watcher that dies at once with exit 1 is usually a transient launch hiccup,
+# so the arm retries ONCE before it surfaces the failure that wakes the
+# orchestrator. The fixture copies bin/ and swaps in a scripted fm-watch.sh so
+# the real arm drives it: <script> is the body that runs per attempt, <n> is the
+# attempt number kept in a counter file.
+make_scripted_watch_arm() {  # <case-name> <watch-body>
+  local dir=$1 body=$2 name
+  name=$(make_case "$dir")
+  cp -R "$ROOT/bin" "$name/bin"
+  printf '#!/usr/bin/env bash\nn=$(cat "%s/attempts" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "%s/attempts"\n%s\n' \
+    "$name" "$name" "$body" > "$name/bin/fm-watch.sh"
+  chmod +x "$name/bin/fm-watch.sh"
+  printf '%s\n' "$name"
+}
+
+run_scripted_arm() {  # <case-dir> [env assignments...]
+  local dir=$1; shift
+  mkdir -p "$dir/home/data"
+  env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" \
+    FM_ARM_CONFIRM_TIMEOUT=3 FM_ARM_RETRY_DELAY=0.1 FM_ARM_QUICK_EXIT_SECONDS=120 "$@" \
+    "$dir/bin/fm-watch-arm.sh" > "$dir/arm.out" 2>&1
+}
+
+test_arm_retries_once_after_a_quick_exit_1() {
+  local dir status
+  dir=$(make_scripted_watch_arm arm-retry-recovers '[ "$n" -ge 2 ] || exit 1
+echo "check: scripted wake"
+exit 0')
+  run_scripted_arm "$dir"
+  status=$?
+  expect_code 0 "$status" "a quick exit 1 followed by a good cycle must succeed: $(cat "$dir/arm.out")"
+  [ "$(cat "$dir/attempts")" = 2 ] || fail "arm did not retry exactly once (attempts: $(cat "$dir/attempts"))"
+  grep -qx 'check: scripted wake' "$dir/arm.out" || fail "the retried cycle's wake was not surfaced: $(cat "$dir/arm.out")"
+  ! grep -q 'FAILED' "$dir/arm.out" || fail "the first quick failure leaked to the orchestrator: $(cat "$dir/arm.out")"
+  grep -q 'reason=nonzero-exit-retry' "$dir/state/.watch-cycle-exits.log" \
+    || fail "the retried cycle was not recorded in the lifecycle ledger"
+  pass "watch-arm: one quick exit 1 is retried once before waking the orchestrator"
+}
+
+test_arm_retries_only_once() {
+  local dir status
+  dir=$(make_scripted_watch_arm arm-retry-once-only 'exit 1')
+  run_scripted_arm "$dir"
+  status=$?
+  expect_code 1 "$status" "two quick exit 1s must still fail the arm: $(cat "$dir/arm.out")"
+  [ "$(cat "$dir/attempts")" = 2 ] || fail "arm retried more than once (attempts: $(cat "$dir/attempts"))"
+  grep -q '^watcher: FAILED' "$dir/arm.out" || fail "the second failure was not surfaced: $(cat "$dir/arm.out")"
+  pass "watch-arm: the retry is bounded to one, then the failure surfaces"
+}
+
+test_arm_does_not_retry_a_slow_or_non_1_exit() {
+  local dir status
+  dir=$(make_scripted_watch_arm arm-no-retry-slow 'sleep 2
+exit 1')
+  run_scripted_arm "$dir" FM_ARM_QUICK_EXIT_SECONDS=1
+  status=$?
+  expect_code 1 "$status" "a slow exit 1 must fail without a retry: $(cat "$dir/arm.out")"
+  [ "$(cat "$dir/attempts")" = 1 ] || fail "arm retried a watcher that ran past the quick window (attempts: $(cat "$dir/attempts"))"
+  dir=$(make_scripted_watch_arm arm-no-retry-exit-2 'exit 2')
+  run_scripted_arm "$dir"
+  status=$?
+  expect_code 2 "$status" "an exit other than 1 must keep its code: $(cat "$dir/arm.out")"
+  [ "$(cat "$dir/attempts")" = 1 ] || fail "arm retried an exit other than 1 (attempts: $(cat "$dir/attempts"))"
+  pass "watch-arm: a slow exit or an exit other than 1 is not retried"
+}
+
 test_append_wakes_handling_successor after-ack
 test_append_wakes_handling_successor before-ack
 test_append_wakes_handling_successor after-ack missing
@@ -1870,3 +1936,6 @@ test_take_over_attaches_to_a_cycle_the_named_arm_does_not_own
 test_take_over_owns_a_fresh_cycle_and_keeps_queued_work_surfacing
 test_take_over_preserves_downtime_from_watcher_self_exit
 test_opencode_arm_plugin_decides_with_the_shared_predicate
+test_arm_retries_once_after_a_quick_exit_1
+test_arm_retries_only_once
+test_arm_does_not_retry_a_slow_or_non_1_exit
