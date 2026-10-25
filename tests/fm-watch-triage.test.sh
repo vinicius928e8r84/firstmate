@@ -45,24 +45,40 @@ ack_stopped_cycle() {  # <state>
   # presentation timeout, and detached side-band children can hold locks briefly
   # after the watcher is gone. Such a drain is retried until a bounded, generous
   # deadline; a stop that never publishes its episode still fails.
-  # A drain that exits non-zero (a presentation timeout, a queue lock lost under
-  # load) is retried the same way, and so is the acknowledging drain, which is
-  # idempotent for a generation already acknowledged.
+  # A drain that exits non-zero for a load symptom (the queue lock could not be
+  # acquired safely, the branch-outcomes section failed, a recovery-marker
+  # transition errored) is retried the same way, and so is the acknowledging drain,
+  # which is idempotent for a generation already acknowledged. Exit 2 is a usage
+  # error, never a load symptom, so it fails at once. The last attempt's stderr is
+  # printed, and kept in the case directory, when the helper gives up.
   deadline=$((SECONDS + 20 * FM_TEST_WAIT_SCALE))
   while :; do
-    sequence= generation=
-    if FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err"; then
+    sequence= generation= rc=0
+    FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || rc=$?
+    if [ "$rc" -eq 0 ]; then
       sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
       generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
     fi
-    rm -f "$err"
-    [ -n "$sequence" ] && [ -n "$generation" ] && break
-    [ "$SECONDS" -lt "$deadline" ] || return 1
+    if [ -n "$sequence" ] && [ -n "$generation" ]; then
+      rm -f "$err"
+      break
+    fi
+    if [ "$rc" -eq 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
+      printf 'ack_stopped_cycle: giving up, the last drain exited %s with stderr:\n' "$rc" >&2
+      cat "$err" >&2 2>/dev/null || true
+      return 1
+    fi
     sleep 0.5
   done
-  until FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
-    --recovery-generation "$generation"; do
-    [ "$SECONDS" -lt "$deadline" ] || return 1
+  while :; do
+    rc=0
+    FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
+      --recovery-generation "$generation" || rc=$?
+    [ "$rc" -ne 0 ] || break
+    if [ "$rc" -eq 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
+      printf 'ack_stopped_cycle: giving up, the acknowledging drain exited %s\n' "$rc" >&2
+      return 1
+    fi
     sleep 0.5
   done
 }
@@ -4357,7 +4373,7 @@ test_wedge_guard_failures_fail_open() {
   local working='state: working · source: run-step · ci running'
   window="test:fm-wedge"; key=$(printf '%s' "$window" | tr ':/.' '___')
   for spec in \
-    'timeout|sleep 600' \
+    "timeout|sleep $((100 * FM_TEST_WAIT_SCALE))" \
     'nonzero|printf "%s\n" "{\"status\":\"CRITICAL\",\"recommendation\":\"r\"}"; exit 3' \
     'malformed|printf "%s\n" "CRITICAL ticket 7"' \
     'two-documents|printf "%s\n" "{\"status\":\"CRITICAL\",\"recommendation\":\"r\"}" "{\"status\":\"OK\",\"recommendation\":\"r\"}"' \
