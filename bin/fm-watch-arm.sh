@@ -53,6 +53,12 @@
 # so the failure is loud. A live cycle already present means re-arm attaches - do
 # not start a second watcher.
 #
+# Retries once: a watcher child that exits 1 within FM_ARM_QUICK_EXIT_SECONDS
+# (default 10) of its launch is usually a transient start hiccup, so the arm waits
+# FM_ARM_RETRY_DELAY seconds (default 1) and re-arms exactly once (the ledger row
+# reads reason=nonzero-exit-retry) before the failure wakes the orchestrator. A
+# slower exit, any other exit code, or the second quick exit 1 surfaces as usual.
+#
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
 # arm/watcher identities, timestamps, exit/signal classification, beacon age,
@@ -163,6 +169,11 @@ ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
 # The beacon age at which the watcher's own re-arm evicts a live holder; an
 # attached arm follows a slow holder up to it (attach_and_wait).
 STALL_BOUND=$(fm_watcher_stall_bound)
+# A watcher that exits 1 within QUICK_EXIT seconds of its launch is retried once
+# after RETRY_DELAY seconds before the failure surfaces (header).
+QUICK_EXIT=${FM_ARM_QUICK_EXIT_SECONDS:-10}
+RETRY_DELAY=${FM_ARM_RETRY_DELAY:-1}
+case "$QUICK_EXIT" in ''|*[!0-9]*) QUICK_EXIT=10 ;; esac
 CYCLE_LOG="$STATE/.watch-cycle-exits.log"
 CYCLE_LOG_LOCK="$STATE/.watch-cycle-exits.lock"
 CYCLE_LOG_MAX_BYTES=${FM_WATCH_CYCLE_LOG_MAX_BYTES:-262144}
@@ -740,6 +751,14 @@ child=$!
 cycle_begin "$child" started "$(fm_pid_identity "$child" 2>/dev/null || true)"
 child_done=0
 
+# Header, "retries once". True for the first exit 1 of a watcher that ran no
+# longer than the quick-exit window; a second arm (FM_ARM_RETRIED) never retries.
+arm_should_retry_quick_exit() {  # <exit-code>
+  [ "$1" -eq 1 ] || return 1
+  [ "${FM_ARM_RETRIED:-}" != 1 ] || return 1
+  [ $(( $(date +%s) - cycle_started_at )) -le "$QUICK_EXIT" ]
+}
+
 owned_child_finished() {
   local rc=$1 signal reason_type status
   signal=$(cycle_signal_name "$rc")
@@ -784,6 +803,15 @@ owned_child_finished() {
 
   reason_type="nonzero-exit"
   [ "$signal" = none ] || reason_type="signal-exit"
+  if arm_should_retry_quick_exit "$rc"; then
+    cycle_log_append "$rc" "$signal" nonzero-exit-retry none
+    rm -f "$child_out" 2>/dev/null || true
+    child=
+    child_out=
+    trap - HUP TERM INT
+    sleep "$RETRY_DELAY"
+    FM_ARM_RETRIED=1 exec "$ARM_SCRIPT"
+  fi
   cycle_log_append "$rc" "$signal" "$reason_type" none
   print_watch_output "$child_out"
   if ! grep -q '^watcher: FAILED' "$child_out" 2>/dev/null; then
