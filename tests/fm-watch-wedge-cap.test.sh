@@ -26,6 +26,20 @@ case "$FM_TEST_WAIT_SCALE" in ''|*[!0-9]*|0) FM_TEST_WAIT_SCALE=6 ;; esac
 # shellcheck disable=SC2034
 TMP_ROOT=$(fm_test_tmproot fm-watch-wedge-cap-tests)
 
+# The recovery state a failed ack_stopped_cycle was waiting on, so a failure on a
+# saturated host says whether the stopped watcher ever published its episode.
+ack_stopped_cycle_state() {  # <state>
+  local state=$1 lockpid=''
+  [ ! -r "$state/.watch.lock/pid" ] || IFS= read -r lockpid < "$state/.watch.lock/pid" || true
+  printf 'ack_stopped_cycle state: marker=[%s] watch.lock=%s lock_pid=[%s] lock_pid_alive=%s queue_bytes=%s beat_age=%s\n' \
+    "$(cat "$state/.watcher-down" 2>/dev/null || true)" \
+    "$([ -e "$state/.watch.lock" ] || [ -L "$state/.watch.lock" ] && echo present || echo absent)" \
+    "$lockpid" "$([ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null && echo yes || echo no)" \
+    "$([ -e "$state/.wake-queue" ] && wc -c < "$state/.wake-queue" | tr -d '[:space:]' || echo none)" \
+    "$([ -e "$state/.last-watcher-beat" ] && echo "$(( $(date +%s) - $(stat -c %Y "$state/.last-watcher-beat") ))s" || echo none)" >&2
+  tail -n 5 "$state/.watch-triage.log" 2>/dev/null | sed 's/^/ack_stopped_cycle triage: /' >&2
+}
+
 ack_stopped_cycle() {  # <state>
   local state=$1 err sequence generation deadline rc
   err="$state/.test-cycle-drain.err"
@@ -42,7 +56,7 @@ ack_stopped_cycle() {  # <state>
   # which is idempotent for a generation already acknowledged. Exit 2 is a usage
   # error, never a load symptom, so it fails at once. The last attempt's stderr is
   # printed, and kept in the case directory, when the helper gives up.
-  deadline=$((SECONDS + 20 * FM_TEST_WAIT_SCALE))
+  deadline=$((SECONDS + 40 * FM_TEST_WAIT_SCALE))
   while :; do
     sequence= generation= rc=0
     FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || rc=$?
@@ -57,6 +71,7 @@ ack_stopped_cycle() {  # <state>
     if [ "$rc" -eq 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
       printf 'ack_stopped_cycle: giving up, the last drain exited %s with stderr:\n' "$rc" >&2
       cat "$err" >&2 2>/dev/null || true
+      ack_stopped_cycle_state "$state"
       return 1
     fi
     sleep 0.5
@@ -68,6 +83,7 @@ ack_stopped_cycle() {  # <state>
     [ "$rc" -ne 0 ] || break
     if [ "$rc" -eq 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
       printf 'ack_stopped_cycle: giving up, the acknowledging drain exited %s\n' "$rc" >&2
+      ack_stopped_cycle_state "$state"
       return 1
     fi
     sleep 0.5
