@@ -30,7 +30,8 @@
 #   range-diff   git range-diff of the PR's own commits (merge-base..reviewed
 #                against merge-base..head); merge commits are not commits of
 #                the range, so a stacked PR whose base landed compares cleanly
-#   resolved     per merge commit in reviewed..head, only what git did not do
+#   resolved     per merge commit in reviewed..head that the base does not
+#                already contain, only what git did not do
 #                itself: the hand edits on top of a clean automatic merge, or the
 #                combined diff (--cc) of a conflict resolution; an automatic
 #                merge has none (needs git with `merge-tree --write-tree`)
@@ -41,7 +42,7 @@ set -uo pipefail
 FM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
-usage() { sed -n 2,38p "$0"; }
+usage() { sed -n 2,39p "$0"; }
 
 repo= reviewed= pin_slug= pin_pr= head=HEAD base=origin/main max=400
 while [ $# -gt 0 ]; do
@@ -113,8 +114,9 @@ merge_hunks() {
 }
 
 resolved=
-# First parent only: a merge main itself brought in is main's, not this PR's.
-merges=$(g rev-list --merges --first-parent --reverse "$rev..$tip")
+# Every merge the PR's own history added, wherever it sits; a merge the base
+# already contains is main's, not this PR's.
+merges=$(g rev-list --merges --reverse "$rev..$tip" "^$base_tip")
 for c in $merges; do
   hunks=$(merge_hunks "$c")
   [ -z "$hunks" ] || resolved+=$'\n'"merge $(g rev-parse --short=8 "$c") $(g log -1 --format=%s "$c" | cut -c1-70)"$'\n'"$(printf '%s\n' "$hunks" | capped)"$'\n'

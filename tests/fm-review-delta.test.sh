@@ -193,6 +193,37 @@ test_main_side_merge_is_not_this_prs_hunk() {
   pass "a merge main brought in is not shown as this PR's resolved hunk"
 }
 
+test_stacked_parent_resolution_is_shown() {
+  local r reviewed out rc
+  # B is stacked on A and reviewed. Main then inserts where A inserted; A merges
+  # main and resolves the conflict by hand (ordering only, so B's own +/- lines
+  # stay identical); B merges A cleanly. The resolution sits in a merge that is
+  # not on B's first-parent line, and it must still be shown.
+  r="$TMP_ROOT/stacked-resolve"
+  git init -q -b main "$r"
+  seq 1 10 | sed 's/^/l/' > "$r/a.txt"
+  git -C "$r" add . && git -C "$r" commit -qm seed
+  git -C "$r" checkout -q -b A
+  sed -i '4a X_from_A' "$r/a.txt"; git -C "$r" commit -qam 'A: insert X after l4'
+  git -C "$r" checkout -q -b B
+  printf 'b\n' > "$r/b.txt"; git -C "$r" add . && git -C "$r" commit -qm 'B: own file'
+  reviewed=$(git -C "$r" rev-parse HEAD)
+  git -C "$r" checkout -q main
+  sed -i '4a M_from_main' "$r/a.txt"; git -C "$r" commit -qam 'main: insert M after l4'
+  git -C "$r" checkout -q A
+  git -C "$r" merge --no-edit main >/dev/null 2>&1 && fail "fixture must conflict"
+  printf '%s\n' l1 l2 l3 l4 M_from_main X_from_A l5 l6 l7 l8 l9 l10 > "$r/a.txt"
+  git -C "$r" commit -qam 'A: resolve main'
+  git -C "$r" checkout -q B
+  git -C "$r" merge -q --no-edit A || fail "fixture merge of A into B must be clean"
+  out=$("$DELTA" --repo "$r" --reviewed "$reviewed" --base main 2>&1); rc=$?
+  expect_code 1 "$rc" "a parent branch's hand resolution needs a look"
+  assert_contains "$out" "DELTA-RESOLVED-ONLY" "verdict"
+  assert_contains "$out" "A: resolve main" "the resolving merge is listed"
+  assert_contains "$out" "M_from_main" "the resolved hunk is shown"
+  pass "stacked PR: a hand resolution made in the parent branch is shown"
+}
+
 test_missing_option_value_is_a_usage_error() {
   local rc
   timeout 10 "$DELTA" --repo >/dev/null 2>&1; rc=$?
@@ -228,6 +259,7 @@ test_own_change_differs
 test_stacked_pr_after_base_landed
 test_post_review_own_commit_is_never_none
 test_main_side_merge_is_not_this_prs_hunk
+test_stacked_parent_resolution_is_shown
 test_missing_option_value_is_a_usage_error
 test_pin_lookup_and_refusals
 
