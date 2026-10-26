@@ -34,7 +34,8 @@ make_world() {
 advance_main() {
   git clone -q "file://$1/origin.git" "$1/pusher"
   printf '%s' "$3" > "$1/pusher/$2"
-  git -C "$1/pusher" commit -qam "main moves $2"
+  git -C "$1/pusher" add -A
+  git -C "$1/pusher" commit -qm "main moves $2"
   git -C "$1/pusher" push -q origin main
   fm_test_remove_tree "$1/pusher"
 }
@@ -111,6 +112,42 @@ test_dirty_refused() {
   pass "dirty worktree: refused"
 }
 
+test_verify_only_refuses_an_open_merge() {
+  local w out rc
+  w=$(make_world verify-open)
+  advance_main "$w" a.txt $'a1\nTHEIRS\na3\n'
+  "$MERGE_MAIN" --worktree "$w/pr" >/dev/null 2>&1
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --verify-only --check 'echo CHECK-RAN' 2>&1); rc=$?
+  expect_code 3 "$rc" "verify-only on an unresolved merge"
+  assert_contains "$out" "merge is in progress" "the open merge is named"
+  assert_not_contains "$out" "CHECK-RAN" "no check runs on a half-resolved tree"
+  w=$(make_world verify-dirty)
+  printf 'x\n' >> "$w/pr/a.txt"
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --verify-only 2>&1); rc=$?
+  expect_code 3 "$rc" "verify-only on a dirty tree"
+  pass "verify-only: refuses an open merge or a dirty tree"
+}
+
+test_failed_merge_without_conflict_says_why() {
+  local w out rc
+  w=$(make_world untracked)
+  advance_main "$w" z.txt $'from main\n'
+  printf 'local scratch\n' > "$w/pr/z.txt"
+  out=$("$MERGE_MAIN" --worktree "$w/pr" 2>&1); rc=$?
+  expect_code 3 "$rc" "merge refused by git"
+  assert_contains "$out" "z.txt" "git's own reason is shown"
+  pass "a merge git refuses without a conflict shows git's reason"
+}
+
+test_missing_option_value_is_a_usage_error() {
+  local rc
+  timeout 10 "$MERGE_MAIN" --worktree >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "--worktree without a value"
+  timeout 10 "$MERGE_MAIN" --worktree "$TMP_ROOT" --check >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "--check without a command"
+  pass "missing option values exit 2 instead of spinning"
+}
+
 test_usage() {
   local rc
   "$MERGE_MAIN" >/dev/null 2>&1; rc=$?
@@ -167,6 +204,9 @@ test_conflict_stops_with_files
 test_checks
 test_dirty_refused
 test_usage
+test_verify_only_refuses_an_open_merge
+test_failed_merge_without_conflict_says_why
+test_missing_option_value_is_a_usage_error
 test_pin_report_sees_unpushed_merge
 
 echo '# all fm-pr-merge-main tests passed'

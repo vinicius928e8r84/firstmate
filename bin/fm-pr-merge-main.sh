@@ -6,7 +6,9 @@
 #                       [--check CMD]... [--slug OWNER/REPO --pr N] [--verify-only]
 #
 # The routine "bring this PR up to date with main" step, done by a script so a
-# model is only needed when the merge truly conflicts. In the PR branch worktree
+# model is only needed when the merge truly conflicts. It is run by the worker
+# that owns the PR, in that worker's own worktree: it commits inside a project
+# worktree, so firstmate itself never runs it. In the PR branch worktree
 # DIR it fetches <remote>/<base>, runs `git merge --no-edit` on it, then runs
 # each --check command (the project's own cheap checks, such as typecheck or
 # lint) from DIR. It never pushes: the worker that owns the PR pushes.
@@ -22,7 +24,8 @@
 #
 # --verify-only skips the fetch and merge and runs only the checks and the pin
 # report on DIR's current head, for use after a model resolved a conflict and
-# committed.
+# committed; like a merge it refuses a worktree with a merge still in progress
+# or uncommitted changes.
 #
 # Result lines (one is always printed first after the work starts):
 #   ALREADY-CURRENT <remote>/<base>   nothing to merge
@@ -39,18 +42,21 @@ set -uo pipefail
 FM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
-usage() { sed -n 2,40p "$0"; }
+usage() { sed -n 2,39p "$0"; }
 
 wt= remote=origin base=main slug= pr= verify_only=0
 checks=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --worktree) wt=${2:-}; shift 2 ;;
-    --remote) remote=${2:-}; shift 2 ;;
-    --base) base=${2:-}; shift 2 ;;
-    --check) checks+=("${2:-}"); shift 2 ;;
-    --slug) slug=${2:-}; shift 2 ;;
-    --pr) pr=${2:-}; shift 2 ;;
+    --worktree|--remote|--base|--check|--slug|--pr) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
+  esac
+  case "$1" in
+    --worktree) wt=$2; shift 2 ;;
+    --remote) remote=$2; shift 2 ;;
+    --base) base=$2; shift 2 ;;
+    --check) checks+=("$2"); shift 2 ;;
+    --slug) slug=$2; shift 2 ;;
+    --pr) pr=$2; shift 2 ;;
     --verify-only) verify_only=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -65,15 +71,15 @@ git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a gi
 git_dir=$(git -C "$wt" rev-parse --git-dir) || exit 3
 case "$git_dir" in /*) ;; *) git_dir=$wt/$git_dir ;; esac
 
+[ ! -e "$git_dir/MERGE_HEAD" ] || { echo "a merge is in progress in $wt; resolve and commit it first" >&2; exit 3; }
+[ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] || { echo "worktree has uncommitted changes: $wt" >&2; exit 3; }
 if [ "$verify_only" = 0 ]; then
-  [ ! -e "$git_dir/MERGE_HEAD" ] || { echo "a merge is already in progress in $wt" >&2; exit 3; }
-  [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] || { echo "worktree has uncommitted changes: $wt" >&2; exit 3; }
   git -C "$wt" fetch -q "$remote" "$base" || { echo "fetch $remote $base failed" >&2; exit 3; }
   target=$(git -C "$wt" rev-parse "FETCH_HEAD^{commit}") || exit 3
   old=$(git -C "$wt" rev-parse HEAD) || exit 3
   if git -C "$wt" merge-base --is-ancestor "$target" "$old"; then
     echo "ALREADY-CURRENT $remote/$base"
-  elif git -C "$wt" merge --no-edit "$target" >/dev/null 2>&1; then
+  elif merge_out=$(git -C "$wt" merge --no-edit "$target" 2>&1); then
     echo "MERGE-CLEAN ${old:0:8} -> $(git -C "$wt" rev-parse --short=8 HEAD)"
   else
     if [ -e "$git_dir/MERGE_HEAD" ]; then
@@ -81,7 +87,8 @@ if [ "$verify_only" = 0 ]; then
       git -C "$wt" diff --name-only --diff-filter=U | sed 's/^/  conflicted: /'
       exit 10
     fi
-    echo "merge failed without a conflict state in $wt" >&2
+    echo "merge failed without a conflict state in $wt:" >&2
+    printf '%s\n' "$merge_out" >&2
     exit 3
   fi
 fi
