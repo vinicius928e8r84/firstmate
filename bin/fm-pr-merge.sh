@@ -174,7 +174,13 @@
 # explicit captain instruction and never skips the live green check, the
 # away-record read, or a captain hold.
 #
-# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [-- <extra forge merge args>]
+# --expected-head <commit-id> names the full head the caller verified before
+# calling. After this script's own live read, a live head that is another commit
+# refuses (exit 1) before the forge merge, so a push that landed in the gap
+# between the caller's check and this read is never merged on the caller's word.
+# An unusable value is a usage error (exit 2) before any state is recorded.
+#
+# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [--expected-head <commit-id>] [-- <extra forge merge args>]
 #
 # On GitLab, this script confirms the MR is actually merged before reporting it;
 # an auto-merge-queued or unconfirmed request leaves the poll armed and records
@@ -234,6 +240,7 @@ fi
 shift 2
 ATTENDED_OVERRIDE=false
 ALLOW_NO_PIPELINE=false
+EXPECTED_HEAD=
 ALLOW_RED=()
 ALLOW_MISSING=()
 while [ "$#" -gt 0 ]; do
@@ -272,6 +279,16 @@ while [ "$#" -gt 0 ]; do
       ;;
     --allow-no-pipeline=*)
       echo "error: --allow-no-pipeline takes no value" >&2
+      exit 2
+      ;;
+    --expected-head)
+      [ -z "$EXPECTED_HEAD" ] || { echo "error: --expected-head may be specified only once" >&2; exit 2; }
+      EXPECTED_HEAD=${2:-}
+      fm_pr_head_valid "$EXPECTED_HEAD" || { echo "error: --expected-head requires a full commit id (40 or 64 lowercase hex digits)" >&2; exit 2; }
+      shift 2
+      ;;
+    --expected-head=*)
+      echo "error: --expected-head requires a separate full commit id argument" >&2
       exit 2
       ;;
     --) shift; break ;;
@@ -545,6 +562,17 @@ RECORDED_HEAD=
 if [ "$PROVIDER" = gitlab ] || [ "$PROVIDER" = forgejo ]; then
   RECORDED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)
 fi
+
+# --expected-head: the head the caller verified must be the live head this run
+# just verified, else nothing is merged. Runs after each forge's verification.
+require_expected_head() {
+  if [ -z "$EXPECTED_HEAD" ] || [ "$EXPECTED_HEAD" = "$FM_PR_MERGE_HEAD" ]; then
+    return 0
+  fi
+  printf 'error: refusing to merge %s: the live head %s is not the expected head %s; nothing was merged\n' \
+    "$URL" "$FM_PR_MERGE_HEAD" "$EXPECTED_HEAD" >&2
+  return 1
+}
 
 # Pre-merge conditions for a GitLab merge request, read from one live view of
 # the merge request. Sets FM_PR_MERGE_HEAD to the verified head on success and
@@ -1688,6 +1716,7 @@ case "$PROVIDER" in
       fi
       exit 1
     fi
+    require_expected_head || exit 1
     # The away record is locked first, so this last presence and authority read
     # and the forge command below share one live-owner critical section.
     hold_away_record_for_merge || exit 1
@@ -1739,6 +1768,7 @@ case "$PROVIDER" in
     ;;
   gitlab)
     gitlab_verify_mergeable || exit 1
+    require_expected_head || exit 1
     # --sha binds the merge to the head this run verified, so a push that lands
     # in between is refused by GitLab instead of merged unverified. --yes only
     # skips the interactive confirmation, which no supervised run can answer;
@@ -1775,6 +1805,7 @@ case "$PROVIDER" in
     forgejo_method=$(caller_merge_method "$@")
     [ -n "$forgejo_method" ] || forgejo_method=$(forgejo_default_merge_style) || exit 1
     forgejo_verify_mergeable || exit 1
+    require_expected_head || exit 1
     # The away record is locked first, so this last presence and authority
     # read and the forge command below share one live-owner critical section.
     hold_away_record_for_merge || exit 1

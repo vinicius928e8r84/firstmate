@@ -2600,6 +2600,76 @@ test_gitlab_head_override_args_refuse_before_recording() {
   pass "fm-pr-merge refuses a GitLab head override before recording state"
 }
 
+# --expected-head: the caller (the private merge gate) names the head it verified, and this
+# script refuses when the live head it reads under its own lock is another one.
+test_expected_head_matching_the_live_head_merges() {
+  local case_dir rc
+  case_dir=$(make_case expected-head-match)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" 7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a
+  : > "$case_dir/gh-axi.log"
+
+  set +e
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/71 \
+    --expected-head 7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "expected-head-match: the verified head is the live head, the merge must go ahead: $(cat "$case_dir/stderr")"
+  assert_logged_gh_merge "$case_dir" 71 example/repo --squash
+  pass "fm-pr-merge --expected-head merges when the live head is the expected one"
+}
+
+test_expected_head_differing_from_the_live_head_refuses_before_the_forge_call() {
+  local case_dir rc
+  case_dir=$(make_case expected-head-moved)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" 8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b
+  : > "$case_dir/gh-axi.log"
+
+  set +e
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/72 \
+    --expected-head 9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "expected-head-moved: a head pushed after verification must be refused"
+  assert_grep 'the live head 8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b is not the expected head 9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c' "$case_dir/stderr" \
+    "expected-head-moved: the refusal did not name both heads"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "expected-head-moved: gh pr merge ran against an unexpected head"
+  pass "fm-pr-merge --expected-head refuses, before any forge merge, when the live head differs"
+}
+
+test_expected_head_differing_from_the_live_head_refuses_on_gitlab() {
+  local case_dir rc
+  case_dir=$(make_gitlab_case gitlab-expected-head-moved)
+
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$MR_URL" --expected-head "$MR_STALE_HEAD" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "gitlab-expected-head-moved: a moved head must be refused"
+  assert_grep "is not the expected head $MR_STALE_HEAD" "$case_dir/stderr" "gitlab-expected-head-moved: the refusal did not name the heads"
+  [ -z "$(glab_merge_line "$case_dir/glab.log")" ] || fail "gitlab-expected-head-moved: glab merged an unexpected head"
+  pass "fm-pr-merge --expected-head refuses a moved GitLab head before merging"
+}
+
+test_expected_head_must_be_a_full_commit_id() {
+  local case_dir rc
+  case_dir=$(make_case expected-head-invalid)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" 1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d
+  : > "$case_dir/gh-axi.log"
+
+  set +e
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/73 --expected-head abc123 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "expected-head-invalid: an abbreviated head is a usage error"
+  assert_grep '--expected-head requires a full commit id' "$case_dir/stderr" "expected-head-invalid: no explanation"
+  assert_no_grep 'pr=' "$case_dir/state/task-x1.meta" "expected-head-invalid: state was recorded before the usage error"
+  pass "fm-pr-merge --expected-head rejects anything but a full commit id before recording state"
+}
+
 test_github_still_forwards_sha_arg() {
   local case_dir rc
   case_dir=$(make_case github-sha-arg)
@@ -2926,6 +2996,10 @@ test_github_zero_exit_queue_required_refuses_with_exact_retry
 test_github_closed_unqueued_outcome_omits_retry_flags
 test_github_agreeing_queue_rules_keep_retry_guidance
 test_github_conflicting_queue_rules_report_ambiguity
+test_expected_head_matching_the_live_head_merges
+test_expected_head_differing_from_the_live_head_refuses_before_the_forge_call
+test_expected_head_differing_from_the_live_head_refuses_on_gitlab
+test_expected_head_must_be_a_full_commit_id
 test_verified_merge_records_pr_and_head
 test_pr_metadata_is_recorded_before_the_forge_call
 test_merge_failure_propagates_after_recording
