@@ -150,6 +150,7 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-contributions.sh`    | Observe owned publications, retain exact-head judgments, measure required actors, and wake on maintainer or configured review-bot signals |
 | `fm-pr-health.sh`        | Opt-in: enroll the PRs this home owns from creation and notify once per condition per latest commit for a conflict or failing required check (see [configuration.md](configuration.md#pr-health-monitor-configpr-health-monitor)) |
 | `fm-pr-merge-main.sh`   | Merge the base branch into a PR branch without a model, run the project's cheap checks, report the review pin on the unpushed merge, and stop with the conflicted files when the merge truly conflicts; never pushes |
+| `fm-review-delta.sh`     | Print the compact re-review packet after a PR head moved past the reviewed head: whether the PR's own +/- lines are byte-identical, the range-diff of its own commits, and only the hand-resolved merge hunks |
 | `fm-pr-check.sh`         | Record validated task `pr=` and `pr_head=` values, then atomically arm a static merge poll; refuses GitHub drafts and persistent secondmate records (see [architecture.md](architecture.md)) |
 | `fm-review-check.sh`    | Record a forge=external task's validated `review=` and `review_head=` without arming a merge watch ([design](external-review-forge.md)) |
 | `fm-external-review-lib.sh` | Shared readers for the forge=external review tool adapter, ready-URL pattern, backup remote, and remote URLs |
