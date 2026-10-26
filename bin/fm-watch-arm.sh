@@ -58,8 +58,11 @@
 # started"), is usually a transient start hiccup, so the arm waits
 # FM_ARM_RETRY_DELAY seconds (default 1) and re-arms exactly once (the ledger row
 # reads reason=nonzero-exit-retry) before the failure wakes the orchestrator. A
-# slower exit, a watcher that had been confirmed, any other exit code, or the
-# second quick exit 1 surfaces as usual.
+# slower exit, a watcher that had been confirmed, an arm whose ground was removed,
+# any other exit code, or the second quick exit 1 surfaces as usual. The retry
+# re-execs with --restart when the arm had it, and the marker is removed from the
+# environment so the watcher's descendants never see it. FM_ARM_QUICK_EXIT_SECONDS=0
+# turns the retry off. It stacks on any retry the harness adapter itself makes.
 #
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
@@ -176,6 +179,13 @@ STALL_BOUND=$(fm_watcher_stall_bound)
 QUICK_EXIT=${FM_ARM_QUICK_EXIT_SECONDS:-10}
 RETRY_DELAY=${FM_ARM_RETRY_DELAY:-1}
 case "$QUICK_EXIT" in ''|*[!0-9]*) QUICK_EXIT=10 ;; esac
+case "$RETRY_DELAY" in ''|*[!0-9.]*|*.*.*) RETRY_DELAY=1 ;; esac
+# The retry marker is read once and removed, so the watcher and its descendants
+# never inherit it; a retried arm keeps --restart, any other mode re-arms plainly.
+ARM_RETRIED=${FM_ARM_RETRIED:-}
+unset FM_ARM_RETRIED
+ARM_RETRY_ARG=
+[ "${1:-}" != --restart ] || ARM_RETRY_ARG=--restart
 CYCLE_LOG="$STATE/.watch-cycle-exits.log"
 CYCLE_LOG_LOCK="$STATE/.watch-cycle-exits.lock"
 CYCLE_LOG_MAX_BYTES=${FM_WATCH_CYCLE_LOG_MAX_BYTES:-262144}
@@ -750,18 +760,21 @@ else
   "$WATCH" >"$child_out" &
 fi
 child=$!
+ARM_CHILD_LAUNCHED=$(date +%s)
 cycle_begin "$child" started "$(fm_pid_identity "$child" 2>/dev/null || true)"
 child_done=0
 
 # Header, "retries once". True for the first exit 1 of a watcher that ran no
-# longer than the quick-exit window and was never confirmed; a second arm
-# (FM_ARM_RETRIED) never retries.
+# longer than the quick-exit window, was never confirmed, and left the arm's
+# ground intact; a retried arm (ARM_RETRIED) never retries; a window of 0 is off.
 ARM_CHILD_CONFIRMED=0
 arm_should_retry_quick_exit() {  # <exit-code>
   [ "$1" -eq 1 ] || return 1
   [ "$ARM_CHILD_CONFIRMED" -eq 0 ] || return 1
-  [ "${FM_ARM_RETRIED:-}" != 1 ] || return 1
-  [ $(( $(date +%s) - cycle_started_at )) -le "$QUICK_EXIT" ]
+  [ "$ARM_RETRIED" != 1 ] || return 1
+  [ "$QUICK_EXIT" -gt 0 ] || return 1
+  [ $(( $(date +%s) - ARM_CHILD_LAUNCHED )) -le "$QUICK_EXIT" ] || return 1
+  ! arm_ground_gone
 }
 
 owned_child_finished() {
@@ -809,13 +822,18 @@ owned_child_finished() {
   reason_type="nonzero-exit"
   [ "$signal" = none ] || reason_type="signal-exit"
   if arm_should_retry_quick_exit "$rc"; then
-    cycle_log_append "$rc" "$signal" nonzero-exit-retry none
     rm -f "$child_out" 2>/dev/null || true
     child=
     child_out=
-    trap - HUP TERM INT
-    sleep "$RETRY_DELAY"
-    FM_ARM_RETRIED=1 exec "$ARM_SCRIPT"
+    # Waited on, not slept in the foreground, so a TERM during the delay still
+    # runs the arm's handler and records arm-interrupted.
+    sleep "$RETRY_DELAY" &
+    wait $!
+    cycle_log_append "$rc" "$signal" nonzero-exit-retry none
+    shopt -s execfail
+    FM_ARM_RETRIED=1 exec "$ARM_SCRIPT" ${ARM_RETRY_ARG:+"$ARM_RETRY_ARG"}
+    echo "watcher: FAILED - could not re-arm: $ARM_SCRIPT"
+    return 1
   fi
   cycle_log_append "$rc" "$signal" "$reason_type" none
   print_watch_output "$child_out"
