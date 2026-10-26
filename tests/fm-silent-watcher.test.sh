@@ -9,8 +9,18 @@ cat > "$T/data/tools/fm-asks.sh" <<'A'
 echo "$*" >> "$FM_HOME/asks.calls"
 A
 chmod +x "$T/data/tools/fm-asks.sh"
+# notify() POSTs to the webhook named under $HOME/.config/fm, so no run of this test
+# may see a real HOME: a stub curl records any POST that would have gone out, and the
+# runs use a private HOME that does hold a webhook config, so only FM_SW_NO_NOTIFY
+# keeps the stub from being called.
+mkdir -p "$T/bin" "$T/home/.config/fm"
+printf 'http://127.0.0.1:9/hook\n' > "$T/home/.config/fm/watcher-webhook.url"
+printf 'test-key\n' > "$T/home/.config/fm/watcher-webhook.key"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s/curl.calls"\n' "$T" > "$T/bin/curl"
+chmod +x "$T/bin/curl"
+PATH="$T/bin:$PATH"; export PATH
 NOW=2000000000; fail=0
-run() { FM_HOME=$T FM_SW_NOW=$NOW FM_SW_PGREP="$1" bash "$SW"; echo $?; }
+run() { HOME=$T/home FM_SW_NO_NOTIFY=1 FM_HOME=$T FM_SW_NOW=$NOW FM_SW_PGREP="$1" bash "$SW"; echo $?; }
 alive="echo 123"; dead="true"
 setbeat() { touch -d "@$1" "$T/state/.last-watcher-beat"; }
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1 (got $2 want $3)"; fail=1; fi; }
@@ -35,4 +45,6 @@ check stale-queue "$(run "$alive")" 1; tail -1 "$T/state/.silent-watcher-alerts"
 run "$alive" >/dev/null; rm -f "$T/state/.silent-watcher.incident"
 # HOLD silences queue check only
 touch "$T/state/HOLD"; check hold-queue "$(run "$alive")" 0; check hold-dead "$(run "$dead")" 1
+# every scenario above alerted or recovered; none may have reached the webhook
+check no-webhook-post "$([ -f "$T/curl.calls" ] && wc -l < "$T/curl.calls" || echo 0)" 0
 exit $fail
