@@ -1869,6 +1869,41 @@ exit 0')
   pass "watch-arm: one quick exit 1 is retried once before waking the orchestrator"
 }
 
+test_arm_retry_ledger_row_keeps_the_first_attempts_stderr_and_a_reason() {
+  local dir status row
+  dir=$(make_scripted_watch_arm arm-retry-ledger-detail '[ "$n" -ge 2 ] || {
+  echo "watcher: lock held by live pid 4242 but heartbeat is stale for 400s (>300s); inspect or stop that watcher before re-arming." >&2
+  exit 1
+}
+echo "check: scripted wake"
+exit 0')
+  run_scripted_arm "$dir"
+  status=$?
+  expect_code 0 "$status" "a retried stale-holder refusal followed by a good cycle must succeed: $(cat "$dir/arm.out")"
+  row=$(grep 'reason=nonzero-exit-retry' "$dir/state/.watch-cycle-exits.log")
+  [ -n "$row" ] || fail "the retry was not recorded in the lifecycle ledger"
+  case "$row" in *"detail=stale-live-holder: watcher: lock held by live pid 4242 but heartbeat is stale for 400s"*) ;; *)
+    fail "the retry row lacks the first attempt's reason and stderr: $row" ;; esac
+  [ "$(printf '%s\n' "$row" | wc -l)" = 1 ] || fail "the retry produced more than one ledger row: $row"
+  grep -q 'lock held by live pid 4242' "$dir/arm.out" || fail "the first attempt's stderr no longer reaches the arm's own stderr: $(cat "$dir/arm.out")"
+  ! ls "$dir"/state/.watch-arm-output.* >/dev/null 2>&1 || fail "the arm left its capture files behind"
+
+  dir=$(make_scripted_watch_arm arm-retry-ledger-detail-other '[ "$n" -ge 2 ] || { echo "boom: something else" >&2; exit 1; }
+echo "check: scripted wake"
+exit 0')
+  run_scripted_arm "$dir"
+  row=$(grep 'reason=nonzero-exit-retry' "$dir/state/.watch-cycle-exits.log")
+  case "$row" in *"detail=stderr: boom: something else"*) ;; *) fail "another stderr was not recorded with its own reason: $row" ;; esac
+
+  dir=$(make_scripted_watch_arm arm-retry-ledger-detail-silent '[ "$n" -ge 2 ] || exit 1
+echo "check: scripted wake"
+exit 0')
+  run_scripted_arm "$dir"
+  row=$(grep 'reason=nonzero-exit-retry' "$dir/state/.watch-cycle-exits.log")
+  case "$row" in *"detail=no-stderr"*) ;; *) fail "a silent exit was not recorded as such: $row" ;; esac
+  pass "watch-arm: the nonzero-exit-retry ledger row records the first attempt's stderr and a reason"
+}
+
 test_arm_retries_only_once() {
   local dir status
   dir=$(make_scripted_watch_arm arm-retry-once-only 'exit 1')
@@ -2018,6 +2053,7 @@ test_arm_retry_delay_honors_term_and_a_removed_script() {
 }
 
 test_arm_retries_once_after_a_quick_exit_1
+test_arm_retry_ledger_row_keeps_the_first_attempts_stderr_and_a_reason
 test_arm_retries_only_once
 test_arm_does_not_retry_a_slow_or_non_1_exit
 test_arm_retry_is_off_at_zero_and_leaves_no_marker

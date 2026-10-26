@@ -57,7 +57,8 @@
 # (default 10) of its launch, before this arm ever confirmed it ("watcher:
 # started"), is usually a transient start hiccup, so the arm waits
 # FM_ARM_RETRY_DELAY seconds (default 1) and re-arms exactly once (the ledger row
-# reads reason=nonzero-exit-retry) before the failure wakes the orchestrator. A
+# reads reason=nonzero-exit-retry, with a trailing detail= field holding the first
+# attempt's stderr and a reason, docs/watcher-continuity.md) before the failure wakes the orchestrator. A
 # slower exit, a watcher that had been confirmed, an arm whose ground was removed,
 # any other exit code, or the second quick exit 1 surfaces as usual. The retry
 # re-execs with --restart when the arm had it, and the marker is removed from the
@@ -246,12 +247,14 @@ cycle_signal_name() {
   kill -l "$signal_number" 2>/dev/null || printf '%s' "$signal_number"
 }
 
-cycle_log_append() {
-  local exit_code=$1 signal=$2 reason=$3 successor=$4 ended_at beacon_age lock_after size tmp raw i
+cycle_log_append() {  # <exit> <signal> <reason> <successor> [detail]
+  local exit_code=$1 signal=$2 reason=$3 successor=$4 detail=${5:-} ended_at beacon_age lock_after size tmp raw i detail_field=
   [ "$cycle_active" -eq 1 ] || return 0
   ended_at=$(date +%s)
   beacon_age=$(fm_path_age "$BEAT")
   lock_after=$(lock_snapshot)
+  # Only the retry row carries a detail, as an extra trailing field.
+  [ -z "$detail" ] || detail_field=$(printf '\tdetail=%s' "$(cycle_clean_field "$detail")")
 
   i=0
   while ! fm_lock_try_acquire "$CYCLE_LOG_LOCK"; do
@@ -259,7 +262,7 @@ cycle_log_append() {
     sleep 0.02
     i=$((i + 1))
   done
-  printf 'arm_pid=%s\twatcher_pid=%s\torigin=%s\tstarted_at=%s\tended_at=%s\texit_code=%s\tsignal=%s\treason=%s\tbeacon_age=%s\tlock_before=%s\tlock_after=%s\tsuccessor=%s\n' \
+  printf 'arm_pid=%s\twatcher_pid=%s\torigin=%s\tstarted_at=%s\tended_at=%s\texit_code=%s\tsignal=%s\treason=%s\tbeacon_age=%s\tlock_before=%s\tlock_after=%s\tsuccessor=%s%s\n' \
     "$ARM_PID" \
     "$(cycle_clean_field "$cycle_watcher_pid")" \
     "$(cycle_clean_field "$cycle_origin")" \
@@ -271,7 +274,8 @@ cycle_log_append() {
     "$beacon_age" \
     "$(cycle_clean_field "$cycle_lock_before")" \
     "$(cycle_clean_field "$lock_after")" \
-    "$(cycle_clean_field "$successor")" >> "$CYCLE_LOG" 2>/dev/null || true
+    "$(cycle_clean_field "$successor")" \
+    "$detail_field" >> "$CYCLE_LOG" 2>/dev/null || true
 
   size=$(wc -c < "$CYCLE_LOG" 2>/dev/null | tr -d '[:space:]')
   case "$size" in
@@ -709,12 +713,16 @@ fi
 # wake exit propagates out so the harness re-notifies firstmate.
 child=
 child_out=
+child_err=
 cleanup_child() {
   if [ -n "$child" ] && fm_pid_alive "$child"; then
     kill -TERM "$child" 2>/dev/null || true
   fi
   if [ -n "$child_out" ]; then
     rm -f "$child_out" 2>/dev/null || true
+  fi
+  if [ -n "$child_err" ]; then
+    rm -f "$child_err" 2>/dev/null || true
   fi
 }
 
@@ -754,10 +762,13 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
 # date(1) exposes whole seconds. Keep the configured confirmation budget from
 # collapsing when startup begins just before the next second boundary.
 deadline=$(( $(date +%s) + CONFIRM_TIMEOUT + 1 ))
+# The watcher's stderr keeps streaming to this arm's stderr, and a copy is kept
+# so a quick-exit retry can ledger why the first attempt failed.
+child_err="$child_out.err"
 if [ -n "${FM_WATCH_PREDECESSOR_ARM_PID:-}" ]; then
-  FM_WATCH_HANDLING_SUCCESSOR=1 "$WATCH" >"$child_out" &
+  FM_WATCH_HANDLING_SUCCESSOR=1 "$WATCH" >"$child_out" 2> >(tee "$child_err" >&2) &
 else
-  "$WATCH" >"$child_out" &
+  "$WATCH" >"$child_out" 2> >(tee "$child_err" >&2) &
 fi
 child=$!
 ARM_CHILD_LAUNCHED=$(date +%s)
@@ -777,6 +788,19 @@ arm_should_retry_quick_exit() {  # <exit-code>
   ! arm_ground_gone
 }
 
+# Why the first attempt failed, for the retry's ledger row: a refused live but
+# stale singleton holder is named (the retry meets the same holder again), any
+# other stderr is quoted, and a silent exit says so.
+retry_detail() {  # <stderr-copy>
+  local text
+  text=$(head -c 400 "$1" 2>/dev/null | tr '\n' ' ')
+  case "$text" in
+    '') printf 'no-stderr' ;;
+    *"lock held by live pid "*"heartbeat is stale"*) printf 'stale-live-holder: %s' "$text" ;;
+    *) printf 'stderr: %s' "$text" ;;
+  esac
+}
+
 owned_child_finished() {
   local rc=$1 signal reason_type status
   signal=$(cycle_signal_name "$rc")
@@ -784,7 +808,7 @@ owned_child_finished() {
     reason_type=$(watch_output_reason_type "$child_out")
     cycle_log_append "$rc" "$signal" "$reason_type" none
     print_watch_output "$child_out"
-    rm -f "$child_out" 2>/dev/null || true
+    rm -f "$child_out" "$child_err" 2>/dev/null || true
     child=
     child_out=
     return 0
@@ -794,7 +818,7 @@ owned_child_finished() {
     if wait_for_healthy_successor; then
       cycle_log_append "$rc" "$signal" unexpected-clean-exit "attached:$HEALTHY_PID"
       print_watch_output "$child_out"
-      rm -f "$child_out" 2>/dev/null || true
+      rm -f "$child_out" "$child_err" 2>/dev/null || true
       child=
       child_out=
       cycle_mark_predecessor_successor "attached:$HEALTHY_PID"
@@ -804,7 +828,7 @@ owned_child_finished() {
       return $?
     fi
     print_watch_output "$child_out"
-    rm -f "$child_out" 2>/dev/null || true
+    rm -f "$child_out" "$child_err" 2>/dev/null || true
     child=
     child_out=
     if [ -n "$ARM_GROUND_MISSING" ]; then
@@ -822,14 +846,17 @@ owned_child_finished() {
   reason_type="nonzero-exit"
   [ "$signal" = none ] || reason_type="signal-exit"
   if arm_should_retry_quick_exit "$rc"; then
+    # Waited on, not slept in the foreground, so a TERM during the delay still
+    # runs the arm's handler and records arm-interrupted. The delay also lets
+    # the stderr copy catch up before it is read.
     rm -f "$child_out" 2>/dev/null || true
     child=
     child_out=
-    # Waited on, not slept in the foreground, so a TERM during the delay still
-    # runs the arm's handler and records arm-interrupted.
     sleep "$RETRY_DELAY" &
     wait $!
-    cycle_log_append "$rc" "$signal" nonzero-exit-retry none
+    cycle_log_append "$rc" "$signal" nonzero-exit-retry none "$(retry_detail "$child_err")"
+    rm -f "$child_err" 2>/dev/null || true
+    child_err=
     shopt -s execfail
     FM_ARM_RETRIED=1 exec "$ARM_SCRIPT" ${ARM_RETRY_ARG:+"$ARM_RETRY_ARG"}
     echo "watcher: FAILED - could not re-arm: $ARM_SCRIPT"
@@ -840,7 +867,7 @@ owned_child_finished() {
   if ! grep -q '^watcher: FAILED' "$child_out" 2>/dev/null; then
     echo "watcher: FAILED - watcher cycle exited $rc without an actionable reason"
   fi
-  rm -f "$child_out" 2>/dev/null || true
+  rm -f "$child_out" "$child_err" 2>/dev/null || true
   child=
   child_out=
   status=$rc

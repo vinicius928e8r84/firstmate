@@ -427,6 +427,10 @@ Each record includes:
 - Lock identity before and after close.
 - Successor disposition.
 
+A `nonzero-exit-retry` row carries one extra trailing `detail=` field.
+It names why the first attempt failed: `stale-live-holder` when the watcher refused a live singleton holder whose beacon is stale, `stderr` for any other output, or `no-stderr` for a silent exit.
+Any stderr text follows the label.
+
 The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYCLE_LOG_KEEP_LINES`.
 `state/.watch-triage.log` remains only the watcher's bounded absorbed-wake debug log and carries no lifecycle semantics.
 
