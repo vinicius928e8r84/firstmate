@@ -54,10 +54,12 @@
 # not start a second watcher.
 #
 # Retries once: a watcher child that exits 1 within FM_ARM_QUICK_EXIT_SECONDS
-# (default 10) of its launch is usually a transient start hiccup, so the arm waits
+# (default 10) of its launch, before this arm ever confirmed it ("watcher:
+# started"), is usually a transient start hiccup, so the arm waits
 # FM_ARM_RETRY_DELAY seconds (default 1) and re-arms exactly once (the ledger row
 # reads reason=nonzero-exit-retry) before the failure wakes the orchestrator. A
-# slower exit, any other exit code, or the second quick exit 1 surfaces as usual.
+# slower exit, a watcher that had been confirmed, any other exit code, or the
+# second quick exit 1 surfaces as usual.
 #
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
@@ -752,9 +754,12 @@ cycle_begin "$child" started "$(fm_pid_identity "$child" 2>/dev/null || true)"
 child_done=0
 
 # Header, "retries once". True for the first exit 1 of a watcher that ran no
-# longer than the quick-exit window; a second arm (FM_ARM_RETRIED) never retries.
+# longer than the quick-exit window and was never confirmed; a second arm
+# (FM_ARM_RETRIED) never retries.
+ARM_CHILD_CONFIRMED=0
 arm_should_retry_quick_exit() {  # <exit-code>
   [ "$1" -eq 1 ] || return 1
+  [ "$ARM_CHILD_CONFIRMED" -eq 0 ] || return 1
   [ "${FM_ARM_RETRIED:-}" != 1 ] || return 1
   [ $(( $(date +%s) - cycle_started_at )) -le "$QUICK_EXIT" ]
 }
@@ -847,6 +852,7 @@ while :; do
         echo "watcher: FAILED - established successor could not inspect handling state"
         exit 1
       fi
+      ARM_CHILD_CONFIRMED=1
       cycle_mark_predecessor_successor "started:$child"
       [ "$TAKEN_OVER" -eq 0 ] || cycle_mark_predecessor_successor "started:$child" "$ARM_PID"
       if [ -n "$handling_generation" ]; then
