@@ -21,7 +21,23 @@
 # The script never closes a workspace. It removes only the matching journal,
 # and only after the exact pane is confirmed gone. Every error warns and returns
 # success so session startup continues conservatively.
+#
+# COST. Every step below is local and cheap until a candidate survives the
+# prefilter. The journals are parsed once into an index (no subprocess per
+# journal), one API snapshot is taken for the whole run, and a candidate with no
+# unique home-local journal, with live task metadata, or whose topology already
+# fails the exact-snapshot grammar in that one snapshot is preserved without a
+# lock or another API call. Only a survivor takes the locks and repeats the
+# locked per-candidate proof above, unchanged. Cleanup is idempotent, so the run
+# is bounded by FM_HERDR_CLEANUP_BUDGET seconds (default 40): candidates not
+# reached by then are reported on one `deferred` warning line and are retried by
+# the next locked session start, never closed on a weaker proof.
 set -u
+
+# A busy pane makes the idle-shell proof retry its settle window, one Herdr API
+# call per sample; bound that window by wall time so a few busy panes cannot
+# spend the whole cleanup budget on a host where each call is slow.
+export FM_BACKEND_HERDR_IDLE_SHELL_PROOF_WINDOW="${FM_HERDR_CLEANUP_PROOF_WINDOW:-4}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
@@ -62,25 +78,59 @@ fm_herdr_cleanup_home_identity() {
   (cd "$FM_HOME" 2>/dev/null && pwd -P)
 }
 
-fm_herdr_cleanup_journal_matches() { # <title> <session> <home-real>
-  local title=$1 session=$2 home_real=$3 journal id expected journal_home
+# Journals of one home name the same home path, so resolve each distinct path
+# once per run instead of forking a subshell for every journal on every walk.
+# Sets FM_HERDR_CLEANUP_JOURNAL_HOME_REAL; no subshell, so the cache persists.
+FM_HERDR_CLEANUP_HOME_CACHE_KEY=
+FM_HERDR_CLEANUP_HOME_CACHE_VALUE=
+fm_herdr_cleanup_resolve_journal_home() { # <journal-home>
+  if [ "$1" != "$FM_HERDR_CLEANUP_HOME_CACHE_KEY" ] || [ -z "$FM_HERDR_CLEANUP_HOME_CACHE_KEY" ]; then
+    FM_HERDR_CLEANUP_HOME_CACHE_VALUE=$(fm_backend_herdr_projection_home_identity "$1" 2>/dev/null) \
+      || { FM_HERDR_CLEANUP_HOME_CACHE_KEY=; return 1; }
+    FM_HERDR_CLEANUP_HOME_CACHE_KEY=$1
+  fi
+  FM_HERDR_CLEANUP_JOURNAL_HOME_REAL=$FM_HERDR_CLEANUP_HOME_CACHE_VALUE
+}
+
+# One walk over the home's journals, printing a tab-separated
+# "<expected-label>\t<journal>\t<task-id>\t<token>" record for every journal
+# that validates and, for a version 2 journal, names this home and session.
+# Each distinct journal home is resolved once per walk, never across walks.
+fm_herdr_cleanup_journal_records() { # <session> <home-real>
+  local session=$1 home_real=$2 journal id expected
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || return 1
+  FM_HERDR_CLEANUP_HOME_CACHE_KEY=
   for journal in "$STATE"/*"$FM_BACKEND_HERDR_PRESENTATION_JOURNAL_SUFFIX"; do
     [ -f "$journal" ] && [ ! -L "$journal" ] || continue
-    id=$(basename "$journal" "$FM_BACKEND_HERDR_PRESENTATION_JOURNAL_SUFFIX")
+    id=${journal##*/}
+    id=${id%"$FM_BACKEND_HERDR_PRESENTATION_JOURNAL_SUFFIX"}
     fm_task_id_creation_valid "$id" || continue
     fm_backend_herdr_projection_journal_snapshot "$journal" "$id" || continue
     if [ "$FM_BACKEND_HERDR_JOURNAL_VERSION" = 2 ]; then
-      journal_home=$(fm_backend_herdr_projection_home_identity \
-        "$FM_BACKEND_HERDR_JOURNAL_HOME" 2>/dev/null) || continue
-      [ "$journal_home" = "$home_real" ] \
+      fm_herdr_cleanup_resolve_journal_home "$FM_BACKEND_HERDR_JOURNAL_HOME" || continue
+      [ "$FM_HERDR_CLEANUP_JOURNAL_HOME_REAL" = "$home_real" ] \
         && [ "$FM_BACKEND_HERDR_JOURNAL_SESSION" = "$session" ] || continue
     fi
-    expected=$(fm_backend_herdr_projection_workspace_label \
-      "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID")
-    [ "$expected" = "$title" ] || continue
-    printf '%s\t%s\t%s\n' "$journal" "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID"
+    fm_backend_herdr_projection_workspace_label_into expected \
+      "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID"
+    printf '%s\t%s\t%s\t%s\n' "$expected" "$journal" "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID"
   done
+}
+
+fm_herdr_cleanup_journal_matches() { # <title> <session> <home-real>
+  local title=$1 records
+  records=$(fm_herdr_cleanup_journal_records "$2" "$3") || return 1
+  fm_herdr_cleanup_records_for_title "$title" "$records"
+}
+
+# Print the "<journal>\t<task-id>\t<token>" part of every record whose label is
+# exactly <title>, from a records document already read.
+fm_herdr_cleanup_records_for_title() { # <title> <records>
+  local title=$1 label rest
+  while IFS=$'\t' read -r label rest; do
+    [ -n "$label" ] && [ "$label" = "$title" ] || continue
+    printf '%s\n' "$rest"
+  done <<< "$2"
 }
 
 fm_herdr_cleanup_unique_match() { # <title> <session> <home-real>
@@ -199,11 +249,45 @@ fm_herdr_cleanup_revalidate() { # <session> <workspace> <tab> <pane> <title> <to
   [ "${focus#*$'\t'}" != "$tab" ]
 }
 
+# Cheap local prefilter, run before any lock or API call. It can only DECLINE a
+# candidate that the locked proof below would also have preserved: no unique
+# home-local journal in the one-pass index, task metadata present, or a topology
+# that already fails the exact-snapshot grammar in the run's single snapshot.
+# A candidate it passes still takes the locks and repeats the whole locked
+# proof, so the prefilter never authorizes a close.
+fm_herdr_cleanup_prefilter() { # <workspace> <title> <token>
+  local workspace=$1 title=$2 token=$3 matches count=0 record id=
+  matches=$(fm_herdr_cleanup_records_for_title "$title" "$FM_HERDR_CLEANUP_INDEX")
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    count=$((count + 1))
+    id=${record#*$'\t'}
+    id=${id%%$'\t'*}
+  done <<< "$matches"
+  [ "$count" -eq 1 ] || return 1
+  if [ -e "$STATE/$id.meta" ] || [ -L "$STATE/$id.meta" ]; then
+    return 1
+  fi
+  if ! fm_herdr_cleanup_snapshot_candidate "$FM_HERDR_CLEANUP_SNAPSHOT" \
+    "$workspace" "$title" "$token" "" "" ""; then
+    fm_herdr_cleanup_warn "$id preserved because its candidate snapshot was ambiguous"
+    return 1
+  fi
+  return 0
+}
+
 fm_herdr_cleanup_one() { # <session> <workspace> <title> <home-real>
   local session=$1 workspace=$2 title=$3 home_real=$4 token journal id task_lock
   local version bound_workspace bound_tab bound_pane presentation_lock snapshot
   local tab pane state close_status=0
   token=$(fm_herdr_cleanup_title_token "$title") || return 0
+  if ! fm_herdr_cleanup_prefilter "$workspace" "$title" "$token"; then
+    return 0
+  fi
+  if [ "$SECONDS" -ge "${FM_HERDR_CLEANUP_DEADLINE:-$SECONDS}" ] && [ -n "${FM_HERDR_CLEANUP_DEADLINE:-}" ]; then
+    FM_HERDR_CLEANUP_DEFERRED=$((FM_HERDR_CLEANUP_DEFERRED + 1))
+    return 0
+  fi
   if ! fm_herdr_cleanup_unique_match "$title" "$session" "$home_real"; then
     return 0
   fi
@@ -294,6 +378,7 @@ fm_herdr_cleanup_one() { # <session> <workspace> <title> <home-real>
 
 fm_herdr_session_cleanup() {
   local session home_real list candidates workspace title journal found=0
+  local budget
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || return 0
   for journal in "$STATE"/*"$FM_BACKEND_HERDR_PRESENTATION_JOURNAL_SUFFIX"; do
     if [ -f "$journal" ] && [ ! -L "$journal" ]; then
@@ -324,10 +409,29 @@ fm_herdr_session_cleanup() {
     fm_herdr_cleanup_warn "session '$session' workspace discovery was unreadable; preserving every candidate"
     return 0
   }
+  FM_HERDR_CLEANUP_INDEX=$(fm_herdr_cleanup_journal_records "$session" "$home_real") || {
+    fm_herdr_cleanup_warn 'journal index is unreadable; preserving every candidate'
+    return 0
+  }
+  FM_HERDR_CLEANUP_SNAPSHOT=$(fm_backend_herdr_cli "$session" api snapshot 2>/dev/null) || {
+    fm_herdr_cleanup_warn "session '$session' topology snapshot failed; preserving every candidate"
+    return 0
+  }
+  [ -n "$FM_HERDR_CLEANUP_SNAPSHOT" ] || {
+    fm_herdr_cleanup_warn "session '$session' topology snapshot was empty; preserving every candidate"
+    return 0
+  }
+  budget=${FM_HERDR_CLEANUP_BUDGET:-40}
+  case "$budget" in ''|*[!0-9]*) budget=40 ;; esac
+  FM_HERDR_CLEANUP_DEADLINE=$((SECONDS + budget))
+  FM_HERDR_CLEANUP_DEFERRED=0
   while IFS=$'\t' read -r workspace title; do
     [ -n "$workspace" ] && [ -n "$title" ] || continue
     fm_herdr_cleanup_one "$session" "$workspace" "$title" "$home_real"
   done <<< "$candidates"
+  if [ "$FM_HERDR_CLEANUP_DEFERRED" -gt 0 ]; then
+    fm_herdr_cleanup_warn "deferred: ${budget}s budget spent with $FM_HERDR_CLEANUP_DEFERRED candidate(s) not examined; the next locked session start retries them and no pane was closed on a weaker proof"
+  fi
   return 0
 }
 

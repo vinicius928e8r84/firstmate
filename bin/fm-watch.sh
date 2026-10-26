@@ -1118,6 +1118,9 @@ secondmate_liveness_tick() {
       relaunchable)
         if [ -e "$bound_marker" ] || [ -L "$bound_marker" ]; then
           :
+        elif fm_hold_active; then
+          # state/HOLD: no attempt, ledger row, kill or wake while the stop order stands.
+          triage_log "secondmate $id relaunch held by $(fm_hold_file)${FM_HOLD_REASON:+ ($FM_HOLD_REASON)}; endpoint left $FM_SM_LIVE_STATE"
         elif ! attempts=$(fm_secondmate_liveness_recent_attempts "$id" "$SECONDMATE_LIVENESS_WINDOW_SECS"); then
           err="relaunch ledger is unreadable; endpoint left $FM_SM_LIVE_STATE"
         elif [ "$attempts" -ge "$SECONDMATE_LIVENESS_MAX_ATTEMPTS" ]; then
@@ -2562,6 +2565,13 @@ captain_call_stale_bound() {  # <window-key> <task>
   stale_wait_throttled "$key" "$STALE_WAIT_DECLARATION"
 }
 
+# 0 when the task's latest status line is a done: report.
+status_last_is_done() {  # <status-file>
+  local line
+  line=$(last_status_line "$1")
+  [ -n "$line" ] && [ "$(status_line_verb "$line")" = "done" ]
+}
+
 # Surface a stale pane no classifier could resolve, so firstmate inspects it: it
 # may have finished through an interactive menu that wrote no status, be waiting on
 # a decision, or be wedged. pause_state_class deliberately answers `none` for a
@@ -2582,7 +2592,7 @@ captain_call_stale_bound() {  # <window-key> <task>
 # above): the status line the worker declared, and the backlog hold firstmate
 # recorded once the captain took the work in hand.
 surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
-  local win=$1 h=$2 dialog=${3-} key task last declared=1 bounded=1 throttled=1 until now reason=''
+  local win=$1 h=$2 dialog=${3-} key task last declared=1 bounded=1 throttled=1 gated=1 until now reason=''
   key=$(window_key "$win")
   task=$(window_to_task "$win" "$STATE")
   last=$(status_declared_wait_line "$STATE/$task.status")
@@ -2620,9 +2630,17 @@ surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
   elif [ -n "$STALE_WAIT_DECLARATION" ]; then
     bounded=0
   fi
+  # A declared wait keeps its own bounded re-surface cadence; the gate is for undeclared quiet panes.
+  if [ "$throttled" -ne 0 ] && [ "$declared" -ne 0 ] && ! fm_wake_gate_check "stale:$win:nonterminal" "$task"; then
+    fm_wake_gate_record
+    triage_log "absorbed non-terminal stale (state unchanged since this alarm was delivered): $win"
+    throttled=0
+    gated=0
+  fi
   if [ "$throttled" -ne 0 ]; then
     reason=$(stale_reason_naming_dialog "stale: $win" "$dialog")
     fm_wake_append stale "$win" "$reason" || exit 1
+    fm_wake_gate_record
     stale_wait_record "$key"
   fi
   printf '%s' "$h" > "$STATE/.stale-$key"
@@ -2645,7 +2663,7 @@ surface_nonterminal_stale() {  # <window> <hash> [dialog-name]
     clear_pause_state "$key"
   fi
   if [ "$throttled" -eq 0 ]; then
-    triage_log "absorbed non-terminal stale (declared wait or open captain call already re-surfaced this window): $win"
+    [ "$gated" -eq 0 ] || triage_log "absorbed non-terminal stale (declared wait or open captain call already re-surfaced this window): $win"
     return 0
   fi
   wake "$reason"
@@ -3904,6 +3922,15 @@ EOF
               date +%s > "$ssf"
               clear_write_tracking "$key"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
+            elif status_last_is_done "$STATE/$task.status" && ! task_captain_call_open "$task"; then
+              # A finished task has nothing left to supervise: its done: line was
+              # already presented as a signal, so a pane going quiet behind it is
+              # not an alarm. Teardown, not a wake, retires it. Work held for the
+              # captain keeps its bounded reminder, so it is excluded here.
+              printf '%s' "$h" > "$sf"
+              wedge_episode_end "$key" 0 1
+              clear_write_tracking "$key"
+              triage_log "absorbed stale (latest status is done): $w"
             elif captain_call_stale_bound "$key" "$task"; then
               # The line is captain-relevant and stays so, but the backlog says
               # the captain already holds this work: further NEW pane hashes with
@@ -3917,9 +3944,16 @@ EOF
               wedge_episode_end "$key" 0 1
               clear_write_tracking "$key"
               triage_log "absorbed stale (open captain call already surfaced for this status): $w"
+            elif ! fm_wake_gate_check "stale:$w:terminal" "$task"; then
+              fm_wake_gate_record
+              printf '%s' "$h" > "$sf"
+              wedge_episode_end "$key" 0 1
+              clear_write_tracking "$key"
+              triage_log "absorbed stale (state unchanged since this alarm was delivered): $w"
             else
               stale_reason=$(stale_reason_naming_dialog "stale: $w" "$dialog")
               fm_wake_append stale "$w" "$stale_reason" || exit 1
+              fm_wake_gate_record
               stale_wait_record "$key"
               printf '%s' "$h" > "$sf"
               # Pre-cap shape kept the count here (keep-count contract).
@@ -4076,9 +4110,17 @@ EOF
     # without exiting); the away-mode daemon, when present, owns triage and wants
     # every heartbeat.
     if afk_present; then
-      fm_wake_append heartbeat heartbeat heartbeat || exit 1
+      if fm_wake_gate_check heartbeat; then
+        fm_wake_append heartbeat heartbeat heartbeat || exit 1
+        fm_wake_gate_record
+        touch "$STATE/.last-heartbeat"
+        wake "heartbeat"
+      else
+        fm_wake_gate_record
+      fi
       touch "$STATE/.last-heartbeat"
-      wake "heartbeat"
+      echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
+      triage_log "absorbed heartbeat (state unchanged since the last delivered heartbeat)"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant event the per-wake path absorbed by mistake.
       # Enqueue first, then record every status log surfaced through its end so the

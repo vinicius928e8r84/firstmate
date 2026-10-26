@@ -25,18 +25,78 @@ set -u
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
+# Every wait budget below is written in 0.1s ticks for an idle host. This suite
+# also runs on CPU-saturated machines, where one watcher's exit cleanup alone can
+# take longer than ten idle seconds, so wake-helpers' wait_for_exit and the waits
+# here are stretched by this factor. A watcher that really hangs still fails, only
+# later. Set FM_TEST_WAIT_SCALE=1 to get the idle-host budgets back.
+FM_TEST_WAIT_SCALE=${FM_TEST_WAIT_SCALE:-6}
+case "$FM_TEST_WAIT_SCALE" in ''|*[!0-9]*|0) FM_TEST_WAIT_SCALE=6 ;; esac
+
 TMP_ROOT=$(fm_test_tmproot fm-watch-triage-tests)
 
+# The recovery state a failed ack_stopped_cycle was waiting on, so a failure on a
+# saturated host says whether the stopped watcher ever published its episode.
+ack_stopped_cycle_state() {  # <state>
+  local state=$1 lockpid=''
+  [ ! -r "$state/.watch.lock/pid" ] || IFS= read -r lockpid < "$state/.watch.lock/pid" || true
+  printf 'ack_stopped_cycle state: marker=[%s] watch.lock=%s lock_pid=[%s] lock_pid_alive=%s queue_bytes=%s beat_age=%s\n' \
+    "$(cat "$state/.watcher-down" 2>/dev/null || true)" \
+    "$([ -e "$state/.watch.lock" ] || [ -L "$state/.watch.lock" ] && echo present || echo absent)" \
+    "$lockpid" "$([ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null && echo yes || echo no)" \
+    "$([ -e "$state/.wake-queue" ] && wc -c < "$state/.wake-queue" | tr -d '[:space:]' || echo none)" \
+    "$(beat=$(file_mtime "$state/.last-watcher-beat"); [ -n "$beat" ] && echo "$(( $(date +%s) - beat ))s" || echo none)" >&2
+  tail -n 5 "$state/.watch-triage.log" 2>/dev/null | sed 's/^/ack_stopped_cycle triage: /' >&2
+}
+
 ack_stopped_cycle() {  # <state>
-  local state=$1 err sequence generation
+  local state=$1 err sequence generation deadline rc
   err="$state/.test-cycle-drain.err"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
-  sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
-  generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
-  rm -f "$err"
-  [ -n "$sequence" ] && [ -n "$generation" ] || return 1
-  FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
-    --recovery-generation "$generation"
+  # The watcher publishes its recovery episode synchronously in its own exit
+  # cleanup, so a stop observed by wait_for_exit or reap already has one. A drain
+  # can still come back empty on a saturated host: it exits 0 with "WAKE DRAIN
+  # SKIPPED ... retry on the next drain" when the queue lock is held past its
+  # presentation timeout, and detached side-band children can hold locks briefly
+  # after the watcher is gone. Such a drain is retried until a bounded, generous
+  # deadline; a stop that never publishes its episode still fails.
+  # A drain that exits non-zero for a load symptom (the queue lock could not be
+  # acquired safely, the branch-outcomes section failed, a recovery-marker
+  # transition errored) is retried the same way, and so is the acknowledging drain,
+  # which is idempotent for a generation already acknowledged. Exit 2 is a usage
+  # error, never a load symptom, so it fails at once. The last attempt's stderr is
+  # printed, and kept in the case directory, when the helper gives up.
+  deadline=$((SECONDS + 40 * FM_TEST_WAIT_SCALE))
+  while :; do
+    sequence= generation= rc=0
+    FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
+      generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
+    fi
+    if [ -n "$sequence" ] && [ -n "$generation" ]; then
+      rm -f "$err"
+      break
+    fi
+    if [ "$rc" -eq 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
+      printf 'ack_stopped_cycle: giving up, the last drain exited %s with stderr:\n' "$rc" >&2
+      cat "$err" >&2 2>/dev/null || true
+      ack_stopped_cycle_state "$state"
+      return 1
+    fi
+    sleep 0.5
+  done
+  while :; do
+    rc=0
+    FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
+      --recovery-generation "$generation" || rc=$?
+    [ "$rc" -ne 0 ] || break
+    if [ "$rc" -eq 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
+      printf 'ack_stopped_cycle: giving up, the acknowledging drain exited %s\n' "$rc" >&2
+      ack_stopped_cycle_state "$state"
+      return 1
+    fi
+    sleep 0.5
+  done
 }
 
 # Common watcher knobs: tight poll/grace, no check or heartbeat cadence unless a
@@ -77,6 +137,7 @@ wait_live() {
 # 0 if the watcher is still alive after a completed cycle, 1 if it exited.
 wait_poll_cycle() {  # <state> <pid> [limit-ticks]
   local state=$1 pid=$2 limit=${3:-300} beat first now i=0
+  limit=$((limit * FM_TEST_WAIT_SCALE))
   beat="$state/.last-watcher-beat"
   rm -f "$beat"
   first=""
@@ -99,7 +160,8 @@ wait_poll_cycle() {  # <state> <pid> [limit-ticks]
   return 1
 }
 
-# Every wait_for_exit budget in this file is 100 ticks (10s), not because any
+# Every wait_for_exit budget in this file is 100 ticks (10s) before FM_TEST_WAIT_SCALE
+# stretches it for a loaded host, not because any
 # watcher takes that long to decide, but because fm-watch.sh does bounded
 # startup work before its first poll: a tighter budget reaps the process while
 # it is still starting and reports a spurious "did not surface" failure. A
@@ -107,6 +169,7 @@ wait_poll_cycle() {  # <state> <pid> [limit-ticks]
 # exits still fails the assertion when the budget runs out.
 wait_numeric_file() {
   local file=$1 limit=${2:-30} i=0 value
+  limit=$((limit * FM_TEST_WAIT_SCALE))
   while [ "$i" -lt "$limit" ]; do
     value=$(cat "$file" 2>/dev/null || true)
     case "$value" in
@@ -176,7 +239,7 @@ record_pi_busy() {  # <state-dir> <id>
 }
 
 # Stop an owned watcher. TERM must end it through its EXIT cleanup, so one still
-# alive after the file's standard 100-tick budget fails the case here, with the
+# alive after the file's standard 100-tick (scaled) budget fails the case here, with the
 # process evidence wait_for_exit prints, instead of an unbounded wait hanging
 # the whole suite until the CI job timeout.
 reap() {
@@ -184,7 +247,7 @@ reap() {
   kill "$1" 2>/dev/null || true
   wait_for_exit "$1" 100
   rc=$?
-  [ "$rc" -ne 124 ] || fail "watcher pid $1 did not exit within 10s of TERM"
+  [ "$rc" -ne 124 ] || fail "watcher pid $1 did not exit within its exit budget after TERM"
 }
 
 # --- pure classifier predicates (fm-classify-lib.sh) ------------------------
@@ -948,7 +1011,7 @@ churn_config() {  # <dir> [off]
 # unchanging fixture pane could reach the stale backbone.
 wait_for_absorbed() {  # <state> <pid> <needle>
   local state=$1 pid=$2 needle=$3 i=0
-  while [ "$i" -lt 100 ]; do
+  while [ "$i" -lt $(( 100 * FM_TEST_WAIT_SCALE )) ]; do
     grep -Fq "$needle" "$state/.watch-triage.log" 2>/dev/null && return 0
     kill -0 "$pid" 2>/dev/null || return 1
     sleep 0.1
@@ -1015,7 +1078,7 @@ test_turn_ended_churn_resets_prior_stale_classification() {
   wait_for_absorbed "$state" "$pid" "absorbed benign signal:" \
     || { reap "$pid"; fail "a churning turn-end with prior stale state was not absorbed: $(cat "$out")"; }
   i=0
-  while [ "$i" -lt 100 ] && [ "$(cat "$state/.hash-$key" 2>/dev/null || true)" != "$active_hash" ]; do
+  while [ "$i" -lt $(( 100 * FM_TEST_WAIT_SCALE )) ] && [ "$(cat "$state/.hash-$key" 2>/dev/null || true)" != "$active_hash" ]; do
     kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited before recording the active pane"; }
     sleep 0.1
     i=$((i + 1))
@@ -1243,13 +1306,19 @@ unknown_alive_stale_case() {  # <evidence: status|worktree|none>
 }
 
 test_unknown_alive_stale_is_bounded_after_its_first_alarm() {
+  # These cases pin the watcher's own re-surface cadence, so the unchanged-state gate (tests/fm-wake-gate.test.sh) is forced open.
+  export FM_WAKE_HASH_FORCE_SECS=0
   unknown_alive_stale_case status
   unknown_alive_stale_case worktree
+  unset FM_WAKE_HASH_FORCE_SECS
   pass "an unknown-but-alive pane with progress evidence alarms once per bounded pause-resurface window"
 }
 
 test_unknown_alive_stale_without_progress_keeps_surfacing() {
+  # These cases pin the watcher's own re-surface cadence, so the unchanged-state gate (tests/fm-wake-gate.test.sh) is forced open.
+  export FM_WAKE_HASH_FORCE_SECS=0
   unknown_alive_stale_case none
+  unset FM_WAKE_HASH_FORCE_SECS
   pass "an unknown-but-alive pane without progress evidence keeps surfacing every new hash"
 }
 
@@ -2357,7 +2426,8 @@ test_terminal_stale_surfaced() {
   window="test:fm-done"
   printf 'finished, awaiting review' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/done.meta"
-  printf 'done: PR https://example.test/pr/3\n' > "$state/done.status"
+  # A done: line is excluded here on purpose: tests/fm-wake-gate.test.sh owns the done gate.
+  printf 'needs-decision: pick A or B\n' > "$state/done.status"
   sig=$(seen_sig "$state/done.status"); printf '%s' "$sig" > "$state/.seen-done_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "finished, awaiting review")
@@ -4319,7 +4389,7 @@ test_wedge_guard_failures_fail_open() {
   local working='state: working · source: run-step · ci running'
   window="test:fm-wedge"; key=$(printf '%s' "$window" | tr ':/.' '___')
   for spec in \
-    'timeout|sleep 10' \
+    "timeout|sleep $((100 * FM_TEST_WAIT_SCALE))" \
     'nonzero|printf "%s\n" "{\"status\":\"CRITICAL\",\"recommendation\":\"r\"}"; exit 3' \
     'malformed|printf "%s\n" "CRITICAL ticket 7"' \
     'two-documents|printf "%s\n" "{\"status\":\"CRITICAL\",\"recommendation\":\"r\"}" "{\"status\":\"OK\",\"recommendation\":\"r\"}"' \
@@ -4642,7 +4712,7 @@ hold_watch_surface() {  # <dir> <out> <capture> <pane-text>
   local dir=$1 out=$2 capture=$3 text=$4
   printf '%s\n' "$text" > "$capture"
   hold_watch_launch "$dir" "$out" "$capture"
-  wait_for_exit "$HOLD_WATCH_PID" 100 || { reap "$HOLD_WATCH_PID"; return 1; }
+  wait_for_exit "$HOLD_WATCH_PID" 300 || { reap "$HOLD_WATCH_PID"; return 1; }
   return 0
 }
 
@@ -4681,6 +4751,9 @@ test_open_captain_call_bounds_stale_churn() {
   local spec name line dir state out capture throttle wakes
   command -v tasks-axi >/dev/null 2>&1 \
     || { echo "skip: tasks-axi not found (captain-hold stale bound)"; return 0; }
+  # The re-surface window is a pane-driven reminder cadence the unchanged-state gate
+  # (tests/fm-wake-gate.test.sh) may defer up to its six-hour bound, so the gate is forced open here.
+  export FM_WAKE_HASH_FORCE_SECS=0
   for spec in \
     'held-delivery|done: PR https://example.invalid/pull/1 checks green' \
     'held-worker-line|working: still tidying the branch'
@@ -4715,6 +4788,7 @@ test_open_captain_call_bounds_stale_churn() {
     [ "$wakes" -eq 1 ] \
       || fail "[$name] elapsed re-surface window produced $wakes wakes instead of one"
   done
+  unset FM_WAKE_HASH_FORCE_SECS
   pass "work under an open captain call surfaces once, absorbs pane churn, then re-surfaces when the window elapses"
 }
 
@@ -4727,8 +4801,10 @@ test_stale_churn_without_a_captain_call_still_alarms() {
   local spec name line dir state out capture round wakes
   command -v tasks-axi >/dev/null 2>&1 \
     || { echo "skip: tasks-axi not found (unheld stale alarm)"; return 0; }
+  # A done: delivery no longer alarms on a stale pane (tests/fm-wake-gate.test.sh owns that),
+  # and these cases pin the per-hash alarm itself, so the unchanged-state gate is forced open.
+  export FM_WAKE_HASH_FORCE_SECS=0
   for spec in \
-    'unheld-delivery|done: PR https://example.invalid/pull/1 checks green' \
     'unheld-blocker|blocked: cannot reach the release host' \
     'unheld-worker-line|working: still tidying the branch'
   do
@@ -4747,6 +4823,7 @@ test_stale_churn_without_a_captain_call_still_alarms() {
       round=$((round + 1))
     done
   done
+  unset FM_WAKE_HASH_FORCE_SECS
   pass "a stale window with no open captain call keeps alarming on every new hash"
 }
 
@@ -4772,7 +4849,7 @@ test_failed_wake_append_does_not_arm_the_captain_hold_throttle() {
   mkdir -p "$state/.wake-queue"
   printf 'idle, elapsed 1s\n' > "$capture"
   hold_watch_launch "$dir" "$out" "$capture"
-  wait_for_exit "$HOLD_WATCH_PID" 100
+  wait_for_exit "$HOLD_WATCH_PID" 300
   rc=$?
   rmdir "$state/.wake-queue"
   [ "$rc" -ne 124 ] || fail "the watcher did not exit when its durable queue could not be written"
@@ -4967,7 +5044,7 @@ test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash() {
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   i=0
-  while [ "$i" -lt 100 ] && kill -0 "$pid" 2>/dev/null; do
+  while [ "$i" -lt $(( 100 * FM_TEST_WAIT_SCALE )) ] && kill -0 "$pid" 2>/dev/null; do
     [ -e "$state/.paused-$key" ] && [ ! -e "$state/.stale-since-$key" ] && break
     sleep 0.1
     i=$((i + 1))
@@ -4988,7 +5065,7 @@ test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash() {
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   i=0
-  while [ "$i" -lt 100 ] && kill -0 "$pid" 2>/dev/null; do
+  while [ "$i" -lt $(( 100 * FM_TEST_WAIT_SCALE )) ] && kill -0 "$pid" 2>/dev/null; do
     [ ! -e "$state/.paused-$key" ] && [ -s "$state/.stale-since-$key" ] && break
     sleep 0.1
     i=$((i + 1))
@@ -5219,14 +5296,17 @@ test_term_stops_a_watcher_blocked_inside_a_poll() {
   sig=$(seen_sig "$state/blocked.status"); printf '%s' "$sig" > "$state/.seen-blocked_status"
   # Opening the write end waits for the capture to open the read end, and the
   # holder then keeps it open without writing, so that capture blocks mid-poll.
-  ( exec 3> "$fifo"; : > "$dir/capture-blocked"; exec sleep 30 ) &
+  # It outlives the scaled stop budget below several times over: a watcher that
+  # only stops once the blocked capture returns (a deferred TERM) must fail this
+  # case, not pass it when the writer finally exits inside a stretched budget.
+  ( exec 3> "$fifo"; : > "$dir/capture-blocked"; exec sleep $(( 600 * FM_TEST_WAIT_SCALE )) ) &
   holder=$!
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$fifo" \
     FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   i=0
-  while [ ! -e "$dir/capture-blocked" ] && [ "$i" -lt 300 ]; do
+  while [ ! -e "$dir/capture-blocked" ] && [ "$i" -lt $(( 300 * FM_TEST_WAIT_SCALE )) ]; do
     sleep 0.1
     i=$((i + 1))
   done
@@ -5282,7 +5362,7 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
   fi
   FM_STATE_OVERRIDE="$state" bash -c '
     . "$1" || exit 1
-    lock=$2 held=$3 release=$4 contended=$5 release_ticks=$6
+    lock=$2 held=$3 release=$4 contended=$5 release_ticks=$6 scale=$7
     fm_lock_acquire_wait_max "$lock" 5 || exit 1
     if [ -n "$release_ticks" ]; then
       record="$(fm_lock_link_owner "$lock")/pid"
@@ -5301,7 +5381,7 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
       writer=$!
       : > "$held"
       i=0
-      while [ ! -e "$contended" ] && [ ! -e "$release" ] && [ "$i" -lt 600 ]; do
+      while [ ! -e "$contended" ] && [ ! -e "$release" ] && [ "$i" -lt $(( 600 * scale )) ]; do
         sleep 0.1
         i=$((i + 1))
       done
@@ -5322,7 +5402,7 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
     else
       : > "$held"
       i=0
-      while [ ! -e "$release" ] && [ "$i" -lt 600 ]; do
+      while [ ! -e "$release" ] && [ "$i" -lt $(( 600 * scale )) ]; do
         sleep 0.1
         i=$((i + 1))
       done
@@ -5330,10 +5410,10 @@ term_watcher_with_held_marker_lock() {  # <dir> [release-ticks]
     fm_lock_release "$lock"
   ' _ "$ROOT/bin/fm-wake-lib.sh" "$state/.watcher-down.lock" "$dir/marker-lock-held" \
     "$dir/release-marker-lock" "$dir/marker-lock-contended" \
-    "$release_ticks" &
+    "$release_ticks" "$FM_TEST_WAIT_SCALE" &
   holder=$!
   i=0
-  while [ ! -e "$dir/marker-lock-held" ] && [ "$i" -lt 100 ]; do
+  while [ ! -e "$dir/marker-lock-held" ] && [ "$i" -lt $(( 100 * FM_TEST_WAIT_SCALE )) ]; do
     sleep 0.1
     i=$((i + 1))
   done
@@ -6315,6 +6395,10 @@ test_terminal_first_sight_drops_a_finished_write_deferral_chain() {
 
   # Same pane, first sight again, but nothing overrides the status line now, so it
   # surfaces. That path drops the idle-window timer, so it must drop the chain too.
+  # The line becomes a needs-decision: because a stale pane behind done: no longer
+  # surfaces at all (tests/fm-wake-gate.test.sh owns that gate).
+  printf 'needs-decision: pick the validation target\n' > "$state/chain-first.status"
+  sig=$(seen_sig "$state/chain-first.status"); printf '%s' "$sig" > "$state/.seen-chain-first_status"
   rm -f "$state/.stale-$key" "$state/.stale-since-$key"
   printf '1\n' > "$state/.count-$key"
   : > "$state/.writing-since-$key"
@@ -6366,7 +6450,7 @@ SH
     reap "$pid"; fail "watcher exited for a benign signal while testing log capping: $(cat "$out")"
   fi
   i=0
-  while [ "$i" -lt 30 ]; do
+  while [ "$i" -lt $(( 30 * FM_TEST_WAIT_SCALE )) ]; do
     lines=$(awk 'END { print NR + 0 }' "$state/.watch-triage.log")
     [ "$lines" -le 2000 ] && break
     sleep 0.1
@@ -6404,7 +6488,7 @@ seed_captured_procevent_result() {  # <dir>
   pe_case "$dir" register lavish delivery-src -- \
     /bin/sh -c 'printf "session:\n  file: /a.html\n  status: waiting\n"' >/dev/null || return 1
   pe_case "$dir" reconcile >/dev/null || return 1
-  while [ "$i" -lt 100 ]; do
+  while [ "$i" -lt $(( 100 * FM_TEST_WAIT_SCALE )) ]; do
     [ -s "$dir/state/.wake-queue" ] && break
     sleep 0.1
     i=$((i + 1))
@@ -6417,7 +6501,7 @@ seed_captured_procevent_result() {  # <dir>
   # runner's last milliseconds. The bound keeps a runner that never releases a
   # real failure at retire rather than a hang here.
   i=0
-  while [ "$i" -lt 100 ]; do
+  while [ "$i" -lt $(( 100 * FM_TEST_WAIT_SCALE )) ]; do
     [ -e "$dir/claims/delivery-src.claim" ] || break
     sleep 0.1
     i=$((i + 1))
@@ -6780,7 +6864,7 @@ test_heartbeat_no_change_absorbed() {
   # FM_HEARTBEAT, which need not be the first completed cycle, so wait for the
   # absorbed heartbeat itself rather than assuming one cycle produced it.
   i=0
-  while [ "$i" -lt 200 ]; do
+  while [ "$i" -lt $(( 200 * FM_TEST_WAIT_SCALE )) ]; do
     [ "$(cat "$state/.heartbeat-streak" 2>/dev/null || echo 0)" -ge 1 ] && break
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1

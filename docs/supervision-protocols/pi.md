@@ -1,8 +1,10 @@
 Mode: Pi extension background wake.
 
 When this session owns supervision, in either posture:
-1. Drain first with `bin/fm-wake-drain.sh`.
-   After handling all emitted wakes and reconciling open decisions and unread status lines, run the exact `--ack-through` command printed as `WAKE_ACK_REQUIRED`; until then the work remains durable for idempotent re-handling after interruption.
+1. A watcher wake arrives with `bin/fm-wake-drain.sh` already run: the wake message carries the drain's own presentation under `WAKE DRAIN`, and the extension runs the acknowledgement (`bin/fm-wake-inline.sh`) when the run that read it settles cleanly.
+   Do not drain or acknowledge that wake again; an aborted, errored, or truncated run acknowledges nothing, so the work stays durable and is presented again by the next drain.
+   Drain first with `bin/fm-wake-drain.sh` and run the exact `--ack-through` command printed as `WAKE_ACK_REQUIRED` only when a wake message tells you to drain (the inline drain was unavailable or `FM_WAKE_INLINE=0`), and at session start.
+   Either way, reconcile open decisions and unread status lines before treating the wake as handled.
 2. Confirm the Pi primary auto-loaded both project extensions (plain `pi` or `pi-signed`, after approving project trust once per clone); if not, restart the selected executable with `-e __FM_PI_TURNEND_EXT__ -e __FM_PI_EXT__` as a trust-free fallback.
 3. Initial process cycle only: make the one required `fm_watch_arm_pi` call; if startup already owned the fleet lock, this is an ownership-based no-op.
    Use `/fm-watch-arm-pi` only as a human-entered fallback.
@@ -19,7 +21,7 @@ When this session owns supervision, in either posture:
 11. Never use shell `&` for watcher supervision.
    The arm mechanism above is extension-owned, not a model tool call, but a manual recovery probe that backgrounds, pipes, or bundles the arm is denied automatically by the PreToolUse seatbelt (`bin/fm-arm-pretool-check.sh`, wired into the turn-end guard extension at `__FM_PI_TURNEND_EXT__`).
 
-The supervision branch is default-on (docs/pi-supervision-branch.md): whenever this session owns the fleet lock, the watcher extension hands eligible task-local rows from ordinary actionable wakes, plus selected fleet-wide heartbeat reviews, to the in-process supervision branch while main-only rows remain queued for this conversation.
+The supervision branch is gated by `config/supervision-branch` (docs/pi-supervision-branch.md; off until a home turns it on, and not gated while the away-posture record exists): when it is on and this session owns the fleet lock, the watcher extension hands eligible task-local rows from ordinary actionable wakes, plus selected fleet-wide heartbeat reviews, to the in-process supervision branch while main-only rows remain queued for this conversation.
 While the away-posture record `state/.afk-contract` exists the branch takes every row instead, this conversation receives no processing request, and main's standing authority relocates to the branch through the guarded scripts; a wake the branch cannot take and every watcher-failure alarm still reach this conversation, and the first run boundary after the record is archived presents what accumulated (docs/pi-supervision-branch.md "Postures").
 Decision-owned signal and stale routing, including whole-batch precedence and the independent heartbeat exception, is owned by [docs/pi-supervision-branch.md](../pi-supervision-branch.md#components-and-their-owners).
 A task-level routine outcome that says the worker is still busy, nothing new has happened since the last outcome, and no action was taken may use `silent=true`; an unchanged heartbeat may do the same with `task=fleet`.

@@ -471,6 +471,30 @@ async function claimSessionstartMessage(
   return sessionstartMessage(generation, result);
 }
 
+// Self-heal request/answer event shared with .pi/extensions/fm-primary-pi-watch.ts
+// (same literal on both sides, like the branch dispatch offer): the guard emits
+// a request object and reads accepted and settlement back synchronously.
+const FM_WATCH_SELFHEAL_EVENT = "fm:watch-selfheal";
+const selfHealAttempts = nonNegativeInteger("FM_GUARD_SELFHEAL_ATTEMPTS", 2);
+const selfHealWaitMs = nonNegativeInteger("FM_GUARD_SELFHEAL_WAIT_MS", 10000);
+
+function nonNegativeInteger(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+function requestWatcherHeal(pi: ExtensionAPI): Promise<boolean> | null {
+  const request: { accepted: boolean; settlement: Promise<boolean> | null } = { accepted: false, settlement: null };
+  try {
+    pi.events?.emit?.(FM_WATCH_SELFHEAL_EVENT, request);
+  } catch {
+    return null;
+  }
+  return request.accepted ? request.settlement : null;
+}
+
 function runGuard(): Promise<{ code: number; stderr: string }> {
   return new Promise((resolveResult) => {
     const invocation = firstmateShellInvocation(`${root}/bin/fm-turnend-guard.sh`, []);
@@ -631,8 +655,24 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const result = await runGuard();
+    let result = await runGuard();
     if (result.code !== 2) return;
+
+    // Self-heal before waking the model (the report behind this: 19 of 29
+    // guard turns were exactly one arm call). The watcher extension repairs
+    // its own cycle on request; the guard predicate then decides again, and
+    // only a cycle that stays unhealthy after the bounded attempts reaches the
+    // model. With no watcher extension answering, nothing waits.
+    for (let attempt = 0; attempt < selfHealAttempts && result.code === 2; attempt += 1) {
+      const healing = requestWatcherHeal(pi);
+      if (!healing) break;
+      await healing;
+      result = await runGuard();
+      if (result.code !== 2) return;
+      if (attempt + 1 < selfHealAttempts) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, selfHealWaitMs));
+      }
+    }
 
     guardFollowupActive = true;
     try {

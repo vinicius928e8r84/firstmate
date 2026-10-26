@@ -131,6 +131,18 @@ fixture_panes() {
 fm_backend_herdr_cli() {
   local _session=$1 first=${2:-} second=${3:-} title tabs panes
   shift
+  [ ! -e "$FIXTURE_DIR/api-calls" ] || printf '%s %s\n' "$first" "$second" >> "$FIXTURE_DIR/api-calls"
+  if [ -e "$FIXTURE_DIR/bulk" ]; then
+    case "$first $second" in
+      "workspace list") printf '{"result":{"workspaces":%s}}\n' "$(cat "$FIXTURE_DIR/bulk-workspaces")"; return 0 ;;
+      "api snapshot")
+        printf '{"result":{"snapshot":{"focused_workspace_id":"w1","focused_tab_id":"w1:t1","focused_pane_id":"w1:p1","workspaces":%s,"tabs":[],"panes":[]}}}\n' \
+          "$(cat "$FIXTURE_DIR/bulk-workspaces")"
+        return 0
+        ;;
+    esac
+    return 1
+  fi
   [ ! -e "$FIXTURE_DIR/error-${first}-${second}" ] || return 1
   if [ -e "$FIXTURE_DIR/closed" ]; then
     case "$first $second" in
@@ -281,6 +293,230 @@ reset_fixture; : > "$FIXTURE_DIR/error-workspace-get"; assert_preserved "unreada
 reset_fixture; : > "$FIXTURE_DIR/race"; assert_preserved "revalidation race"
 reset_fixture; printf '%s\n' "$TAB" > "$FIXTURE_DIR/active-tab"; assert_preserved "active target"
 reset_fixture; : > "$FIXTURE_DIR/focus-refuse"; assert_preserved "focus refusal"
+
+
+# --- cost: parsing and API calls must not scale with journals x candidates ----
+# The journal parse and the candidate loop once forked about forty processes per
+# journal for every candidate and took a locked API snapshot per candidate,
+# minutes of wall time at 66 journals on a CPU-contended host. The checks below
+# count real subprocesses and API calls, which is load-independent.
+
+# The earlier grep/cut/wc journal reader, kept as the oracle the one-pass reader
+# must agree with on every shape of journal, valid or not.
+oracle_journal_field() { # <journal> <key>
+  local journal=$1 key=$2 count
+  count=$(grep -c "^${key}=" "$journal" 2>/dev/null || true)
+  [ "$count" = 1 ] || return 1
+  grep "^${key}=" "$journal" 2>/dev/null | cut -d= -f2-
+}
+
+oracle_journal_snapshot() { # <journal> <task-id>
+  local journal=$1 id=$2 lines expected_label expected_task_label exact
+  FM_BACKEND_HERDR_JOURNAL_VERSION="" FM_BACKEND_HERDR_JOURNAL_TASK_ID=""
+  FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID="" FM_BACKEND_HERDR_JOURNAL_HOME=""
+  FM_BACKEND_HERDR_JOURNAL_SESSION="" FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID=""
+  FM_BACKEND_HERDR_JOURNAL_TAB_ID="" FM_BACKEND_HERDR_JOURNAL_PANE_ID=""
+  FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID="" FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL=""
+  FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL="" FM_BACKEND_HERDR_JOURNAL_TASK_LABEL=""
+  [ -f "$journal" ] && [ ! -L "$journal" ] || return 1
+  lines=$(wc -l < "$journal" 2>/dev/null | tr -d '[:space:]')
+  FM_BACKEND_HERDR_JOURNAL_VERSION=$(oracle_journal_field "$journal" version) || return 1
+  FM_BACKEND_HERDR_JOURNAL_TASK_ID=$(oracle_journal_field "$journal" task_id) || return 1
+  FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID=$(oracle_journal_field "$journal" projection_id) || return 1
+  [ "$FM_BACKEND_HERDR_JOURNAL_TASK_ID" = "$id" ] || return 1
+  [ "${#FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID}" -eq 22 ] || return 1
+  case "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID" in *[!A-Za-z0-9_-]*) return 1 ;; esac
+  case "$FM_BACKEND_HERDR_JOURNAL_VERSION:$lines" in
+    1:3) return 0 ;;
+    2:12) ;;
+    *) return 1 ;;
+  esac
+  FM_BACKEND_HERDR_JOURNAL_HOME=$(oracle_journal_field "$journal" home) || return 1
+  FM_BACKEND_HERDR_JOURNAL_SESSION=$(oracle_journal_field "$journal" session) || return 1
+  FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID=$(oracle_journal_field "$journal" workspace_id) || return 1
+  FM_BACKEND_HERDR_JOURNAL_TAB_ID=$(oracle_journal_field "$journal" tab_id) || return 1
+  FM_BACKEND_HERDR_JOURNAL_PANE_ID=$(oracle_journal_field "$journal" pane_id) || return 1
+  FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID=$(oracle_journal_field "$journal" parent_workspace_id) || return 1
+  FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL=$(oracle_journal_field "$journal" parent_label) || return 1
+  FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL=$(oracle_journal_field "$journal" workspace_label) || return 1
+  FM_BACKEND_HERDR_JOURNAL_TASK_LABEL=$(oracle_journal_field "$journal" task_label) || return 1
+  case "$FM_BACKEND_HERDR_JOURNAL_HOME" in /*) ;; *) return 1 ;; esac
+  for exact in "$FM_BACKEND_HERDR_JOURNAL_SESSION" "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" \
+    "$FM_BACKEND_HERDR_JOURNAL_TAB_ID" "$FM_BACKEND_HERDR_JOURNAL_PANE_ID" \
+    "$FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID"; do
+    case "$exact" in ''|*[[:space:]]*) return 1 ;; esac
+  done
+  [ -n "$FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL" ] \
+    && [ -n "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" ] \
+    && [ -n "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL" ] || return 1
+  expected_label=$(fm_backend_herdr_projection_workspace_label "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID")
+  expected_task_label="fm-$id"
+  [ "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" = "$expected_label" ] \
+    && [ "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL" = "$expected_task_label" ]
+}
+
+journal_globals() {
+  printf '%s|' "$FM_BACKEND_HERDR_JOURNAL_VERSION" "$FM_BACKEND_HERDR_JOURNAL_TASK_ID" \
+    "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID" "$FM_BACKEND_HERDR_JOURNAL_HOME" \
+    "$FM_BACKEND_HERDR_JOURNAL_SESSION" "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" \
+    "$FM_BACKEND_HERDR_JOURNAL_TAB_ID" "$FM_BACKEND_HERDR_JOURNAL_PANE_ID" \
+    "$FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID" "$FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL" \
+    "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL"
+}
+
+compare_journal_readers() { # <case> <journal> <task-id>
+  local name=$1 journal=$2 id=$3 want_rc got_rc want_globals got_globals
+  oracle_journal_snapshot "$journal" "$id"; want_rc=$?
+  want_globals=$(journal_globals)
+  fm_backend_herdr_projection_journal_snapshot "$journal" "$id"; got_rc=$?
+  got_globals=$(journal_globals)
+  [ "$got_rc" = "$want_rc" ] || fail "journal reader disagrees on status for $name: oracle=$want_rc one-pass=$got_rc"
+  [ "$got_globals" = "$want_globals" ] || fail "journal reader disagrees on fields for $name: oracle=$want_globals one-pass=$got_globals"
+}
+
+JOURNAL_CASES="$TMP_ROOT/journal-cases"
+mkdir -p "$JOURNAL_CASES"
+case_journal() { # <name> <task-id> then journal text on stdin
+  cat > "$JOURNAL_CASES/$1"
+  compare_journal_readers "$1" "$JOURNAL_CASES/$1" "$2"
+}
+V2_LINES=$(printf 'version=2\ntask_id=%s\nprojection_id=%s\nhome=%s\nsession=test\nworkspace_id=w2\ntab_id=w2:t1\npane_id=w2:p1\nparent_workspace_id=w1\nparent_label=firstmate\nworkspace_label=%s\ntask_label=fm-%s\n' \
+  "$ID" "$TOKEN" "$FM_HOME" "$TITLE" "$ID")
+case_journal v1-valid "$ID" <<EOF
+version=1
+task_id=$ID
+projection_id=$TOKEN
+EOF
+case_journal v2-valid "$ID" <<EOF
+$V2_LINES
+EOF
+case_journal v1-wrong-id other <<EOF
+version=1
+task_id=$ID
+projection_id=$TOKEN
+EOF
+case_journal v1-extra-line "$ID" <<EOF
+version=1
+task_id=$ID
+projection_id=$TOKEN
+note=x
+EOF
+case_journal v1-duplicate-key "$ID" <<EOF
+version=1
+task_id=$ID
+task_id=$ID
+projection_id=$TOKEN
+EOF
+case_journal v1-missing-key "$ID" <<EOF
+version=1
+projection_id=$TOKEN
+EOF
+case_journal v1-short-token "$ID" <<EOF
+version=1
+task_id=$ID
+projection_id=short
+EOF
+case_journal v1-bad-token-char "$ID" <<EOF
+version=1
+task_id=$ID
+projection_id=AbCdEfGhIjKlMnOpQrSt!!
+EOF
+case_journal v1-empty-value "$ID" <<EOF
+version=1
+task_id=
+projection_id=$TOKEN
+EOF
+case_journal v1-value-with-equals "$ID" <<EOF
+version=1
+task_id=$ID
+projection_id=$TOKEN=
+EOF
+printf 'version=1\ntask_id=%s\nprojection_id=%s' "$ID" "$TOKEN" > "$JOURNAL_CASES/v1-no-final-newline"
+compare_journal_readers v1-no-final-newline "$JOURNAL_CASES/v1-no-final-newline" "$ID"
+printf 'version=1\r\ntask_id=%s\r\nprojection_id=%s\r\n' "$ID" "$TOKEN" > "$JOURNAL_CASES/v1-crlf"
+compare_journal_readers v1-crlf "$JOURNAL_CASES/v1-crlf" "$ID"
+: > "$JOURNAL_CASES/empty"
+compare_journal_readers empty "$JOURNAL_CASES/empty" "$ID"
+compare_journal_readers absent "$JOURNAL_CASES/absent" "$ID"
+ln -sf "$JOURNAL_CASES/v1-valid" "$JOURNAL_CASES/symlink"
+compare_journal_readers symlink "$JOURNAL_CASES/symlink" "$ID"
+printf '%s\n' "$V2_LINES" | sed 's/^session=test$/session=te st/' > "$JOURNAL_CASES/v2-space-in-session"
+compare_journal_readers v2-space-in-session "$JOURNAL_CASES/v2-space-in-session" "$ID"
+printf '%s\n' "$V2_LINES" | sed 's#^home=.*#home=relative/home#' > "$JOURNAL_CASES/v2-relative-home"
+compare_journal_readers v2-relative-home "$JOURNAL_CASES/v2-relative-home" "$ID"
+printf '%s\n' "$V2_LINES" | sed 's/^task_label=.*/task_label=fm-wrong/' > "$JOURNAL_CASES/v2-wrong-task-label"
+compare_journal_readers v2-wrong-task-label "$JOURNAL_CASES/v2-wrong-task-label" "$ID"
+printf '%s\n' "$V2_LINES" | sed 's/^parent_label=.*/parent_label=/' > "$JOURNAL_CASES/v2-empty-parent-label"
+compare_journal_readers v2-empty-parent-label "$JOURNAL_CASES/v2-empty-parent-label" "$ID"
+printf '%s\n' "$V2_LINES" | sed '/^pane_id=/d' > "$JOURNAL_CASES/v2-missing-pane"
+compare_journal_readers v2-missing-pane "$JOURNAL_CASES/v2-missing-pane" "$ID"
+pass "the one-pass journal reader agrees with the grep/cut oracle on every journal shape"
+
+# Many stale journals, every candidate's topology ambiguous: nothing may be
+# closed, the API is read once, and no journal costs a grep/cut/wc/basename.
+COST_N=${FM_TEST_COST_JOURNALS:-30}
+COST_REAL_HOME=$(cd "$FM_HOME" && pwd -P)
+reset_fixture
+rm -f "$FM_STATE_OVERRIDE/$ID.herdr-presentation"
+: > "$FIXTURE_DIR/bulk"
+COST_WORKSPACES='{"workspace_id":"w1","label":"firstmate","focused":true,"active_tab_id":"w1:t1","tab_count":1,"pane_count":1}'
+i=1
+while [ "$i" -le "$COST_N" ]; do
+  cost_id="bulk-$i"
+  cost_token=$(printf 'Bulk%018d' "$i")
+  cost_title="└ $cost_id · p:$cost_token"
+  {
+    printf 'version=2\ntask_id=%s\nprojection_id=%s\nhome=%s\nsession=test\n' "$cost_id" "$cost_token" "$COST_REAL_HOME"
+    printf 'workspace_id=wb%s\ntab_id=wb%s:t1\npane_id=wb%s:p1\n' "$i" "$i" "$i"
+    printf 'parent_workspace_id=w1\nparent_label=firstmate\nworkspace_label=%s\ntask_label=fm-%s\n' "$cost_title" "$cost_id"
+  } > "$FM_STATE_OVERRIDE/$cost_id.herdr-presentation"
+  COST_WORKSPACES="$COST_WORKSPACES,{\"workspace_id\":\"wb$i\",\"label\":\"$cost_title\",\"focused\":false,\"active_tab_id\":\"wb$i:t1\",\"tab_count\":2,\"pane_count\":2}"
+  i=$((i + 1))
+done
+printf '[%s]' "$COST_WORKSPACES" > "$FIXTURE_DIR/bulk-workspaces"
+: > "$FIXTURE_DIR/api-calls"
+
+COUNTBIN="$TMP_ROOT/countbin"
+mkdir -p "$COUNTBIN"
+FORK_LOG="$TMP_ROOT/forks.log"
+: > "$FORK_LOG"
+for tool in grep cut wc basename; do
+  real_tool=$(command -v "$tool")
+  printf '#!/bin/sh\necho %s >> "%s"\nexec "%s" "$@"\n' "$tool" "$FORK_LOG" "$real_tool" > "$COUNTBIN/$tool"
+  chmod +x "$COUNTBIN/$tool"
+done
+SAVED_PATH=$PATH
+PATH="$COUNTBIN:$PATH"
+cost_out=$(fm_herdr_session_cleanup 2>&1)
+PATH=$SAVED_PATH
+
+snapshot_calls=$(grep -c '^api snapshot$' "$FIXTURE_DIR/api-calls" || true)
+total_calls=$(grep -c . "$FIXTURE_DIR/api-calls" || true)
+journal_forks=$(grep -c . "$FORK_LOG" || true)
+journals_left=$(find "$FM_STATE_OVERRIDE" -name 'bulk-*.herdr-presentation' | grep -c . || true)
+printf '# cost: %s journals, %s api snapshot call(s), %s api call(s) in all, %s grep/cut/wc/basename process(es)\n' \
+  "$COST_N" "$snapshot_calls" "$total_calls" "$journal_forks"
+[ "$snapshot_calls" -eq 1 ] || fail "cleanup took $snapshot_calls API snapshots for $COST_N candidates instead of one"
+[ "$total_calls" -le 2 ] || fail "cleanup made $total_calls API calls for candidates its one snapshot already ruled out"
+[ "$journal_forks" -lt "$COST_N" ] || fail "journal parsing forked $journal_forks processes for $COST_N journals"
+[ "$journals_left" -eq "$COST_N" ] || fail "cleanup retired journals of workspaces it never closed"
+[ ! -s "$CLOSE_LOG" ] || fail "cleanup closed a pane whose topology was ambiguous"
+assert_contains "$cost_out" "bulk-1 preserved because its candidate snapshot was ambiguous" \
+  "a ruled-out candidate was not reported as preserved"
+pass "cleanup reads the API once and forks nothing per journal for $COST_N ambiguous candidates"
+
+# A spent budget defers a candidate that passed the prefilter on one reported
+# line and closes nothing; the next start retries it.
+reset_fixture
+cost_out=$(FM_HERDR_CLEANUP_BUDGET=0 fm_herdr_session_cleanup 2>&1)
+assert_contains "$cost_out" "deferred:" "a spent cleanup budget was not reported as deferred"
+assert_contains "$cost_out" "1 candidate(s) not examined" "the deferred line did not count the unexamined candidate"
+[ -f "$FM_STATE_OVERRIDE/$ID.herdr-presentation" ] || fail "a deferred cleanup retired the journal"
+[ ! -s "$CLOSE_LOG" ] || fail "a deferred cleanup closed a pane"
+fm_herdr_session_cleanup >/dev/null 2>&1
+[ ! -e "$FM_STATE_OVERRIDE/$ID.herdr-presentation" ] || fail "the next cleanup did not finish the deferred candidate"
+[ "$(wc -l < "$CLOSE_LOG" | tr -d ' ')" = 1 ] || fail "the deferred candidate was not closed exactly once by the next cleanup"
+pass "a spent cleanup budget defers the candidate loudly and the next cleanup finishes it"
 
 INTEGRATION_ROOT="$TMP_ROOT/bootstrap-integration"
 mkdir -p "$INTEGRATION_ROOT/home/state" "$INTEGRATION_ROOT/home/data" "$INTEGRATION_ROOT/home/config"

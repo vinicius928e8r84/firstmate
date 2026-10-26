@@ -101,7 +101,8 @@ test_stale_enqueue_before_suppressor() {
   # is not provably working, so give the window one and prime the .seen-* marker
   # to its current signature so the per-poll signal scan does not pre-empt the
   # stale wake with a signal wake.
-  printf 'done: ready in branch fm/stale\n' > "$state/stale.status"
+  # needs-decision: because a stale pane behind done: no longer wakes (tests/fm-wake-gate.test.sh owns that gate).
+  printf 'needs-decision: ready for review fm/stale\n' > "$state/stale.status"
   prime_status_seen "$state" "$state/stale.status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "idle prompt")

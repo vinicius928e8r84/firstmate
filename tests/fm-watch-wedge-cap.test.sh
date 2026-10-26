@@ -14,20 +14,80 @@ set -u
 
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
+
+# Every wait budget below is written in 0.1s ticks for an idle host. This suite
+# also runs on CPU-saturated machines, where one watcher's exit cleanup alone can
+# take longer than ten idle seconds, so wake-helpers' wait_for_exit and the waits
+# here are stretched by this factor. A watcher that really hangs still fails, only
+# later. Set FM_TEST_WAIT_SCALE=1 to get the idle-host budgets back.
+FM_TEST_WAIT_SCALE=${FM_TEST_WAIT_SCALE:-6}
+case "$FM_TEST_WAIT_SCALE" in ''|*[!0-9]*|0) FM_TEST_WAIT_SCALE=6 ;; esac
 # The fixture root for make_case, which reads TMP_ROOT at call time.
 # shellcheck disable=SC2034
 TMP_ROOT=$(fm_test_tmproot fm-watch-wedge-cap-tests)
 
+# The recovery state a failed ack_stopped_cycle was waiting on, so a failure on a
+# saturated host says whether the stopped watcher ever published its episode.
+ack_stopped_cycle_state() {  # <state>
+  local state=$1 lockpid=''
+  [ ! -r "$state/.watch.lock/pid" ] || IFS= read -r lockpid < "$state/.watch.lock/pid" || true
+  printf 'ack_stopped_cycle state: marker=[%s] watch.lock=%s lock_pid=[%s] lock_pid_alive=%s queue_bytes=%s beat_age=%s\n' \
+    "$(cat "$state/.watcher-down" 2>/dev/null || true)" \
+    "$([ -e "$state/.watch.lock" ] || [ -L "$state/.watch.lock" ] && echo present || echo absent)" \
+    "$lockpid" "$([ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null && echo yes || echo no)" \
+    "$([ -e "$state/.wake-queue" ] && wc -c < "$state/.wake-queue" | tr -d '[:space:]' || echo none)" \
+    "$(beat=$(file_mtime "$state/.last-watcher-beat"); [ -n "$beat" ] && echo "$(( $(date +%s) - beat ))s" || echo none)" >&2
+  tail -n 5 "$state/.watch-triage.log" 2>/dev/null | sed 's/^/ack_stopped_cycle triage: /' >&2
+}
+
 ack_stopped_cycle() {  # <state>
-  local state=$1 err sequence generation
+  local state=$1 err sequence generation deadline rc
   err="$state/.test-cycle-drain.err"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
-  sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
-  generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
-  rm -f "$err"
-  [ -n "$sequence" ] && [ -n "$generation" ] || return 1
-  FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
-    --recovery-generation "$generation"
+  # The watcher publishes its recovery episode synchronously in its own exit
+  # cleanup, so a stop observed by wait_for_exit or reap already has one. A drain
+  # can still come back empty on a saturated host: it exits 0 with "WAKE DRAIN
+  # SKIPPED ... retry on the next drain" when the queue lock is held past its
+  # presentation timeout, and detached side-band children can hold locks briefly
+  # after the watcher is gone. Such a drain is retried until a bounded, generous
+  # deadline; a stop that never publishes its episode still fails.
+  # A drain that exits non-zero for a load symptom (the queue lock could not be
+  # acquired safely, the branch-outcomes section failed, a recovery-marker
+  # transition errored) is retried the same way, and so is the acknowledging drain,
+  # which is idempotent for a generation already acknowledged. Exit 2 is a usage
+  # error, never a load symptom, so it fails at once. The last attempt's stderr is
+  # printed, and kept in the case directory, when the helper gives up.
+  deadline=$((SECONDS + 40 * FM_TEST_WAIT_SCALE))
+  while :; do
+    sequence= generation= rc=0
+    FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
+      generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
+    fi
+    if [ -n "$sequence" ] && [ -n "$generation" ]; then
+      rm -f "$err"
+      break
+    fi
+    if [ "$rc" -eq 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
+      printf 'ack_stopped_cycle: giving up, the last drain exited %s with stderr:\n' "$rc" >&2
+      cat "$err" >&2 2>/dev/null || true
+      ack_stopped_cycle_state "$state"
+      return 1
+    fi
+    sleep 0.5
+  done
+  while :; do
+    rc=0
+    FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
+      --recovery-generation "$generation" || rc=$?
+    [ "$rc" -ne 0 ] || break
+    if [ "$rc" -eq 2 ] || [ "$SECONDS" -ge "$deadline" ]; then
+      printf 'ack_stopped_cycle: giving up, the acknowledging drain exited %s\n' "$rc" >&2
+      ack_stopped_cycle_state "$state"
+      return 1
+    fi
+    sleep 0.5
+  done
 }
 
 reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
@@ -44,6 +104,7 @@ is_live_non_zombie() {
 
 wait_for_exit() {
   local pid=$1 limit=${2:-50} i=0
+  limit=$((limit * FM_TEST_WAIT_SCALE))
   while [ "$i" -lt "$limit" ]; do
     if ! is_live_non_zombie "$pid"; then
       wait "$pid"
@@ -63,6 +124,7 @@ file_mtime() {
 
 wait_poll_cycle() {  # <state> <pid> [limit-ticks]
   local state=$1 pid=$2 limit=${3:-300} beat first now i=0
+  limit=$((limit * FM_TEST_WAIT_SCALE))
   beat="$state/.last-watcher-beat"
   rm -f "$beat"
   first=""
@@ -1610,13 +1672,14 @@ test_wedge_cap_off_ignores_leftover_markers() {
 # for the rest of FM_CAP_HORIZON_SECS. The routes driven here are the ones that
 # need a crew-state verdict to pick between them - a captain-relevant status log
 # outranked by a live run, that same log with nothing overriding it, a
-# non-terminal pane absorbed because the crew is provably working, and the
+# non-terminal pane absorbed because the crew is provably working, a quiet pane
+# behind a done: line, a repeat alarm the unchanged-state gate absorbs, and the
 # away-posture one-shot the supervise daemon owns. The reset
 # routes are the ones the recovery and declared-wait cases drive: a pane that
 # leaves the stale path, and a declared wait and its lift.
 drive_first_sight_release() {  # <route>
   local route=$1 dir state fakebin out capture_file window key statusf
-  local fire_verdict route_verdict mode pid fresh_hash away_record=0
+  local fire_verdict route_verdict mode pid fresh_hash away_record=0 gate_record=0
   dir=$(make_case "wedge-cap-release-$route")
   state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"
@@ -1640,10 +1703,27 @@ drive_first_sight_release() {  # <route>
       mode="absorb"
       ;;
     surface-terminal)
-      printf 'done: implementation complete, ready to validate\n' > "$statusf"
+      # A done: line no longer surfaces a stale pane (tests/fm-wake-gate.test.sh owns
+      # that), so the route that does surface needs a different captain-relevant line.
+      printf 'blocked: cannot reach the release host\n' > "$statusf"
       fire_verdict='state: working · source: run-step · validating (running)'
       route_verdict='state: unknown · source: none · no run, no busy pane'
       mode="exit"
+      ;;
+    done-absorb)
+      # A finished task's quiet pane is absorbed rather than surfaced.
+      printf 'done: implementation complete, ready to validate\n' > "$statusf"
+      fire_verdict='state: working · source: run-step · validating (running)'
+      route_verdict='state: unknown · source: none · no run, no busy pane'
+      mode="absorb"
+      ;;
+    gate-absorb)
+      # An alarm already delivered for this unchanged state is absorbed by the gate.
+      printf 'blocked: cannot reach the release host\n' > "$statusf"
+      fire_verdict='state: working · source: run-step · validating (running)'
+      route_verdict='state: unknown · source: none · no run, no busy pane'
+      mode="absorb"
+      gate_record=1
       ;;
     provably-working-nonterminal)
       printf 'working: still wedged\n' > "$statusf"
@@ -1681,6 +1761,11 @@ drive_first_sight_release() {  # <route>
   printf '1\n' > "$state/.count-$key"
   export FM_FAKE_CREW_STATE="$route_verdict"
   [ "$away_record" -eq 0 ] || date +%s > "$state/.afk"
+  if [ "$gate_record" -eq 1 ]; then
+    FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_wake_gate "$2" "$3"' _ \
+      "$ROOT/bin/fm-wake-lib.sh" "stale:$window:terminal" "wedge-cap-release-$route" \
+      || fail "could not plant the delivered-alarm record for the $route case"
+  fi
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
@@ -1739,6 +1824,8 @@ drive_first_sight_release() {  # <route>
 test_wedge_cap_releases_on_every_first_sight_route() {
   drive_first_sight_release provably-working-terminal
   drive_first_sight_release surface-terminal
+  drive_first_sight_release done-absorb
+  drive_first_sight_release gate-absorb
   drive_first_sight_release provably-working-nonterminal
   drive_first_sight_release away-first-sight
   pass "every first-sight route that ends a wedge episode releases that episode's cap and lets the next wedge escalate"

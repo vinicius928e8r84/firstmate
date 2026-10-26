@@ -557,6 +557,17 @@ SH
   chmod +x "$fakebin/herdr"
 }
 
+# make_fake_nice_noop <fakebin>: the locked start launches the home summary
+# refresh detached through nice, and that refresh would keep reading the hung
+# fake endpoint after the digest returns. A test that counts leftover hung
+# processes is about the digest's own per-task bound, so the refresh is dropped
+# for it; the detached launch itself is covered by
+# test_home_summary_refresh_does_not_block_the_digest.
+make_fake_nice_noop() {
+  printf '#!/bin/sh\nexit 0\n' > "$1/nice"
+  chmod +x "$1/nice"
+}
+
 # run_session_start <home> <root> <path>
 # Drop every harness env marker from bin/fm-harness.sh detect_own so the
 # surrounding interactive shell cannot leak past the suite's fake ps harness.
@@ -772,6 +783,18 @@ write_omp_loaded_markers() {
   printf '%s\n%s\n' "$version" "$pid" > "$home/state/.omp-turnend-extension-loaded"
 }
 
+# The locked start launches the home summary refresh detached, so a test that
+# reads the ledger waits for the publication instead of assuming it is there.
+wait_for_home_summary() {  # <home> [tries]
+  local home=$1 tries=${2:-300}
+  while [ "$tries" -gt 0 ]; do
+    [ -s "$home/state/home-summary.json" ] && return 0
+    sleep 0.2
+    tries=$((tries - 1))
+  done
+  return 1
+}
+
 # --- context digest: absent vs empty vs present -----------------------------
 
 test_context_digest_absent_empty_present() {
@@ -789,6 +812,8 @@ EOF
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
 
+  # The ledger is published by a detached refresh, so wait for it.
+  wait_for_home_summary "$home"
   jq -e --arg home "$home" '
     .schema == "fm-secondmate-home-summary.v1"
     and .home == $home
@@ -816,6 +841,49 @@ EOF
   assert_contains "$cap_section" "(present, empty)" "empty-but-present captain.md was not distinguished from ABSENT"
 
   pass "context digest distinguishes ABSENT, empty-but-present, and populated files"
+}
+
+test_home_summary_refresh_does_not_block_the_digest() {
+  local rec root home fakebin out
+  rec=$(new_world home-summary-detached)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  # The refresh is launched through nice, so a nice that holds the command until
+  # the test releases it stands in for a producer that is slow on a
+  # CPU-contended host. A start that waited for the refresh would hang here or
+  # would already have published the ledger when it returned.
+  cat > "$fakebin/nice" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = -n ] && shift 2
+printf '%s\n' "$*" >> "${FM_TEST_NICE_LOG:?}"
+held=0
+while [ ! -e "${FM_TEST_NICE_RELEASE:?}" ] && [ "$held" -lt 1200 ]; do
+  sleep 0.1
+  held=$((held + 1))
+done
+exec "$@"
+SH
+  chmod +x "$fakebin/nice"
+  export FM_TEST_NICE_LOG="$TMP_ROOT/home-summary-detached.nice.log"
+  export FM_TEST_NICE_RELEASE="$TMP_ROOT/home-summary-detached.release"
+  : > "$FM_TEST_NICE_LOG"
+  rm -f "$FM_TEST_NICE_RELEASE"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  [ ! -e "$home/state/home-summary.json" ] \
+    || fail "the home summary was already published when the start returned, so the refresh ran in line"
+  assert_contains "$out" "data/projects.md" "the digest did not complete while the summary refresh was still held"
+  : > "$FM_TEST_NICE_RELEASE"
+  wait_for_home_summary "$home" 300 \
+    || fail "the detached home summary refresh never published the ledger"
+  assert_contains "$(cat "$FM_TEST_NICE_LOG")" "fm-home-summary-refresh.sh --best-effort" \
+    "the detached refresh was not the best-effort home summary refresh"
+  unset FM_TEST_NICE_LOG FM_TEST_NICE_RELEASE
+
+  pass "a locked start detaches the home summary refresh and still publishes the ledger"
 }
 
 # --- lock refusal: read-only path --------------------------------------------
@@ -1487,14 +1555,15 @@ EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
   make_fake_herdr_hanging_read "$fakebin" "p-live" "p-slow"
+  make_fake_nice_noop "$fakebin"
 
   printf 'window=sess:p-slow\nkind=ship\nbackend=herdr\n' > "$home/state/task-a-slow.meta"
   printf 'window=sess:p-live\nkind=ship\nbackend=herdr\n' > "$home/state/task-z-live.meta"
 
-  # The same fake hangs the side-band home summary before the endpoint section.
-  # Bound that unrelated refresh at 5s instead of paying its production 60s;
-  # the endpoint's own 2s bound and descendant-cleanup assertions stay real.
-  out=$(FM_HOME_SUMMARY_TIMEOUT=5 FM_SESSION_START_ENDPOINT_TIMEOUT=2 \
+  # The same fake would hang the side-band home summary, which make_fake_nice_noop
+  # drops here; the endpoint's own 2s bound and descendant-cleanup assertions
+  # stay real.
+  out=$(FM_SESSION_START_ENDPOINT_TIMEOUT=2 \
     run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
 
   expect_code 0 "$status" "a hung endpoint read must not fail the digest"
@@ -1523,13 +1592,14 @@ EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
   make_fake_herdr_hanging_read "$fakebin" "p-live" "p-slow"
+  make_fake_nice_noop "$fakebin"
 
   printf 'window=sess:p-slow\nkind=ship\nbackend=herdr\n' > "$home/state/task-a-slow.meta"
   printf 'window=sess:p-live\nkind=ship\nbackend=herdr\n' > "$home/state/task-z-live.meta"
 
-  # Only the unrelated summary gets a shorter fixture budget. The invalid
-  # endpoint value must still fall back to the real 10s production bound.
-  out=$(FM_HOME_SUMMARY_TIMEOUT=5 FM_SESSION_START_ENDPOINT_TIMEOUT=00 \
+  # The invalid endpoint value must still fall back to the real 10s production
+  # bound.
+  out=$(FM_SESSION_START_ENDPOINT_TIMEOUT=00 \
     run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
 
   expect_code 0 "$status" "a padded-zero per-read bound must not fail the digest"
@@ -3095,6 +3165,7 @@ EOF
 }
 
 test_context_digest_absent_empty_present
+test_home_summary_refresh_does_not_block_the_digest
 test_lock_refusal_read_only_path
 test_lock_write_failure_read_only_path
 test_trace_context_effective_state_is_frozen_after_lock

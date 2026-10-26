@@ -25,6 +25,10 @@ unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
 command -v python3 >/dev/null 2>&1 \
   || fail "python3 is required to decode the fm-on.sh argv payload"
 
+# The remote probe budget is covered by its own test below; every other test here
+# must not have a slow host turn a healthy probe into a deferral.
+export FM_SM_LIVE_PROBE_BUDGET=900
+
 REAL_GIT=$(command -v git) || fail "git is required"
 REAL_MKTEMP=$(command -v mktemp) || fail "mktemp is required"
 fm_git_identity fmtest fmtest@example.invalid
@@ -440,7 +444,12 @@ case "$command_name:$subcommand" in
     printf 'current: test\n'
     exit 0
     ;;
-  fm-remote-secondmate-control.sh:state) printf 'END %s\n' "$host" >> "$log"; printf 'alive\n'; exit 0 ;;
+  fm-remote-secondmate-control.sh:state)
+    if [ "$host" = "${FM_FAKE_STATE_HANG_HOST:-none}" ]; then
+      sleep 120
+    fi
+    printf 'END %s\n' "$host" >> "$log"; printf 'alive\n'; exit 0
+    ;;
   fm-remote-secondmate-control.sh:route) printf 'END %s\n' "$host" >> "$log"; printf 'backend=herdr\n'; exit 0 ;;
   fm-remote-inherit.sh:*)
     if [ "$item_rel" = "${FM_FAKE_ITEM_UNKNOWN:-none}" ]; then
@@ -610,6 +619,41 @@ test_convergence_budget_isolates_a_hung_mate() {
   pass "per-mate convergence budget: a hung host is that mate's skip, keeps its retry marker, and does not hold the others"
 }
 
+test_deferred_liveness_probe_skips_that_mates_convergence() {
+  local out start elapsed
+  convergence_fixture "$TMP_ROOT/deferred-probe" alpha:host-alpha bravo:host-bravo
+  start=$(date +%s)
+  out=$(
+    PATH="$CF_FAKEBIN:$BASE_PATH" \
+    FM_HOME="$CF_HOME" \
+    FM_ROOT_OVERRIDE="$CF_PRIMARY" \
+    FM_BOOTSTRAP_NETWORK=only \
+    FM_SSH_BIN="$CF_FAKEBIN/fake-ssh" \
+    FM_FAKE_SSH_LOG="$CF_LOG" \
+    FM_FAKE_STATE_HANG_HOST=host-alpha \
+    FM_SM_LIVE_PROBE_BUDGET=20 \
+    FM_SECONDMATE_CONVERGENCE_TIMEOUT=60 \
+    FM_INHERITABLE_CONFIG='item-a' \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 \
+    "$ROOT/bin/fm-bootstrap.sh" 2>&1
+  )
+  elapsed=$(( $(date +%s) - start ))
+  [ "$elapsed" -lt 100 ] || fail "a silent host held the network phase for ${elapsed}s although its probe budget was 20s"$'\n'"$out"
+  assert_contains "$out" \
+    "SECONDMATE_LIVENESS: secondmate alpha: skipped: deferred: remote probe exceeded its 20s budget; route preserved on host-alpha" \
+    "a probe cut off by its budget must be reported as a deferral naming the host"
+  assert_contains "$out" \
+    "SECONDMATE_SYNC: secondmate alpha: skipped: deferred: its liveness probe on host-alpha exceeded its budget in this run" \
+    "the convergence of a mate whose probe was deferred must be deferred too, by name"
+  if grep -q 'START host-alpha fm-remote-secondmate-control.sh sync' "$CF_LOG"; then
+    fail "convergence still spent a remote call on the host whose probe had just gone silent"$'\n'"$(cat "$CF_LOG")"
+  fi
+  grep -q 'START host-bravo fm-remote-secondmate-control.sh sync' "$CF_LOG" \
+    || fail "the healthy mate's convergence did not run"$'\n'"$(cat "$CF_LOG")"
+  assert_not_contains "$out" "SECONDMATE_LIVENESS: secondmate bravo:" "the healthy mate must not be reported"
+  pass "a probe cut off by its budget is a named deferral and skips that mate's convergence, not the others'"
+}
+
 test_partial_push_failure_keeps_the_reread_owed() {
   local out
   convergence_fixture "$TMP_ROOT/partial-push-owed" alpha:host-alpha
@@ -763,6 +807,7 @@ test_inherit_push_overlaps_items_and_replays_in_order
 test_inherit_push_failure_stops_new_sends
 test_inherit_push_local_refusal_sends_nothing
 test_convergence_budget_isolates_a_hung_mate
+test_deferred_liveness_probe_skips_that_mates_convergence
 test_partial_push_failure_keeps_the_reread_owed
 test_config_push_partial_failure_keeps_the_reread_owed
 test_unknown_completion_keeps_the_reread_owed

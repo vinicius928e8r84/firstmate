@@ -732,9 +732,16 @@ if [ "$READ_ONLY" -eq 0 ]; then
   fm_trace_context_session_start "$CONFIG" "$STATE/.trace-context-effective"
   # A full locked start publishes this home's current structured summary.
   # Publication is side-band and best-effort, so it can never change the
-  # session-start result. A context re-emit is not another session start.
+  # session-start result, and nothing below reads it. It is built by a detached,
+  # lowered-priority process that owns its atomic publication and its own
+  # FM_HOME_SUMMARY_TIMEOUT bound (180s here, because no digest waits on it),
+  # as the watcher launches it. Run in line on a CPU-contended host it cost 90
+  # seconds of this script's runtime bound for a ledger no digest section reads.
+  # A context re-emit is not another session start.
   if [ "$REEMIT" -eq 0 ]; then
-    "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
+    FM_HOME_SUMMARY_TIMEOUT=${FM_HOME_SUMMARY_TIMEOUT:-180} \
+      nice -n 10 "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort \
+      </dev/null >/dev/null 2>&1 &
   fi
   # Every network call and the potentially slow inactive-outcome startup scan
   # are launched HERE, detached and bounded, so they run concurrently with the

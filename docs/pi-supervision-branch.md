@@ -29,8 +29,8 @@ Fleet supervision on the Pi primary harness runs on a second conversation - the 
 
 ### What the branch handles while attended
 
-Supervision is default-on.
-Once a Pi primary session owns this home's fleet lock, the branch handles two kinds of work:
+Supervision is gated by `config/supervision-branch`, and off until a home sets it ([configuration.md](configuration.md#pi-supervision-branch-gate-configsupervision-branch) owns the gate).
+Once the gate is on and a Pi primary session owns this home's fleet lock, the branch handles two kinds of work:
 
 - Eligible task-local rows from ordinary actionable wakes.
   A row is one queued wake entry.
@@ -84,7 +84,7 @@ On a non-Pi home that runs the supervision host, the host runs the branch beside
 | [Branch system prompt](#branch-system-prompt) | `bin/fm-branch-prompt.sh` |
 | [Outcome store](#outcome-store) | `bin/fm-branch-outcome.sh` |
 | [Consistency](#consistency) | `bin/fm-lease-lib.sh`, with `bin/fm-lease.sh` as the command surface |
-| [Autonomy](#autonomy) | Default-on once a Pi primary session owns the fleet lock |
+| [Autonomy](#autonomy) | Gated by `config/supervision-branch`; the away posture is not gated |
 
 ### Wake dispatch
 
@@ -262,8 +262,9 @@ Local-only landing and second-mate retirement never do ("Postures" below).
 
 ### Autonomy
 
-Supervision is default-on for every task once a Pi primary session owns the fleet lock (docs/configuration.md "Pi supervision branch").
+Once the gate is on (docs/configuration.md "Pi supervision branch gate"), supervision covers every task whenever a Pi primary session owns the fleet lock.
 No captain grant file is required.
+A gate that is off, or `triage` without a shadow log or on a Claude model, declines every attended offer, so the wake takes the ordinary path to main; the away posture record bypasses the gate.
 
 A fleet-wide heartbeat is separately eligible only when every row other than a check or decision-owned signal/stale row is a heartbeat row or a resolvable task-local row (see "Heartbeat routing" below).
 Every other fleet-wide or unresolvable wake, and every watcher-failure alarm, stays on main.

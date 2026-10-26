@@ -36,12 +36,13 @@
 // consumption changes.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Text, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { runCommandAsync } from "./lib/fm-async-exec.ts";
 import { registerFirstmateTool } from "./lib/fm-native-contract.ts";
 import {
   afkPostureRecordPresent,
@@ -118,6 +119,8 @@ type SessionGeneration = {
   // still delivering the wake it was started for; its bounded retry runs once
   // that delivery settles instead of being skipped by the single-flight guard.
   deferredClose: { message: string; predecessorArmPid: string } | null;
+  // A self-heal sequence is running after the retry ladder was exhausted.
+  healing: boolean;
 };
 
 function refreshWatchToolShell(
@@ -147,6 +150,7 @@ const fmRoot = process.env.FM_ROOT_OVERRIDE || root;
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
+const inlineScript = `${fmRoot}/bin/fm-wake-inline.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
 const handoffDir = `${state}/extensions/pi-primary-watch`;
 const actionableHandoff = `${handoffDir}/session-replacement-actionable.json`;
@@ -156,6 +160,12 @@ const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(exte
 const retryBaseMs = positiveInteger("FM_WATCH_REARM_RETRY_BASE_MS", 250);
 const retryMaxMs = positiveInteger("FM_WATCH_REARM_RETRY_MAX_MS", 4000);
 const retryLimit = positiveInteger("FM_WATCH_REARM_RETRY_LIMIT", 5);
+// Self-heal rounds that follow an exhausted continuity retry ladder before the
+// model is told. Each round waits twice as long as the last, starting at eight
+// times the ladder's cap (32 s by default), so a host overloaded for a few
+// minutes recovers without a model turn. Zero disables them.
+const selfHealRounds = nonNegativeInteger("FM_WATCH_SELFHEAL_ROUNDS", 3);
+const selfHealDelayMs = positiveInteger("FM_WATCH_SELFHEAL_DELAY_MS", retryMaxMs * 8);
 // 35s on Windows so the budget stays above arm's MSYS confirm default (30s in
 // bin/fm-watch-arm.sh): a slow but successful Git Bash cold start must not be
 // SIGTERMed mid-confirmation. Conditioned on win32 so other platforms keep 12s.
@@ -164,7 +174,16 @@ const armReadyTimeoutMs = positiveInteger(
   process.platform === "win32" ? 35000 : 12000,
 );
 const armRetireTimeoutMs = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 1000);
+// The drain itself takes 45-60 s on a loaded 4-core host (measured 48.7 s on
+// 24/10 at load 6-7), so a 60 s cap timed out on every wake and the model ran
+// the same drain again. The model's own drain is no faster, so a longer cap
+// costs no wall time and keeps the pair out of the model.
+const inlineDrainTimeoutMs = positiveInteger("FM_WAKE_INLINE_TIMEOUT_MS", 300000);
 const repairOnlyHint = "call fm_watch_arm_pi again only after a later notification says the cycle is missing, failed, or unhealthy";
+// Request/answer event shared with .pi/extensions/fm-primary-turnend-guard.ts,
+// which carries the same literal: the guard emits a request object and reads
+// accepted and settlement back synchronously, like the branch dispatch offer.
+const FM_WATCH_SELFHEAL_EVENT = "fm:watch-selfheal";
 const shuttingDownMessage = "watcher: not armed - Pi session is shutting down";
 
 let nextHandoffId = 0;
@@ -209,6 +228,13 @@ const retiringGenerations = new Set<SessionGeneration>();
 const armRetired = new WeakSet<ChildProcess>();
 const armRecovery = new WeakMap<ChildProcess, { generation: string; watcherPid: string }>();
 const armPendingActionable = new WeakMap<ChildProcess, PendingActionableClose>();
+
+function nonNegativeInteger(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
 
 function positiveInteger(name: string, fallback: number): number {
   const value = Number(process.env[name]);
@@ -551,6 +577,7 @@ function createGeneration(): SessionGeneration {
     cleanupFailure: "",
     unconsumedWakes: new Map(),
     deferredClose: null,
+    healing: false,
   };
 }
 
@@ -652,21 +679,123 @@ export default function (pi: ExtensionAPI) {
     !calmPresentation.stockExportRendering &&
     !calmTranscriptClassIsVisible(itemClass);
 
+  // Inline drain and turn-end acknowledgement (bin/fm-wake-inline.sh owns the
+  // pair). The wake text carries what the model's first call used to fetch,
+  // and the acknowledgement that call's last step used to send runs when the
+  // run that consumed the text settles cleanly. Anything that stops the pair
+  // (kill switch, missing or failing script, aborted or errored turn) leaves
+  // the rows durable and the model told to drain itself, exactly as before.
+  type InlineAck = { sequence: number; generation: string };
+  const inlineWakes = new Map<string, InlineAck>();
+  let consumedInlineAcks: InlineAck[] = [];
+  let lastRunClean = true;
+
+  async function inlineDrain(): Promise<{ text: string; ack: InlineAck | null } | null> {
+    if (process.env.FM_WAKE_INLINE === "0" || !existsSync(inlineScript)) return null;
+    const ackFile = `${state}/.inline-ack.${process.pid}.${Date.now()}`;
+    try {
+      const timeout = new Promise<null>((resolveTimeout) => {
+        const timer = setTimeout(() => resolveTimeout(null), inlineDrainTimeoutMs);
+        timer.unref();
+      });
+      const run = runCommandAsync("bash", [inlineScript, "drain", "--ack-out", ackFile], {
+        cwd: fmRoot,
+        env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_CONFIG_OVERRIDE: config, FM_ROOT_OVERRIDE: fmRoot },
+      });
+      const result = await Promise.race([run, timeout]);
+      if (!result) {
+        // The drain keeps running and writes the ack file after this call has
+        // given up; remove it once it settles so no orphan is left in state/.
+        void run.then(() => {
+          try {
+            unlinkSync(ackFile);
+          } catch {}
+        });
+      }
+      if (!result || result.status !== 0) {
+        appendExtensionLog(`inline-drain unavailable status=${result ? String(result.status) : "timeout"}`);
+        return null;
+      }
+      let ack: InlineAck | null = null;
+      try {
+        const [sequence, generation] = readFileSync(ackFile, "utf8").trim().split(" ");
+        if (/^[0-9]+$/.test(sequence ?? "") && /^[A-Za-z0-9._-]+$/.test(generation ?? "")) {
+          ack = { sequence: Number(sequence), generation };
+        }
+      } catch (error) {
+        if (nodeErrorCode(error) !== "ENOENT") return null;
+      }
+      return { text: result.stdout.trimEnd(), ack };
+    } finally {
+      try {
+        unlinkSync(ackFile);
+      } catch {}
+    }
+  }
+
+  async function wakeBody(message: string): Promise<{ text: string; ack: InlineAck | null }> {
+    const inline = await inlineDrain();
+    if (!inline) {
+      return {
+        text: `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. Watcher continuity is extension-owned.`,
+        ack: null,
+      };
+    }
+    const ackNote = inline.ack
+      ? ` Do not run its --ack-through command either: the Pi extension acknowledges wakes through ${inline.ack.sequence} when this turn ends cleanly.`
+      : "";
+    return {
+      text:
+        `FIRSTMATE WATCHER WAKE: ${message}\n\n` +
+        `WAKE DRAIN (bin/fm-wake-drain.sh already ran for this wake; do not run it again.${ackNote}):\n` +
+        `${inline.text || "(the queue held nothing further)"}\n\n` +
+        "Handle the wake. Watcher continuity is extension-owned.",
+      ack: inline.ack,
+    };
+  }
+
+  function consumeInline(text: string): void {
+    const ack = inlineWakes.get(text);
+    if (!ack) return;
+    inlineWakes.delete(text);
+    consumedInlineAcks.push(ack);
+  }
+
+  async function acknowledgeConsumedWakes(): Promise<void> {
+    const acks = consumedInlineAcks;
+    consumedInlineAcks = [];
+    if (acks.length === 0) return;
+    if (!lastRunClean) {
+      appendExtensionLog(`inline-ack skipped reason=unclean-run wakes=${acks.length}`);
+      return;
+    }
+    const newest = acks.reduce((best, item) => (item.sequence >= best.sequence ? item : best));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = await runCommandAsync("bash", [inlineScript, "ack", String(newest.sequence), newest.generation], {
+        cwd: fmRoot,
+        env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_CONFIG_OVERRIDE: config, FM_ROOT_OVERRIDE: fmRoot },
+      });
+      appendExtensionLog(`inline-ack through=${newest.sequence} attempt=${attempt} status=${String(result.status)}`);
+      if (result.status === 0) return;
+    }
+  }
+
   async function sendWake(
     owner: SessionGeneration,
     message: string,
     pending?: PendingActionableClose,
   ): Promise<boolean> {
     if (!generationIsLive(owner)) return false;
-    const content = encodeFirstmateOperationalInput(
-      "watcher",
-      `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. Watcher continuity is extension-owned.`,
-    );
+    const body = await wakeBody(message);
+    if (!generationIsLive(owner)) return false;
+    const content = encodeFirstmateOperationalInput("watcher", body.text);
+    if (body.ack) inlineWakes.set(content, body.ack);
     if (pending) owner.unconsumedWakes.set(pending.token, { content, pending });
     try {
       await pi.sendUserMessage(content, { deliverAs: "followUp" });
     } catch (error) {
       if (pending) owner.unconsumedWakes.delete(pending.token);
+      inlineWakes.delete(content);
       throw error;
     }
     // Accepted by Pi. A generation replaced while Pi was accepting it may
@@ -1042,6 +1171,46 @@ export default function (pi: ExtensionAPI) {
     return { failure: `${failure}\nwatcher: FAILED - Pi extension could not restore watcher continuity after ${retryLimit} retries` };
   }
 
+  // The retry ladder is spent. Before the model is told, keep trying on a
+  // slower schedule: the failures that reached the model were an overloaded
+  // host outlasting an eight-second ladder, not a watcher that cannot run.
+  // Anything else (a child already live, a retry already scheduled, a lost
+  // lock) ends the sequence, and the model hears of it only when every round
+  // has failed.
+  async function healContinuity(owner: SessionGeneration, message: string, predecessorArmPid: string): Promise<void> {
+    if (owner.healing) return;
+    owner.healing = true;
+    let outcome = "exhausted";
+    try {
+      for (let round = 1; round <= selfHealRounds; round += 1) {
+        await new Promise((resolveWait) => {
+          const timer = setTimeout(resolveWait, selfHealDelayMs * 2 ** (round - 1));
+          timer.unref();
+        });
+        if (!generationIsLive(owner)) return;
+        if (liveArmChild(owner) || owner.retryTimer) {
+          outcome = "recovered-elsewhere";
+          return;
+        }
+        if (lockOwnership() !== "owned") break;
+        const started = startArm(owner, predecessorArmPid);
+        const child = owner.child;
+        if (started.ok && child && await waitForReadiness(child)) {
+          owner.retryFailures = 0;
+          outcome = `healed round=${round}`;
+          return;
+        }
+        appendExtensionLog(`selfheal round=${round} start=${started.ok ? "unready" : "failed"}`);
+        if (started.ok && !(await retireArm(child))) break;
+      }
+    } finally {
+      owner.healing = false;
+      appendExtensionLog(`selfheal ${outcome}`);
+    }
+    if (!generationIsLive(owner)) return;
+    surfaceFailure(owner, `watcher: FAILED - Pi extension could not restore watcher continuity after ${retryLimit} retries${selfHealRounds > 0 ? ` and ${selfHealRounds} self-heal rounds` : ""}\n${message}`);
+  }
+
   function scheduleRetry(owner: SessionGeneration, message: string, predecessorArmPid: string): void {
     if (!generationIsLive(owner) || liveArmChild(owner) || owner.retryTimer) return;
     const ownership = lockOwnership();
@@ -1051,7 +1220,7 @@ export default function (pi: ExtensionAPI) {
     }
     owner.retryFailures += 1;
     if (owner.retryFailures > retryLimit) {
-      surfaceFailure(owner, `watcher: FAILED - Pi extension could not restore watcher continuity after ${retryLimit} retries\n${message}`);
+      void healContinuity(owner, message, predecessorArmPid);
       return;
     }
     const timer = setTimeout(() => {
@@ -1225,14 +1394,69 @@ export default function (pi: ExtensionAPI) {
     return result;
   }
 
+  // Self-heal on request from the turn-end guard extension (same event bus).
+  // The guard asks before it wakes the model: a cycle that is only between
+  // retries, or that has no child at all, is repaired here without a model
+  // turn. Settles true once a child is established and ready; false when it
+  // cannot be (lock not owned, readiness timeout), and the guard then wakes
+  // the model exactly as it did before.
+  async function healWatcherNow(): Promise<boolean> {
+    const owner = generation;
+    if (!generationIsLive(owner) || lockOwnership() !== "owned") return false;
+    // A cycle that spent its retry budget starts a fresh one: the next child's
+    // failures are counted from zero rather than surfacing at once.
+    if (!liveArmChild(owner) && !owner.retryTimer) owner.retryFailures = 0;
+    const started = activateOwnedWatch(owner);
+    if (!started.ok) return false;
+    const deadline = Date.now() + armReadyTimeoutMs;
+    while (Date.now() < deadline) {
+      const child = liveArmChild(owner);
+      if (child) {
+        const ready = await waitForReadiness(child);
+        appendExtensionLog(`selfheal ready=${String(ready)} pid=${child.pid ?? "none"}`);
+        return ready;
+      }
+      if (!owner.retryTimer && generationIsLive(owner)) {
+        const retried = startArm(owner);
+        if (!retried.ok) return false;
+      }
+      await new Promise((resolveWait) => {
+        const timer = setTimeout(resolveWait, 100);
+        timer.unref();
+      });
+    }
+    appendExtensionLog("selfheal ready=timeout");
+    return false;
+  }
+
+  pi.events?.on?.(FM_WATCH_SELFHEAL_EVENT, (data) => {
+    const request = data as { accepted?: boolean; settlement?: Promise<boolean> | null };
+    request.accepted = true;
+    request.settlement = healWatcherNow().catch(() => false);
+  });
+
   pi.on?.("before_agent_start", (event) => {
     // A custom message cannot consume a pending user wake, even with equal text.
     if (!("prompt" in event)) return;
+    consumeInline(event.prompt);
     consumeWake(generation, event.prompt);
   });
   pi.on?.("message_start", (event) => {
     if (event.message.role !== "user") return;
-    consumeWake(generation, userMessageText(event.message.content));
+    const text = userMessageText(event.message.content);
+    consumeInline(text);
+    consumeWake(generation, text);
+  });
+  // A run counts as handled only when its last assistant message ended on its
+  // own; an aborted, errored, or truncated run leaves its wakes unacknowledged.
+  pi.on?.("agent_end", (event) => {
+    const messages = Array.isArray(event.messages) ? event.messages : [];
+    const last = [...messages].reverse().find((message) => (message as { role?: unknown }).role === "assistant");
+    const stopReason = String((last as { stopReason?: unknown } | undefined)?.stopReason ?? "stop");
+    lastRunClean = !["aborted", "error", "length"].includes(stopReason);
+  });
+  pi.on?.("agent_settled", async () => {
+    await acknowledgeConsumedWakes();
   });
 
   pi.on?.("session_start", async () => {

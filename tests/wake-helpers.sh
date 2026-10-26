@@ -326,8 +326,16 @@ SH
 # Only pass a process owned by this test. A deadline must also bound cleanup:
 # TERM can be ignored or remain pending on a stopped child, so never follow it
 # with an unbounded wait. Keep process evidence before the final owned-PID kill.
+#
+# Budgets are written in 0.1s ticks for an idle host. FM_TEST_WAIT_SCALE (default
+# 1, so other suites are unchanged) stretches every budget by that factor for a
+# suite that has to run on a CPU-saturated machine, where one exit cleanup alone
+# can outlast ten idle seconds. A process that really hangs is still stopped and
+# reported with 124 once the stretched budget is spent.
 wait_for_exit() {
-  local pid=$1 limit=${2:-50} i=0
+  local pid=$1 limit=${2:-50} i=0 scale=${FM_TEST_WAIT_SCALE:-1}
+  case "$scale" in ''|*[!0-9]*|0) scale=1 ;; esac
+  limit=$((limit * scale))
   while [ "$i" -lt "$limit" ]; do
     if ! is_live_non_zombie "$pid"; then
       wait "$pid"
@@ -340,7 +348,7 @@ wait_for_exit() {
   ps -p "$pid" -o pid= -o ppid= -o stat= -o command= >&2 2>/dev/null || true
   kill -TERM "$pid" 2>/dev/null || true
   i=0
-  while [ "$i" -lt 20 ] && is_live_non_zombie "$pid"; do
+  while [ "$i" -lt $((20 * scale)) ] && is_live_non_zombie "$pid"; do
     sleep 0.1
     i=$((i + 1))
   done

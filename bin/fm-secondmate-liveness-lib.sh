@@ -114,7 +114,41 @@ fm_secondmate_liveness_recent_attempts() {  # <id> <window-secs>
     "$ledger" 2>/dev/null
 }
 
+# One fm-on.sh remote command, cut off at the probe deadline when full mode set
+# one. Its stdout lands in FM_SM_LIVE_REMOTE_OUT (read in this shell, not through
+# a substitution, so the flags below survive). A cut-off run is reported as 255,
+# unknown remote completion, and marks FM_REMOTE_READINESS_TIMED_OUT so the
+# caller words the skip as a deferral.
+FM_SM_LIVE_REMOTE_OUT=
+fm_sm_live_remote() {  # <id> <fm-command> [args...]
+  local id=$1 remaining rc=0
+  shift
+  FM_SM_LIVE_REMOTE_OUT=
+  if [ -z "${FM_REMOTE_READINESS_DEADLINE:-}" ]; then
+    FM_SM_LIVE_REMOTE_OUT=$("$FM_SM_LIVE_LIB_DIR/fm-on.sh" "$id" "$@" < /dev/null 2>/dev/null) || rc=$?
+    return "$rc"
+  fi
+  remaining=$((FM_REMOTE_READINESS_DEADLINE - SECONDS))
+  if [ "$remaining" -lt 1 ]; then
+    FM_REMOTE_READINESS_TIMED_OUT=1
+    return 255
+  fi
+  FM_SM_LIVE_REMOTE_OUT=$(fm_run_timed "$remaining" "$FM_SM_LIVE_LIB_DIR/fm-on.sh" "$id" "$@" < /dev/null 2>/dev/null) || rc=$?
+  if fm_timed_out "$rc"; then
+    FM_REMOTE_READINESS_TIMED_OUT=1
+    return 255
+  fi
+  return "$rc"
+}
+
 # fm_secondmate_liveness_probe <meta> <id> <full|poll>
+#
+# In full mode a remote route's whole probe (readiness doctor, state, route) is
+# bounded by FM_SM_LIVE_PROBE_BUDGET seconds (default 60). A probe cut off by it
+# is the same unknown-remote-completion verdict as exit 255 - skipped, route
+# preserved, never evidence of death - and says so with a "deferred" reason; the
+# watcher's secondmate liveness tick repeats the probe, so nothing is dropped.
+# A slow host therefore costs its own line, not the sweeps that run after it.
 #
 # Read-only probe of one registered secondmate's recorded endpoint. Populates:
 #
@@ -137,16 +171,24 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
   FM_SM_LIVE_STATUS=skipped FM_SM_LIVE_STATE=unknown FM_SM_LIVE_KILL=0
   FM_SM_LIVE_CAUSE='' FM_SM_LIVE_WHERE='' FM_SM_LIVE_REASON='' FM_SM_LIVE_LINE=''
   local window harness remote_host remote_rc out agent_state readiness_reason route_out remote_backend
+  local probe_budget
+  probe_budget=${FM_SM_LIVE_PROBE_BUDGET:-60}
+  case "$probe_budget" in ''|*[!0-9]*|0) probe_budget=60 ;; esac
   window=$(fm_meta_get "$meta" window)
   [ -n "$window" ] || { FM_SM_LIVE_STATUS=silent; return 0; }
   harness=$(fm_meta_get "$meta" harness)
   remote_host=$(fm_meta_get "$meta" remote_host)
   if [ -n "$remote_host" ]; then
+    FM_REMOTE_READINESS_DEADLINE=
+    FM_REMOTE_READINESS_TIMED_OUT=0
     if [ "$mode" = full ]; then
+      FM_REMOTE_READINESS_DEADLINE=$((SECONDS + probe_budget))
       remote_rc=0
       fm_remote_readiness_ensure "$FM_SM_LIVE_LIB_DIR" "$id" || remote_rc=$?
       if [ "$remote_rc" -eq 255 ]; then
         FM_SM_LIVE_REASON="remote host unavailable or endpoint state unknown; route preserved on $remote_host"
+        [ "$FM_REMOTE_READINESS_TIMED_OUT" != 1 ] \
+          || FM_SM_LIVE_REASON="deferred: remote probe exceeded its ${probe_budget}s budget; route preserved on $remote_host and the watcher liveness tick repeats it"
         return 0
       fi
       if [ "$remote_rc" -ne 0 ]; then
@@ -158,13 +200,16 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
         return 0
       fi
     fi
-    if out=$("$FM_SM_LIVE_LIB_DIR/fm-on.sh" "$id" fm-remote-secondmate-control.sh state "$id" < /dev/null 2>/dev/null); then
+    if fm_sm_live_remote "$id" fm-remote-secondmate-control.sh state "$id"; then
       remote_rc=0
     else
       remote_rc=$?
     fi
+    out=$FM_SM_LIVE_REMOTE_OUT
     if [ "$remote_rc" -eq 255 ]; then
       FM_SM_LIVE_REASON="remote host unavailable or endpoint state unknown; route preserved on $remote_host"
+      [ "$FM_REMOTE_READINESS_TIMED_OUT" != 1 ] \
+        || FM_SM_LIVE_REASON="deferred: remote probe exceeded its ${probe_budget}s budget; route preserved on $remote_host and the watcher liveness tick repeats it"
       return 0
     fi
     if [ "$remote_rc" -ne 0 ]; then
@@ -176,13 +221,16 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
     case "$agent_state" in
       alive)
         if [ "$mode" = full ]; then
-          if route_out=$("$FM_SM_LIVE_LIB_DIR/fm-on.sh" "$id" fm-remote-secondmate-control.sh route "$id" < /dev/null 2>/dev/null); then
+          if fm_sm_live_remote "$id" fm-remote-secondmate-control.sh route "$id"; then
             remote_rc=0
           else
             remote_rc=$?
           fi
+          route_out=$FM_SM_LIVE_REMOTE_OUT
           if [ "$remote_rc" -eq 255 ]; then
             FM_SM_LIVE_REASON="remote host unavailable or endpoint route unknown; route preserved on $remote_host"
+            [ "$FM_REMOTE_READINESS_TIMED_OUT" != 1 ] \
+              || FM_SM_LIVE_REASON="deferred: remote probe exceeded its ${probe_budget}s budget; route preserved on $remote_host and the watcher liveness tick repeats it"
             return 0
           fi
           if [ "$remote_rc" -ne 0 ]; then
@@ -272,6 +320,15 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
 fm_secondmate_liveness_relaunch() {  # <meta> <id> [timeout-secs]
   local meta=$1 id=$2 timeout=${3:-} relaunch_lock wait_seconds rc=0
   FM_SM_LIVE_OUT='' FM_SM_LIVE_RC=0
+  # state/HOLD stops every launching path, the bootstrap sweep included.
+  fm_sm_live_require_locks || return 1
+  if command -v fm_hold_refuse >/dev/null 2>&1 \
+      && ! FM_SM_LIVE_OUT=$(fm_hold_refuse "relaunch of $id" 2>&1); then
+    FM_SM_LIVE_STATUS=skipped
+    FM_SM_LIVE_REASON="state/HOLD is in force; endpoint left $FM_SM_LIVE_STATE"
+    FM_SM_LIVE_RC=1
+    return 1
+  fi
   if ! fm_secondmate_liveness_recent_attempts "$id" 0 >/dev/null; then
     FM_SM_LIVE_STATUS=skipped
     FM_SM_LIVE_REASON="relaunch ledger $STATE/.secondmate-relaunch-$id is unreadable; endpoint left $FM_SM_LIVE_STATE"

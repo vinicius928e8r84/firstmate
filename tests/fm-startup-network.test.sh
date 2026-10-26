@@ -470,6 +470,46 @@ EOF
   pass "fm-startup-network: an aggregate bound turns a wedged sweep into an actionable line"
 }
 
+# The local inactive-outcome scan and the network sweeps are independent, so the
+# stage runs them side by side: a scan that precedes the sweeps adds its whole
+# duration (12 seconds on a loaded host) in front of every probe. The scan stand-in
+# waits for the sweeps stand-in to appear, so a serial stage is caught by the
+# scan finding nothing there.
+test_the_inactive_scan_runs_alongside_the_sweeps() {
+  local rec home root log verdict
+  rec=$(new_world scan-parallel)
+  IFS='|' read -r home root log <<EOF
+$rec
+EOF
+  rm -f "$root/bin/fm-inactive-reconcile.sh"
+  cat > "$root/bin/fm-inactive-reconcile.sh" <<'SH'
+#!/usr/bin/env bash
+waited=0
+while [ ! -s "${FM_FAKE_BOOTSTRAP_LOG:?}" ] && [ "$waited" -lt 150 ]; do
+  sleep 0.1
+  waited=$((waited + 1))
+done
+if [ -s "$FM_FAKE_BOOTSTRAP_LOG" ]; then
+  printf 'sweeps-running\n' > "${FM_FAKE_SCAN_VERDICT:?}"
+else
+  printf 'sweeps-not-started\n' > "$FM_FAKE_SCAN_VERDICT"
+fi
+SH
+  chmod +x "$root/bin/fm-inactive-reconcile.sh"
+  printf '%s\n' $$ > "$home/state/.lock"
+  verdict="$home/scan-verdict"
+
+  FM_FAKE_BOOTSTRAP_LOG="$log" FM_FAKE_SCAN_VERDICT="$verdict" \
+    run_stage "$home" "$root" start --locked 1 --harvest-pid $$
+  run_stage "$home" "$root" harvest --pid $$ >/dev/null
+  run_stage "$home" "$root" wait 40 >/dev/null || fail "the stage never settled"
+  [ "$(cat "$verdict" 2>/dev/null)" = sweeps-running ] \
+    || fail "the inactive scan finished before the sweeps began: $(cat "$verdict" 2>/dev/null)"
+  assert_contains "$(run_stage "$home" "$root" report)" "inactive-scan" \
+    "the scan's elapsed time was not published beside the sweeps' timings"
+  pass "fm-startup-network: the inactive scan runs alongside the sweeps and is timed"
+}
+
 # A worker killed before publication leaves a `running` record behind.
 # That record must read as work to redo, not as work still in flight.
 test_an_abandoned_run_reads_as_needing_a_rerun() {
@@ -778,7 +818,9 @@ GITHUB_TOKEN=ghp_supersecretvalue" \
     "the timing artifact carried a command line through"
   assert_grep 'unrecordable' "$home/state/.startup-network.timings" \
     "free text was silently dropped instead of being marked unrecordable"
-  lines=$(grep -c . "$home/state/.startup-network.timings")
+  # The stage's own inactive-scan record is not the stand-in sweep's, so it is
+  # left out of the count this forgery check is about.
+  lines=$(grep -v $'\tinactive-scan\t' "$home/state/.startup-network.timings" | grep -c .)
   [ "$lines" -eq 2 ] \
     || fail "one sweep record plus the stage total should be 2 lines, got $lines"
 
@@ -869,6 +911,7 @@ test_an_actionable_successful_result_still_queues_a_wake
 test_deferred_invalid_secondmate_markers_queue_durable_findings
 test_mutating_sweeps_are_refused_when_the_lock_changed_hands
 test_the_stage_bound_is_reported_not_swallowed
+test_the_inactive_scan_runs_alongside_the_sweeps
 test_an_abandoned_run_reads_as_needing_a_rerun
 test_locked_start_is_not_satisfied_by_an_inflight_probe
 test_start_is_single_flight

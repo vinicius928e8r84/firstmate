@@ -405,6 +405,23 @@ test_sweep_respawns_confirmed_dead_secondmate() {
   pass "sweep: a confirmed-dead secondmate endpoint is killed and respawned"
 }
 
+test_sweep_refuses_relaunch_under_hold() {
+  local w fb tmuxfb log out
+  w=$(new_world sweep-hold)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  printf 'reason=test hold\n' > "$w/home/state/HOLD"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log")
+
+  assert_not_contains "$(cat "$log")" "new-window" \
+    "a HOLD must stop the bootstrap sweep from relaunching a dead secondmate"
+  assert_not_contains "$(cat "$log")" "kill-window" \
+    "a HOLD must leave the dead endpoint untouched"
+  pass "sweep: state/HOLD stops a secondmate relaunch"
+}
+
 test_sweep_recovers_the_durable_secondmate_account() {
   local w fb tmuxfb log out
   w=$(new_world sweep-account)
@@ -820,12 +837,45 @@ test_remote_poll_probe_unreachable_preserves_route() {
   pass "poll probe: unreachable or inconclusive remote reads preserve the route"
 }
 
+# A full-mode remote probe is bounded as a whole: a host that accepts the
+# connection and then never answers is a deferral reported on its own line, not
+# a wait that consumes the stage the other probes and the later sweeps share.
+# The fake ssh hangs only for the hung host, so the same world proves the
+# bound leaves a prompt host untouched.
+test_remote_full_probe_defers_a_hung_host_within_its_budget() {
+  local w out started elapsed
+  w=$(make_remote_probe_world probe-hung)
+  cat > "$w/fakebin/ssh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_FAKE_SSH_LOG:?}"
+[ -z "${FM_FAKE_REMOTE_HANG:-}" ] || sleep "$FM_FAKE_REMOTE_HANG"
+[ -z "${FM_FAKE_REMOTE_REPLY:-}" ] || printf '%s\n' "$FM_FAKE_REMOTE_REPLY"
+exit "${FM_FAKE_REMOTE_RC:-0}"
+SH
+  chmod +x "$w/fakebin/ssh"
+
+  started=$SECONDS
+  out=$(probe_remote "$w" full FM_SM_LIVE_PROBE_BUDGET=3 FM_FAKE_REMOTE_HANG=60 FM_FAKE_REMOTE_REPLY=alive)
+  elapsed=$((SECONDS - started))
+  [ "$out" = 'skipped|unknown|0|||deferred: remote probe exceeded its 3s budget; route preserved on lab-host and the watcher liveness tick repeats it' ] \
+    || fail "a hung remote host should defer with its route preserved, got: $out"
+  [ "$elapsed" -lt 30 ] || fail "the 3s probe budget took ${elapsed}s to end a hung host"
+
+  out=$(probe_remote "$w" full FM_SM_LIVE_PROBE_BUDGET=300 FM_FAKE_REMOTE_REPLY=dead)
+  case "$out" in
+    'relaunchable|dead|0|remote endpoint dead on its configured host|host=lab-host|') ;;
+    *) fail "a prompt host should still be classified within the budget, got: $out" ;;
+  esac
+  pass "full probe: a hung remote host is deferred inside its own budget and a prompt host is unaffected"
+}
+
 test_tmux_agent_state_classifies
 test_tmux_agent_state_rejects_malformed_targets_before_probe
 test_herdr_agent_state_preserves_husk_classifier
 test_agent_state_dispatcher_and_compatibility
 test_sweep_respawns_confirmed_dead_secondmate
 test_sweep_recovers_the_durable_secondmate_account
+test_sweep_refuses_relaunch_under_hold
 test_sweep_serializes_distinct_secondmate_relaunches
 test_sweep_leaves_alive_secondmate_untouched
 test_sweep_respawns_authoritatively_missing_pi_secondmate
@@ -842,5 +892,6 @@ test_relaunch_waits_for_other_mates_relaunch_lock
 test_sweep_refuses_relaunch_on_ledger_errors
 test_remote_poll_probe_maps_states
 test_remote_poll_probe_unreachable_preserves_route
+test_remote_full_probe_defers_a_hung_host_within_its_budget
 
 echo "# all fm-secondmate-liveness tests passed"

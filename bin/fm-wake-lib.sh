@@ -3047,3 +3047,154 @@ EOF
 
   return 0
 }
+
+# Unchanged-state gate for stale and heartbeat wakes (docs/configuration.md owns
+# the state/.wake-hash record). The model is woken for a repeat alarm only when
+# something it could act on changed. A heartbeat is judged against the whole-fleet
+# digest (the last line of every state/*.status, the backlog and the captain
+# asks); a stale alarm about one task is judged against that task's own digest (its
+# last status line plus the backlog and ask lines naming it), so unrelated traffic
+# cannot re-arm it. state/.wake-hash holds the fleet digest, the epoch the record
+# was last forced, and one seen=<subject>=<digest> line per alarm already delivered.
+# A new subject or a changed digest always delivers, a repeat is absorbed, and
+# every FM_WAKE_HASH_FORCE_SECS (default 6h) the record resets so a genuinely stuck
+# worker is never hidden. Event wakes (new status line, check result, failure,
+# open decision, unread steering) never pass through here.
+FM_WAKE_HASH_FORCE_SECS="${FM_WAKE_HASH_FORCE_SECS:-21600}"
+
+fm_wake_state_digest() {  # [state-dir] [task-id]
+  local state=${1:-$STATE} task=${2:-} data f
+  data="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+  {
+    if [ -n "$task" ]; then
+      printf '%s\n' "$(tail -n 1 "$state/$task.status" 2>/dev/null)"
+      grep -F -- "$task" "$data/backlog.md" "$data/captain-asks.tsv" 2>/dev/null
+    else
+      for f in "$state"/*.status; do
+        [ -f "$f" ] || continue
+        printf '%s\t%s\n' "${f##*/}" "$(tail -n 1 "$f" 2>/dev/null)"
+      done
+      cat "$data/backlog.md" "$data/captain-asks.tsv" 2>/dev/null
+    fi
+  } | LC_ALL=C cksum | tr -s ' \t' '--'
+}
+
+# Read-only half of the gate: 0 = deliver the wake, 1 = absorb it as unchanged.
+# It writes nothing, because a subject recorded ahead of its wake outlives a failed
+# append: the watcher exits with nothing queued, and the retry then reads the fresh
+# record and is absorbed, so a delayed alarm becomes a lost one. The caller records
+# the delivery with fm_wake_gate_record once its own append has succeeded.
+fm_wake_gate_check() {  # <subject-key> [task-id] [state-dir]
+  local key=$1 task=${2:-} state=${3:-$STATE} file now forced_at
+  file="$state/.wake-hash"
+  FM_WAKE_GATE_KEY=''
+  FM_WAKE_GATE_FLEET=$(fm_wake_state_digest "$state") || return 0
+  FM_WAKE_GATE_SCOPED=$FM_WAKE_GATE_FLEET
+  [ -z "$task" ] || FM_WAKE_GATE_SCOPED=$(fm_wake_state_digest "$state" "$task") || return 0
+  now=$(date +%s)
+  forced_at=$(sed -n 's/^forced_at=//p' "$file" 2>/dev/null | head -n 1)
+  case "$forced_at" in ''|*[!0-9]*) forced_at=0 ;; esac
+  FM_WAKE_GATE_KEY=$key
+  FM_WAKE_GATE_STATE=$state
+  FM_WAKE_GATE_FORCED_AT=$forced_at
+  FM_WAKE_GATE_RESET=0
+  if [ $((now - forced_at)) -ge "$FM_WAKE_HASH_FORCE_SECS" ]; then
+    FM_WAKE_GATE_FORCED_AT=$now
+    FM_WAKE_GATE_RESET=1
+    return 0
+  fi
+  ! grep -Fxq -- "seen=$key=$FM_WAKE_GATE_SCOPED" "$file" 2>/dev/null
+}
+
+# Record the subject judged by the last fm_wake_gate_check as delivered. A gate
+# that could not compute its digest checked nothing and records nothing.
+fm_wake_gate_record() {
+  local key=${FM_WAKE_GATE_KEY:-} state=${FM_WAKE_GATE_STATE:-} file line
+  [ -n "$key" ] || return 0
+  file="$state/.wake-hash"
+  : > "$file.seen.$$"
+  if [ "$FM_WAKE_GATE_RESET" -eq 0 ]; then
+    # keep every other subject's record; this key is rewritten below
+    while IFS= read -r line; do
+      case "$line" in "seen=$key="*) ;; seen=*) printf '%s\n' "$line" ;; esac
+    done 2>/dev/null < "$file" > "$file.seen.$$"
+  fi
+  {
+    printf 'hash=%s\nforced_at=%s\n' "$FM_WAKE_GATE_FLEET" "$FM_WAKE_GATE_FORCED_AT"
+    cat "$file.seen.$$" 2>/dev/null
+    printf 'seen=%s=%s\n' "$key" "$FM_WAKE_GATE_SCOPED"
+  } > "$file.tmp.$$" 2>/dev/null
+  mv -f "$file.tmp.$$" "$file" 2>/dev/null || rm -f "$file.tmp.$$" 2>/dev/null
+  rm -f "$file.seen.$$" 2>/dev/null
+  FM_WAKE_GATE_KEY=''
+  return 0
+}
+
+# 0 = deliver the wake (and remember the subject), 1 = absorb it as unchanged.
+# For a caller that appends a durable wake after the decision, use
+# fm_wake_gate_check and record only once that append has succeeded.
+fm_wake_gate() {  # <subject-key> [task-id] [state-dir]
+  local rc=0
+  fm_wake_gate_check "$@" || rc=$?
+  fm_wake_gate_record
+  return "$rc"
+}
+
+# state/HOLD: the one operator file that stops the fleet from starting work. It holds
+# optional `until=<epoch or ISO UTC>` and `reason=<text>` lines (bin/fm-hold.sh sets,
+# clears and shows it). While it exists and its `until` has not passed, every launching
+# path - bin/fm-spawn.sh (fresh and --relaunch), bin/fm-control.sh relaunch and the
+# watcher's secondmate auto-relaunch - calls fm_hold_refuse and stops; an expired
+# `until` means no HOLD. An unreadable file or an `until` that cannot be parsed counts
+# as a HOLD in force, because refusing is the safe error for a stop order.
+# shellcheck disable=SC2034 # Read by the launching scripts that call fm_hold_refuse.
+FM_HOLD_EXIT=75
+
+fm_hold_file() { printf '%s\n' "${FM_HOLD_FILE:-$STATE/HOLD}"; }
+
+# 0 when a HOLD is in force; sets FM_HOLD_UNTIL (epoch, empty when open-ended) and FM_HOLD_REASON.
+fm_hold_active() {
+  local file line value now epoch
+  FM_HOLD_UNTIL='' FM_HOLD_REASON=''
+  file=$(fm_hold_file)
+  [ -e "$file" ] || [ -L "$file" ] || return 1
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    FM_HOLD_REASON='the HOLD file is not a readable regular file'
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      reason=*) FM_HOLD_REASON=${line#reason=} ;;
+      until=*)
+        value=${line#until=}
+        case "$value" in
+          '') ;;
+          *[!0-9]*)
+            _fm_wake_require_classify
+            if epoch=$(fm_utc_iso_to_epoch "$value" 2>/dev/null) && [ -n "$epoch" ]; then
+              FM_HOLD_UNTIL=$epoch
+            else
+              FM_HOLD_REASON="${FM_HOLD_REASON:+$FM_HOLD_REASON; }until=$value is not an epoch or ISO UTC time, so the HOLD stays in force"
+              FM_HOLD_UNTIL=''
+            fi
+            ;;
+          *) FM_HOLD_UNTIL=$value ;;
+        esac
+        ;;
+    esac
+  done < "$file"
+  [ -n "$FM_HOLD_UNTIL" ] || return 0
+  now=$(date +%s)
+  [ "$now" -lt "$FM_HOLD_UNTIL" ]
+}
+
+# 0 to proceed; 1 after printing the refusal when a HOLD is in force. Callers exit
+# FM_HOLD_EXIT (75, "try later", the same code a capacity refusal uses).
+fm_hold_refuse() {  # <what is being refused>
+  fm_hold_active || return 0
+  printf 'error: %s refused: %s is present%s%s. Run bin/fm-hold.sh clear (or wait for its until= time) to resume.\n' \
+    "$1" "$(fm_hold_file)" \
+    "${FM_HOLD_REASON:+ ($FM_HOLD_REASON)}" \
+    "${FM_HOLD_UNTIL:+, in force until epoch $FM_HOLD_UNTIL}" >&2
+  return 1
+}

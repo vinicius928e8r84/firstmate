@@ -121,6 +121,9 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-quota-choose.sh`     | Choose the first candidate with known positive quota from an ordered harness:model list |
 | `fm-vendor-auth-probe.sh`| Run one hard-bounded, non-destructive authentication probe of a named vendor CLI and report the fact |
 | `fm-wake-drain.sh`       | Present and acknowledge the current actor's claimed wake rows alongside status, outcome-backstop, decision, divergence, supervision-host outcome, recovery, and supervision checks |
+| `fm-wake-inline.sh`      | Run the main actor's wake drain for the Pi extension (text for the wake message, acknowledgement arguments aside) and run its turn-end acknowledgement |
+| `fm-wake-shadow.sh`      | Append an observational shadow-log line per presented check or signal wake (features plus a conservative candidate verdict) for comparing a cheaper triage with the model's own outcome |
+| `fm-worker-context-cap.sh` | Print the per-project Pi worker settings that make auto-compaction trigger near a configured context cap, for a listed project and model only |
 | `fm-wake-grant.sh`       | Serialize Pi supervision-branch wake-row claim activation, publication, release, and deactivation |
 | `fm-wake-lib.sh`         | Shared durable wake queue, recovery generations, portable locks, and watcher identity/health helpers |
 | `fm-path-lib.sh`         | Fork-free `dirname`/`basename` equivalents with no source-time side effects             |

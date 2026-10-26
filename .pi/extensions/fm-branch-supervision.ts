@@ -76,7 +76,7 @@
 // its deliberate limits.
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 // Pi exposes pi-ai to extensions as a first-class module in both its Node
@@ -153,6 +153,8 @@ const wakeGrantScript = join(fmRoot, "bin", "fm-wake-grant.sh");
 const loadedMarker = join(state, ".pi-branch-extension-loaded");
 const modelPinFile = join(config, "supervision-branch-model");
 const effortPinFile = join(config, "supervision-branch-effort");
+const branchGateFile = join(config, "supervision-branch");
+const shadowLogFile = join(state, "wake-shadow.jsonl");
 
 // Same tool set in the same order on every request (part of the cached
 // prefix). "bash" resolves to the customTools override below, which injects
@@ -306,6 +308,53 @@ function readModelPin(): { provider: string; modelId: string } | null {
   const separator = line.indexOf("/");
   if (separator <= 0 || separator >= line.length - 1) return null;
   return { provider: line.slice(0, separator), modelId: line.slice(separator + 1) };
+}
+
+// The attended branch gate, owned operator-side by docs/configuration.md "Pi
+// supervision branch gate": config/supervision-branch (or FM_SUPERVISION_BRANCH,
+// which wins) holds one word. Absent or anything else means off. `triage` turns
+// the branch on for attended wakes only while the shadow log
+// (bin/fm-wake-shadow.sh) holds rows and the model the branch would run is not
+// a Claude model, so the branch can only take no-op triage off Claude quota,
+// never add to it. `legacy` is the earlier always-on behavior on any model. The
+// away posture keeps that earlier behavior whatever this says: the captain
+// chose it explicitly and it relocates main's authority to the branch.
+type BranchGateMode = "off" | "triage" | "legacy";
+
+function readBranchGateMode(): BranchGateMode {
+  let raw = process.env.FM_SUPERVISION_BRANCH;
+  if (raw === undefined) {
+    try {
+      raw = readFileSync(branchGateFile, "utf8");
+    } catch {
+      raw = "";
+    }
+  }
+  const word = (raw.split("\n")[0] ?? "").trim().toLowerCase();
+  return word === "triage" || word === "legacy" ? word : "off";
+}
+
+function shadowLogHasRows(): boolean {
+  try {
+    return statSync(shadowLogFile).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+function isClaudeModel(model: { provider: string; id: string }): boolean {
+  return /claude|anthropic/i.test(`${model.provider}/${model.id}`);
+}
+
+function branchGateAccepts(main: { provider: string; id: string } | null): boolean {
+  if (afkPostureRecordPresent(state)) return true;
+  const mode = readBranchGateMode();
+  if (mode === "legacy") return true;
+  if (mode === "off") return false;
+  if (!shadowLogHasRows()) return false;
+  const pin = readModelPin();
+  const model = pin ? { provider: pin.provider, id: pin.modelId } : main;
+  return model !== null && !isClaudeModel(model);
 }
 
 // The supervision-branch effort pin, owned operator-side by the same
@@ -1661,6 +1710,7 @@ ${context.command}
     // gets neither branch routing nor branch-owned state/lease cleanup side
     // effects.
     if (!offerEligible(offer)) return;
+    if (!branchGateAccepts(mainModel)) return; // gate off, or triage without a shadow log / on a Claude model: main keeps the wake
     if (!generationOwnsLockSync(generation)) return; // cold start pre-lock, secondary session, or shutdown
     const recoveryProbe = Boolean(
       branchBroken &&

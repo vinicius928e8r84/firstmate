@@ -469,7 +469,15 @@ fm_control_harness_wiring_paths() {  # <harness> <worktree> <state-dir> <id> [ki
       fi
       ;;
     opencode) printf '%s\n' "$wt/.opencode/plugins/fm-busy-state.js" ;;
-    pi|pi-signed) printf '%s\n' "$state/$id.pi-ext.ts" ;;
+    # The worker context cap (bin/fm-worker-context-cap.sh) is named only while
+    # the worktree's .pi/settings.json carries this task's marker; a project's
+    # own settings file is never firstmate's to retire.
+    pi|pi-signed)
+      printf '%s\n' "$state/$id.pi-ext.ts"
+      if grep -qsF "\"firstmateWorkerContextCap\":\"$id\"" "$wt/.pi/settings.json"; then
+        printf '%s\n' "$wt/.pi/settings.json"
+      fi
+      ;;
     omp) printf '%s\n' "$state/$id.omp-ext.ts" ;;
     grok)
       printf '%s\n' "$wt/.fm-grok-turnend"

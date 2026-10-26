@@ -100,6 +100,7 @@ Each effective `FM_HOME` contains private operational directories.
 
 - Task metadata, append-only status events, and endpoint signals.
 - Watcher and wake-queue coordination, away-mode state, and generated Relay artifacts.
+- The unchanged-state wake record `state/.wake-hash` (`fm_wake_gate` in `bin/fm-wake-lib.sh` owns its fields and the forced-wake interval) and the optional stop order `state/HOLD` (`bin/fm-hold.sh` sets it, `fm_hold_refuse` in `bin/fm-wake-lib.sh` owns the check that makes spawn, relaunch and the secondmate auto-relaunch refuse with exit 75 until its `until=` time).
 - Inactive terminal-outcome receipts under `state/terminal-outcomes/`.
 - Enabled extension working namespaces under `state/extensions/`.
 - Parent-side remote ledger copies under `state/secondmate-summary-cache/`.
@@ -180,7 +181,7 @@ This preference is local to each Firstmate home and is not part of secondmate in
 On a Pi primary, an in-process supervision branch handles eligible task-local wake rows and selected heartbeat reviews.
 Main-only rows stay on the captain-facing path.
 [docs/pi-supervision-branch.md](pi-supervision-branch.md) defines its conversation lifecycle, row eligibility, mixed-queue dispatch, heartbeat routing, and pre-drain recheck.
-Supervision is default-on: once a Pi primary session owns this home's fleet lock, the branch is eligible for every task with no captain grant file required.
+Supervision is off until `config/supervision-branch` turns it on ([gate](#pi-supervision-branch-gate-configsupervision-branch)); once it is on and a Pi primary session owns this home's fleet lock, the branch is eligible for every task with no captain grant file required.
 
 Bash absorbs a genuinely no-op heartbeat before it reaches Pi.
 Every watcher-failure alarm stays on the captain-facing main path.
@@ -214,6 +215,47 @@ The branch prompt's "Verdict: routine or captain" section owns the distinction b
 
 The generated [Pi supervision protocol](supervision-protocols/pi.md) owns main's event ownership, acknowledgement duty, and conversational treatment for merged outcomes, while the persisted entry itself owns captain visibility.
 A task-level routine no-change outcome or a no-change heartbeat explicitly reported with `silent=true` is delivered without a rendered note; the branch prompt owns task-level eligibility, and every other routine outcome still appends a rendered, sailboat-prefixed note.
+
+## Worker context cap (config/worker-context-cap)
+
+A worker session re-reads its whole context on every model call, so a long task pays for a large context hundreds of times.
+Pi compacts automatically once the context passes the model's window minus `compaction.reserveTokens`, which is how the primary session is capped.
+Gitignored `config/worker-context-cap` extends that cap to the Pi workers of named projects, one entry per line:
+
+```
+# <project> <cap-tokens> <model-id> <window-tokens>
+modo-caverna 250000 claude-opus-5-5 1000000
+```
+
+`<project>` is the registered project name, `<model-id>` is the worker's model without its provider prefix, and `<window-tokens>` is that model's context window as `pi --list-models` reports it.
+`bin/fm-spawn.sh` writes a git-excluded `.pi/settings.json` into the worker's worktree with `reserveTokens` equal to window minus cap, only for a Pi or pi-signed ship or scout whose project and model are both listed.
+A model or project the file does not name is never capped, so a smaller-window model cannot be handed a reserve larger than its window, and an entry whose window is under 100000 tokens above its cap is ignored.
+A worktree that already has its own `.pi/settings.json` keeps it, and cleanup and relaunch retire only the file that carries the task's own marker.
+The script header of `bin/fm-worker-context-cap.sh` owns the arithmetic and the settings it writes.
+Project settings load only for a trusted worktree, which is the same trust the worker's launch already needs.
+
+## Pi supervision branch gate (config/supervision-branch)
+
+One word in gitignored `config/supervision-branch`, or in `FM_SUPERVISION_BRANCH`, which wins over the file, sets whether the branch takes attended wakes:
+
+| Word | Meaning |
+| --- | --- |
+| absent, `off`, anything else | The branch declines every attended offer and main handles the wake as it always could. This is the default. |
+| `triage` | The branch takes attended wakes only while `state/wake-shadow.jsonl` holds rows and the model it would run is not a Claude model: the `config/supervision-branch-model` pin when there is one, otherwise main's own model. A Claude pin, or following a Claude main, declines. |
+| `legacy` | The earlier always-on behavior on any model, for homes that want it back. |
+
+The away-posture record `state/.afk-contract` bypasses the gate: the branch takes every row exactly as [pi-supervision-branch.md](pi-supervision-branch.md#postures) describes, whatever the gate says.
+The extension reads the gate at every offer, so a change applies to the next wake with no restart.
+
+To turn on no-op triage:
+
+1. Let the shadow log collect check and signal wakes for a few working days (`bin/fm-wake-shadow.sh summary` counts them; the script header owns the log format).
+2. Pin a non-Claude branch model with `/supervision-model` (it writes `config/supervision-branch-model`) and an effort.
+3. Write `triage` to `config/supervision-branch`.
+
+To turn it off again, delete the file or write `off`; the next wake goes to main.
+The branch can only reduce Claude spend this way: a gate that is on but cannot satisfy the shadow-log or non-Claude conditions behaves as off.
+Pass the equivalence check from the shadow log before relying on it: among the wakes the candidate rule marks `noop`, the model's own outcome must show no mutating turn over at least 300 wakes.
 
 ## Pi supervision branch model and effort (config/supervision-branch-model, config/supervision-branch-effort)
 
@@ -2815,6 +2857,9 @@ FM_TASKS_AXI_CHECK_REASON=   # internal one-hop handoff of the reason behind tha
 FM_GUARD_READ_ONLY=0    # internal/read-only guard mode: keep alarms but suppress drain, supervision repair, and checkout repair commands
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the guarded operation WILL still run.'   # banner continuation line; fm-send.sh overrides it to name the requested message specifically
 FM_POLL=15              # seconds between watcher poll cycles
+FM_HERDR_CLEANUP_BUDGET=40   # seconds bounding the locked session-start Herdr projection cleanup (bin/fm-herdr-session-cleanup.sh); candidates not reached are reported on one `deferred` warning line and retried by the next locked start; invalid values use 40
+FM_HERDR_CLEANUP_PROOF_WINDOW=4   # seconds after which the cleanup's idle-shell proof stops retrying a busy pane (at least two samples are always taken); the proof still passes only on one fully clean sample; invalid values use 4
+FM_SM_LIVE_PROBE_BUDGET=60   # seconds bounding one remote secondmate's whole startup liveness probe (readiness doctor, state, route); a host that exceeds it is reported as a `deferred` skip with its route preserved and the watcher liveness tick repeats it; invalid or zero values use 60
 FM_HOME_SUMMARY_INTERVAL=300   # seconds before a live watcher refreshes this home's state/home-summary.json even without a status signal; invalid or zero values use 300
 FM_HOME_SUMMARY_TIMEOUT=60     # seconds bounding the complete best-effort home-summary refresh, including lock acquisition, validation, atomic publication, and worker-side failure logging; invalid or zero values use 60
 FM_HOME_SUMMARY_ERROR_LOG_MAX_BYTES=65536   # approximate size cap for state/.home-summary-refresh.log before it is trimmed to the newest 200 lines; invalid or zero values use 65536
@@ -2889,6 +2934,18 @@ FM_WATCH_ARM_RETIRE_TIMEOUT_MS=1000   # milliseconds Pi/OpenCode wait for an unr
 FM_WATCH_REARM_RETRY_BASE_MS=250   # Pi/OpenCode adapter base delay for continuity restoration retries
 FM_WATCH_REARM_RETRY_MAX_MS=4000   # Pi/OpenCode adapter cap for exponential continuity retry delay
 FM_WATCH_REARM_RETRY_LIMIT=5   # Pi/OpenCode adapter launch-failure retries before surfacing restoration failure
+FM_WATCH_SELFHEAL_ROUNDS=3   # Pi adapter slower restart rounds after the retry ladder is spent and before the model is told; zero restores the immediate failure
+FM_WATCH_SELFHEAL_DELAY_MS=32000   # Pi adapter delay before the first self-heal round (default eight times FM_WATCH_REARM_RETRY_MAX_MS), doubling each round
+FM_GUARD_SELFHEAL_ATTEMPTS=2   # Pi turn-end guard requests to the watcher extension for a self-heal before it wakes the model; zero disables
+FM_GUARD_SELFHEAL_WAIT_MS=10000   # Pi turn-end guard pause between self-heal attempts
+FM_WAKE_INLINE=1   # Pi adapter inline wake drain with turn-end acknowledgement (bin/fm-wake-inline.sh); 0 hands the drain back to the model
+FM_WAKE_INLINE_TIMEOUT_MS=60000   # Pi adapter bound on the inline drain before it falls back to telling the model to drain
+FM_CACHE_KEEPALIVE=1   # Pi primary cache keep-alive (.pi/extensions/fm-cache-keepalive.ts); 0 disables it. Only the session that owns the fleet lock pings
+FM_CACHE_KEEPALIVE_IDLE_MS=3000000   # idle time after which an idle primary sends one hidden turn so the prompt cache does not expire (50 minutes)
+FM_CACHE_KEEPALIVE_MAX_PINGS=4   # consecutive keep-alive turns with no real activity between them; real activity resets the count, zero disables
+FM_CACHE_KEEPALIVE_MIN_TOKENS=30000   # context size under which a cache miss is cheaper than a keep-alive turn and none is sent
+FM_WAKE_SHADOW=1   # shadow log of check and signal wakes presented by the drain (state/wake-shadow.jsonl, bin/fm-wake-shadow.sh header owns the fields); observational, 0 disables it
+FM_WAKE_SHADOW_MAX_BYTES=4194304   # size at which the shadow log rotates once to wake-shadow.jsonl.1
 FM_WATCH_CYCLE_LOG_MAX_BYTES=262144   # size cap for the arm-owned watcher lifecycle ledger
 FM_WATCH_CYCLE_LOG_KEEP_LINES=1000   # newest complete lifecycle rows considered when the ledger is capped
 FM_WATCH_EXTENSION_LOG_KEEP_LINES=0   # opt-in Pi extension diagnostic log (state/.watch-extension.log); unset, empty, non-numeric, zero, or negative disables logging, a positive value keeps that many newest rows; logging never changes supervision behavior

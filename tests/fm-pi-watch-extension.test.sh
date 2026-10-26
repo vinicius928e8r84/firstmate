@@ -218,6 +218,340 @@ EOF
   pass "Pi extension reports external healthy watcher output"
 }
 
+# Drives the inline drain and turn-end acknowledgement (bin/fm-wake-inline.sh).
+# The arm stub prints a healthy-watcher line so the extension raises its owned
+# failure wake, which is the cheapest real route into sendWake. The drain stub
+# stands in for bin/fm-wake-drain.sh and logs every acknowledgement it receives.
+# <case> <drain-mode ok|fail> <consume yes|no> <stop-reason>
+run_pi_inline_wake_case() {
+  local name=$1 mode=$2 consume=$3 stop=$4 repo home drain
+  repo="$TMP_ROOT/pi-inline-$name-root"
+  home="$TMP_ROOT/pi-inline-$name-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  cp "$ROOT/bin/fm-wake-inline.sh" "$repo/bin/fm-wake-inline.sh"
+  chmod +x "$repo/bin/fm-wake-inline.sh"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'watcher: healthy pid=1 (beacon 0s)\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  drain="$TMP_ROOT/pi-inline-$name-drain.sh"
+  cat > "$drain" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --ack-through ]; then
+  printf 'ack %s\n' "$*" >> "$INLINE_ACK_LOG"
+  exit 0
+fi
+[ "$INLINE_DRAIN_MODE" = slow ] && { sleep "${INLINE_SLEEP:-2}"; INLINE_DRAIN_MODE=ok; }
+[ "$INLINE_DRAIN_MODE" = ok ] || { echo "wake drain: boom" >&2; exit 1; }
+printf 'signal one done: PR https://example.test/pull/1\n'
+printf 'WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 7 --recovery-generation gen1\n' >&2
+SH
+  chmod +x "$drain"
+  : > "$TMP_ROOT/pi-inline-$name-acks.log"
+  PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" \
+    FM_WAKE_INLINE_DRAIN="$drain" INLINE_DRAIN_MODE="$mode" INLINE_ACK_LOG="$TMP_ROOT/pi-inline-$name-acks.log" \
+    INLINE_CONSUME="$consume" INLINE_STOP="$stop" \
+    FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 FM_WATCH_REARM_RETRY_LIMIT=2 \
+    node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let commandHandler = null;
+let prompt = "";
+const pi = {
+  on(name, fn) { handlers.set(name, fn); },
+  registerCommand(name, options) { if (name === "fm-watch-arm-pi") commandHandler = options.handler; },
+  registerTool() {},
+  sendUserMessage: async (message) => { prompt = message; },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await commandHandler("", { ui: { notify() {} } });
+for (let i = 0; i < 400 && !prompt; i += 1) await new Promise((r) => setTimeout(r, 20));
+console.log(`PROMPT-START\n${prompt}\nPROMPT-END`);
+const settle = async () => { await handlers.get("agent_settled")?.(); };
+await settle();
+if (process.env.INLINE_CONSUME === "yes") {
+  handlers.get("message_start")?.({ message: { role: "user", content: [{ type: "text", text: prompt }] } });
+}
+handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: process.env.INLINE_STOP }] });
+await settle();
+await new Promise((r) => setTimeout(r, Number(process.env.INLINE_LINGER_MS || 0)));
+process.exit(0);
+EOF
+}
+
+test_pi_wake_is_drained_inline_and_acknowledged_when_the_run_settles() {
+  local out acks
+  out=$(run_pi_inline_wake_case clean ok yes stop)
+  acks=$(cat "$TMP_ROOT/pi-inline-clean-acks.log")
+  case "$out" in *"WAKE DRAIN (bin/fm-wake-drain.sh already ran"*) ;; *) fail "wake text carries no inline drain: $out" ;; esac
+  case "$out" in *"signal one done: PR https://example.test/pull/1"*) ;; *) fail "wake text lost the drained rows: $out" ;; esac
+  case "$out" in *"Run bin/fm-wake-drain.sh first"*) fail "an inline wake still tells the model to drain: $out" ;; esac
+  case "$out" in *"WAKE_ACK_REQUIRED"*) fail "the ack line leaked into the wake text: $out" ;; esac
+  case "$out" in *"acknowledges wakes through 7"*) ;; *) fail "wake text does not announce the automatic acknowledgement: $out" ;; esac
+  [ "$acks" = "ack --ack-through 7 --recovery-generation gen1" ] \
+    || fail "the settled run must acknowledge exactly the drained cutoff once, got: $acks"
+  pass "Pi wake carries the drain inline and the settled run acknowledges it"
+}
+
+test_pi_wake_is_not_acknowledged_before_it_is_consumed() {
+  local acks
+  run_pi_inline_wake_case unconsumed ok no stop > /dev/null
+  acks=$(cat "$TMP_ROOT/pi-inline-unconsumed-acks.log")
+  [ -z "$acks" ] || fail "a wake Pi accepted but the model never read was acknowledged: $acks"
+  pass "Pi wake is not acknowledged until the model's run consumed it"
+}
+
+test_pi_aborted_or_errored_run_leaves_the_wake_unacknowledged() {
+  local stop acks
+  for stop in aborted error length; do
+    run_pi_inline_wake_case "run-$stop" ok yes "$stop" > /dev/null
+    acks=$(cat "$TMP_ROOT/pi-inline-run-$stop-acks.log")
+    [ -z "$acks" ] || fail "a run that ended '$stop' acknowledged its wake: $acks"
+  done
+  pass "Pi aborted, errored, and truncated runs leave their wake durable"
+}
+
+test_pi_failing_inline_drain_falls_back_to_the_model_drain() {
+  local out acks
+  out=$(run_pi_inline_wake_case fallback fail yes stop)
+  acks=$(cat "$TMP_ROOT/pi-inline-fallback-acks.log")
+  case "$out" in *"Run bin/fm-wake-drain.sh first and handle the queued wake."*) ;; *) fail "fallback lost the model drain instruction: $out" ;; esac
+  case "$out" in *"WAKE DRAIN"*) fail "a failed inline drain still claims an inline drain: $out" ;; esac
+  [ -z "$acks" ] || fail "a fallback wake must leave acknowledgement to the model, got: $acks"
+  pass "Pi wake falls back to the model drain when the inline drain fails"
+}
+
+test_pi_slow_inline_drain_under_the_default_cap_stays_inline() {
+  local out acks
+  out=$(INLINE_SLEEP=2 run_pi_inline_wake_case slow slow yes stop)
+  acks=$(cat "$TMP_ROOT/pi-inline-slow-acks.log")
+  case "$out" in *"WAKE DRAIN (bin/fm-wake-drain.sh already ran"*) ;; *) fail "a slow but successful drain fell back to the model: $out" ;; esac
+  [ "$acks" = "ack --ack-through 7 --recovery-generation gen1" ] || fail "slow inline drain was not acknowledged once: $acks"
+  grep -Eq 'positiveInteger\("FM_WAKE_INLINE_TIMEOUT_MS", (1[89]|[2-9][0-9])[0-9]{4}\)' "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" \
+    || fail "default inline drain cap must cover a loaded host's 45-60 s drain (>= 180 s)"
+  pass "Pi slow inline drain under the default cap stays inline and is acknowledged"
+}
+
+test_pi_timed_out_inline_drain_falls_back_and_leaves_no_orphan_ack_file() {
+  local out left
+  out=$(FM_WAKE_INLINE_TIMEOUT_MS=500 INLINE_SLEEP=2 INLINE_LINGER_MS=3500 run_pi_inline_wake_case timeout slow yes stop)
+  case "$out" in *"Run bin/fm-wake-drain.sh first and handle the queued wake."*) ;; *) fail "timed-out inline drain did not fall back: $out" ;; esac
+  case "$out" in *"WAKE DRAIN ("*) fail "timed-out inline drain still claims an inline drain: $out" ;; esac
+  left=$(find "$TMP_ROOT/pi-inline-timeout-home/state" -maxdepth 1 -name '.inline-ack.*' | head -n 1)
+  [ -z "$left" ] || fail "timed-out inline drain left an orphan ack file: $left"
+  pass "Pi timed-out inline drain falls back and removes its late ack file"
+}
+
+# Self-heal on request (the turn-end guard asks over the shared event bus before
+# it wakes the model). The arm stub fails its first two launches, which spends
+# the retry budget and surfaces a failure, then runs healthy; the request must
+# start a fresh cycle, settle true once it is ready, and be an idempotent no-op
+# afterwards.
+test_pi_selfheal_request_restarts_an_exhausted_cycle_once() {
+  local repo home log stop out status
+  repo="$TMP_ROOT/pi-selfheal-root"
+  home="$TMP_ROOT/pi-selfheal-home"
+  log="$TMP_ROOT/pi-selfheal.log"
+  stop="$TMP_ROOT/pi-selfheal.stop"
+  rm -f "$log" "$stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(grep -c '^arm=' "$FM_ARM_LOG")
+if [ "$count" -le 2 ]; then
+  printf 'watcher: FAILED - no live watcher with a fresh beacon\n'
+  exit 1
+fi
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
+trap 'exit 0' TERM INT
+while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" \
+    FM_PI_ARM_READY_TIMEOUT_MS="$ARM_READY_TIMEOUT_MS" FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 FM_WATCH_REARM_RETRY_LIMIT=1 FM_WATCH_SELFHEAL_ROUNDS=0 \
+    node --input-type=module 2>&1 <<'EOF'
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const bus = new Map();
+let tool = null;
+let prompts = [];
+const pi = {
+  on() {},
+  events: {
+    on(name, fn) { bus.set(name, fn); },
+    emit(name, data) { bus.get(name)?.(data); },
+  },
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendUserMessage: async (message) => { prompts.push(message); },
+};
+const launches = () => readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").length;
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("selfheal-first", {}, undefined, undefined, {});
+for (let i = 0; i < 400 && !prompts.some((p) => p.includes("could not restore watcher continuity")); i += 1) {
+  await new Promise((r) => setTimeout(r, 20));
+}
+if (!prompts.some((p) => p.includes("could not restore watcher continuity after 1 retries"))) {
+  throw new Error(`the exhausted cycle never surfaced: ${prompts.join(" | ")}`);
+}
+if (launches() !== 2) throw new Error(`expected 2 failed launches before the request, saw ${launches()}`);
+
+const ask = () => {
+  const request = { accepted: false, settlement: null };
+  pi.events.emit("fm:watch-selfheal", request);
+  if (!request.accepted) throw new Error("the watcher extension did not answer the self-heal request");
+  return request.settlement;
+};
+if ((await ask()) !== true) throw new Error("self-heal did not report a ready cycle");
+if (launches() !== 3) throw new Error(`self-heal should have started exactly one fresh cycle, saw ${launches()} launches`);
+if ((await ask()) !== true) throw new Error("a repeat request against a healthy cycle must settle true");
+if (launches() !== 3) throw new Error(`a repeat request started another cycle: ${launches()} launches`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi self-heal request must restart an exhausted cycle once: $out"
+  [ -z "$out" ] || fail "Pi self-heal test printed output: $out"
+  pass "Pi self-heal request restarts an exhausted cycle once and is idempotent"
+}
+
+test_pi_selfheal_request_is_refused_without_the_session_lock() {
+  local repo home log stop out status
+  repo="$TMP_ROOT/pi-selfheal-nolock-root"
+  home="$TMP_ROOT/pi-selfheal-nolock-home"
+  log="$TMP_ROOT/pi-selfheal-nolock.log"
+  rm -f "$log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" \
+    node --input-type=module 2>&1 <<'EOF'
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const bus = new Map();
+const pi = {
+  on() {},
+  events: { on(name, fn) { bus.set(name, fn); }, emit(name, data) { bus.get(name)?.(data); } },
+  registerCommand() {},
+  registerTool() {},
+  sendUserMessage: async () => {},
+};
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+const request = { accepted: false, settlement: null };
+pi.events.emit("fm:watch-selfheal", request);
+if (!request.accepted) throw new Error("the request was not answered");
+if ((await request.settlement) !== false) throw new Error("a session that does not own the lock must not self-heal");
+if (existsSync(process.env.FM_ARM_LOG)) throw new Error("a refused self-heal still launched the watcher");
+process.exit(0);
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi self-heal must refuse without the lock: $out"
+  [ -z "$out" ] || fail "Pi self-heal refusal test printed output: $out"
+  pass "Pi self-heal request is refused when this session does not own the lock"
+}
+
+# After the retry ladder is spent the extension keeps trying on a slower
+# schedule before it tells the model. <fail-launches> launches fail, then the
+# arm runs healthy: with rounds to spare the model is never told; with none
+# left it is told once, after exactly the launches the budget allows.
+run_pi_selfheal_rounds_case() {  # <name> <fail-launches> <rounds>
+  local name=$1 failures=$2 rounds=$3 repo home log stop
+  repo="$TMP_ROOT/pi-selfheal-$name-root"
+  home="$TMP_ROOT/pi-selfheal-$name-home"
+  log="$TMP_ROOT/pi-selfheal-$name.log"
+  stop="$TMP_ROOT/pi-selfheal-$name.stop"
+  rm -f "$log" "$stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(grep -c '^arm=' "$FM_ARM_LOG")
+if [ "$count" -le "${FM_FAIL_LAUNCHES:?}" ]; then
+  printf 'watcher: FAILED - no live watcher with a fresh beacon\n'
+  exit 1
+fi
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
+trap 'exit 0' TERM INT
+while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" \
+    FM_FAIL_LAUNCHES="$failures" FM_PI_ARM_READY_TIMEOUT_MS="$ARM_READY_TIMEOUT_MS" \
+    FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 FM_WATCH_REARM_RETRY_LIMIT=1 \
+    FM_WATCH_SELFHEAL_ROUNDS="$rounds" FM_WATCH_SELFHEAL_DELAY_MS=20 \
+    node --input-type=module 2>&1 <<'EOF'
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const prompts = [];
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendUserMessage: async (message) => { prompts.push(message); },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("selfheal-rounds", {}, undefined, undefined, {});
+await new Promise((r) => setTimeout(r, 1500));
+const launches = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").length;
+console.log(`launches=${launches} prompts=${prompts.length}`);
+for (const prompt of prompts) console.log(prompt.split("\n").find((line) => line.includes("could not restore")) ?? "");
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+process.exit(0);
+EOF
+}
+
+test_pi_selfheal_rounds_recover_before_the_model_is_told() {
+  local out
+  out=$(run_pi_selfheal_rounds_case recover 3 3)
+  case "$out" in "launches=4 prompts=0") ;; *) fail "a cycle that recovers in a self-heal round must not wake the model: $out" ;; esac
+  pass "Pi continuity self-heal recovers an exhausted retry ladder without a model turn"
+}
+
+test_pi_selfheal_rounds_surface_once_when_every_round_fails() {
+  local out
+  out=$(run_pi_selfheal_rounds_case exhaust 99 2)
+  case "$out" in
+    "launches=4 prompts=1"*"after 1 retries and 2 self-heal rounds"*) ;;
+    *) fail "every failed round must end in exactly one typed failure after 2 launches plus 2 rounds: $out" ;;
+  esac
+  pass "Pi continuity self-heal surfaces one failure after its last round"
+}
+
+test_pi_selfheal_rounds_zero_keeps_the_original_failure() {
+  local out
+  out=$(run_pi_selfheal_rounds_case norounds 99 0)
+  case "$out" in
+    "launches=2 prompts=1"*"after 1 retries"*) ;;
+    *) fail "with no rounds the original failure text and launch count must hold: $out" ;;
+  esac
+  case "$out" in *"self-heal"*) fail "rounds=0 text mentions self-heal: $out" ;; esac
+  pass "Pi continuity self-heal rounds can be switched off"
+}
+
 test_pi_tool_returns_agent_tool_result() {
   local repo home plugin out status
   repo="$TMP_ROOT/pi-tool-result-root"
@@ -2815,7 +3149,7 @@ printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
 exit 0
 SH
   chmod +x "$repo/bin/fm-watch-arm.sh"
-  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 FM_WATCH_REARM_RETRY_LIMIT=2 node --input-type=module 2>&1 <<'EOF'
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 FM_WATCH_REARM_RETRY_LIMIT=2 FM_WATCH_SELFHEAL_ROUNDS=0 node --input-type=module 2>&1 <<'EOF'
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
@@ -5679,6 +6013,17 @@ EOF
 }
 
 test_pi_extension_reports_external_healthy_watcher
+test_pi_wake_is_drained_inline_and_acknowledged_when_the_run_settles
+test_pi_wake_is_not_acknowledged_before_it_is_consumed
+test_pi_aborted_or_errored_run_leaves_the_wake_unacknowledged
+test_pi_failing_inline_drain_falls_back_to_the_model_drain
+test_pi_slow_inline_drain_under_the_default_cap_stays_inline
+test_pi_timed_out_inline_drain_falls_back_and_leaves_no_orphan_ack_file
+test_pi_selfheal_request_restarts_an_exhausted_cycle_once
+test_pi_selfheal_request_is_refused_without_the_session_lock
+test_pi_selfheal_rounds_recover_before_the_model_is_told
+test_pi_selfheal_rounds_surface_once_when_every_round_fails
+test_pi_selfheal_rounds_zero_keeps_the_original_failure
 test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop
 test_pi_scheduled_retry_call_is_owned_noop
