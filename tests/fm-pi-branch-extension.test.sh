@@ -1843,7 +1843,7 @@ setMode("off");
 if (verdict("env-wins")) throw new Error("the environment variable did not win over the file");
 setMode(undefined);
 
-// 3. Triage with a shadow log still refuses a Claude model: main's own (provider anthropic) ...
+// 3. Triage with a shadow log still refuses a Claude model: the main model (provider anthropic) ...
 writeFileSync(`${home}/state/wake-shadow.jsonl`, '{"v":1}\n');
 if (verdict("claude-main")) throw new Error("triage accepted a wake while following a Claude main model");
 // ... or a Claude pin.
