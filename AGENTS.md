@@ -269,6 +269,7 @@ No turn ends blind while work is under way, including turns described as holding
 
 - At the start of every wake-handling turn, drain the durable wake queue before peeking, reading beyond the reason line, steering, or starting work.
 - Session start is the only exception because its one-shot digest already presented the queue while locked or deliberately left it untouched in lock-refused read-only mode; a wake message that carries its own drain and says the harness acknowledges it (emitted protocol) is the other.
+- A wake whose reason is exactly `check: rearm-resurface` has nothing for the captain when nothing is behind it: where the message tells you to drain, first run `bin/fm-wake-drain.sh --probe --reason 'check: rearm-resurface' --settle`, and where it already carries the drain, read that presentation; on `QUIET` or a carried drain that presents nothing, end the turn with no captain-facing text, not even `Captain, shipshape.`, and otherwise handle it as above (`docs/watcher-continuity.md` "Quiet wakes" owns the verdict).
 - Treat any `OPEN DECISIONS` section from the drain as actionable reconciliation input even when no wake record was queued.
 - Treat any `UNREAD STATUS` section as newly surfaced status that must be read this turn; those lines are not re-printed after this presentation.
 - Treat any `RECORD DIVERGENCE` section as a contradiction between two records of one captain call, never as proof the captain ruled; load `captain-hold-lifecycle` and reconcile it in whichever direction the evidence supports.

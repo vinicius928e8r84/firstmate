@@ -12,6 +12,7 @@ In this document, an arm is one run of `bin/fm-watch-arm.sh`, which starts a wat
 | Which component re-arms the watcher on each harness | [Ownership](#ownership) |
 | What happens between an actionable close and the wake reaching the model | [Actionable wake ordering](#actionable-wake-ordering) |
 | How a watcher-downtime episode is announced and retired | [Recovery episode acknowledgement](#recovery-episode-acknowledgement) |
+| When a wake is provably empty and needs no captain-facing turn | [Quiet wakes](#quiet-wakes) |
 | How each actor consumes the wake queue | [Per-actor acknowledgement](#per-actor-acknowledgement) |
 | What `bin/fm-watch-arm.sh` guarantees about each cycle | [Arm-layer cycle contract](#arm-layer-cycle-contract) |
 | Which test suites pin these contracts | [Regression coverage](#regression-coverage) |
@@ -267,6 +268,22 @@ The acknowledgement retires the marker only when no rows remain after sequence-b
 A concurrently appended wake has a higher sequence, remains queued, and keeps the episode pending for presentation.
 Consequently, a watcher close during handling republishes the same generation as pending and forces one recovery turn even when no queue row remains, while the outstanding generation-bound acknowledgement stays valid.
 An acknowledged episode does not freeze the generation, because the next downtime after it opens an episode of its own.
+
+## Quiet wakes
+
+A recovery wake can close a watcher cycle with nothing behind it: `check: rearm-resurface` names no content, and an empty queue with no open decision leaves the drain nothing to print.
+Handling it as an ordinary wake spends a full supervision turn, and a reply to the captain, to learn that nothing happened.
+`bin/fm-wake-drain.sh --probe --reason '<wake reason line>' [--settle]` answers whether that is the case without presenting or consuming anything.
+It prints `QUIET` or `NEWS: <why>` and exits 0 for both.
+The verdict is `QUIET` only for the reason `check: rearm-resurface`, and only when the drain would print nothing: an empty queue, no interrupted handling episode, no unread note, no outcome backstop line, no open decision, no record divergence, no unprocessed or visible supervision outcome, and no supervision alarm.
+The probe runs the drain's own section writers over a status snapshot, so the definition of empty is the drain's and cannot drift.
+Any doubt is `NEWS`, and the caller then drains and handles the wake as usual; the probe consumes no presentation, so that drain still shows everything once.
+With `--settle`, a `QUIET` verdict also retires the open downtime episode through the generation-bound acknowledgement a drain uses, after rechecking the queue under its lock, so a row that arrives meanwhile turns the verdict into `NEWS`.
+Where the Pi extension has already run the drain inline (`bin/fm-wake-inline.sh`), the wake message carries the presentation instead, and an empty one for this reason is equally quiet; the probe is for the harnesses whose message tells the model to drain.
+A harness-level skip that never starts the turn would save the turn's own cost and is not wired: it would have to settle the extension's pending-handoff bookkeeping, which this contract leaves to the extension.
+Heartbeat, stale, signal, and every other check wake are never eligible, because their purpose is a fleet review rather than the drain's contents.
+Process-event results with no news are already withheld at the source by the adapter `silent` seam in `bin/fm-procevent.sh`, and routine unchanged task outcomes by the supervision branch's `silent` outcomes, so neither needs a probe.
+`tests/fm-wake-drain-probe.test.sh` pins the verdicts, including that content probed as `NEWS` is still presented by the next drain.
 
 ## Per-actor acknowledgement
 

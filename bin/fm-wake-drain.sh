@@ -16,6 +16,25 @@
 # locked drain rotates such leftovers away before doing anything else.
 # FM_STATUS_PRESENTATION_LOCK_TIMEOUT sets the positive whole-second wait for
 # presentation-path locks (default 10); queue mutation locks remain blocking.
+#
+# --probe --reason <wake reason line> [--settle] answers one question without
+# presenting or consuming anything: is this wake provably empty? It prints one
+# line, QUIET or "NEWS: <why>", and exits 0 either way (nonzero is an error).
+# QUIET is printed only for the reason `check: rearm-resurface` - a wake that
+# carries no content of its own - and only when everything a drain would show
+# is empty: no queued row, no interrupted-handling episode, no UNREAD STATUS,
+# STATUS OUTCOME BACKSTOP, OPEN DECISIONS or RECORD DIVERGENCE, no unprocessed
+# or visible BRANCH OUTCOMES, and no supervision alarm. It reuses the drain's
+# own section writers over a status snapshot, so "empty" cannot drift from what
+# a drain prints; any doubt (another reason, a lock that stays busy, an
+# unreadable store, a failed writer, a non-main actor, a home that has not yet
+# presented any status) is NEWS and the caller
+# drains as usual. With --settle a QUIET verdict also retires the open
+# downtime episode through the same generation-bound acknowledgement a drain
+# uses, so the wake needs no handling turn at all. Heartbeats, stale wakes,
+# signals, and every other check are never eligible: the verdict covers what
+# the drain would print, not the fleet review those wakes exist to trigger.
+# docs/watcher-continuity.md "Quiet wakes" owns the contract.
 set -u
 
 SCRIPT_DIR="$(d=${BASH_SOURCE[0]%/*}; [ "$d" != "${BASH_SOURCE[0]}" ] || d=.; cd "${d:-/}" && pwd)"
@@ -217,8 +236,122 @@ presented_max_row() { # <rows-file>
   fi
 }
 
+
+# probe_news <why>: the probe's only non-QUIET verdict. Always exits 0.
+probe_news() {
+  printf 'NEWS: %s\n' "$1"
+  exit 0
+}
+
+# probe_first_line <text>: the first line of captured section output, for the verdict.
+probe_first_line() {
+  printf '%s\n' "$1" | sed -n '1p' | cut -c1-120
+}
+
+# probe_branch_outcomes_quiet: 0 when print_branch_outcomes_section would print
+# nothing. Reads the store through its read-only `present` view and never
+# advances the cursor; a visible routine or any captain row is news.
+probe_branch_outcomes_quiet() {
+  local config rows
+  config=${FM_CONFIG_OVERRIDE:-$FM_HOME/config}
+  fm_supervision_host_outcomes_drained "$config" || return 0
+  [ -s "$STATE/branch-outcomes.jsonl" ] || return 0
+  ! fm_afk_contract_away_present "$STATE" || return 0
+  command -v jq >/dev/null 2>&1 || return 1
+  rows=$("$SCRIPT_DIR/fm-branch-outcome.sh" present 2>/dev/null) || return 1
+  [ -n "$rows" ] || return 0
+  printf '%s\n' "$rows" | jq -es 'all(.[]; .verdict == "routine" and (.silent == true or .unread != true))' >/dev/null 2>&1
+}
+
+run_probe() {
+  local token generation='' snapshot out rc lock live
+  [ "$PROBE_REASON" = 'check: rearm-resurface' ] \
+    || probe_news "wake reason is not an eligible routine wake"
+  [ "$ACTOR" = main ] || probe_news "only main probes"
+  lock="$STATE/.status-presentation-lock"
+
+  fm_lock_acquire_wait_bounded "$FM_WAKE_QUEUE_LOCK" "$PRESENTATION_LOCK_TIMEOUT" \
+    || probe_news "the wake queue is busy"
+  if [ -s "$FM_WAKE_QUEUE" ]; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    probe_news "queued wake rows are waiting"
+  fi
+  if ! fm_recovery_marker_snapshot "$RECOVERY_MARKER"; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    probe_news "the recovery marker could not be read"
+  fi
+  token=$FM_RECOVERY_MARKER_TOKEN
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  case "$token" in
+    '') [ ! -e "$RECOVERY_MARKER" ] && [ ! -L "$RECOVERY_MARKER" ] || probe_news "the recovery marker is invalid" ;;
+    acked:*) ;;
+    pending:downtime:*|announced:downtime:*) generation=${token##*:} ;;
+    *) probe_news "an interrupted handling episode needs its turn" ;;
+  esac
+
+  fm_lock_acquire_wait_bounded "$lock" "$PRESENTATION_LOCK_TIMEOUT" \
+    || probe_news "status presentation is busy"
+  snapshot=$(status_presentation_snapshot "$STATE") || { fm_lock_release "$lock"; probe_news "the status snapshot could not be read"; }
+  if [ -n "$snapshot" ]; then
+    # Before the first presentation manifest exists the open-decisions fold's
+    # own cache seeds the unread offset, and evaluating that fold would move it.
+    # The probe must consume nothing, so a home with no baseline is NEWS.
+    if [ ! -e "$STATE/.status-presentation-cursor" ]; then
+      fm_lock_release "$lock"
+      probe_news "no status presentation baseline yet"
+    fi
+    out=$({
+      print_unread_status_section "$snapshot" \
+        && print_status_outcome_backstop_section "$snapshot" \
+        && print_open_decisions_section "$snapshot" \
+        && print_record_divergence_section
+    })
+    rc=$?
+    fm_lock_release "$lock"
+    [ "$rc" -eq 0 ] || probe_news "a status section could not be evaluated"
+    [ -z "$out" ] || probe_news "$(probe_first_line "$out")"
+  else
+    fm_lock_release "$lock"
+  fi
+
+  probe_branch_outcomes_quiet || probe_news "supervision outcomes are waiting or unreadable"
+  live=$(assert_watcher_liveness 2>&1)
+  [ -z "$live" ] || probe_news "$(probe_first_line "$live")"
+
+  if [ "$PROBE_SETTLE" = true ] && [ -n "$generation" ]; then
+    fm_lock_acquire_wait_bounded "$FM_WAKE_QUEUE_LOCK" "$PRESENTATION_LOCK_TIMEOUT" \
+      || probe_news "the wake queue is busy"
+    if [ -s "$FM_WAKE_QUEUE" ]; then
+      fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+      probe_news "queued wake rows arrived"
+    fi
+    fm_recovery_marker_ack "$RECOVERY_MARKER" "$generation"
+    rc=$?
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    [ "$rc" -eq 0 ] || probe_news "the recovery episode moved or could not be retired"
+    printf 'QUIET settled recovery generation %s\n' "$generation"
+    exit 0
+  fi
+  printf 'QUIET\n'
+  exit 0
+}
+
+PROBE=false
+PROBE_SETTLE=false
+PROBE_REASON=
 case "${1:-}" in
   '') ;;
+  --probe)
+    PROBE=true
+    shift
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --settle) PROBE_SETTLE=true; shift ;;
+        --reason) PROBE_REASON=${2:-}; shift 2 || { echo "wake drain: --reason needs the wake reason line" >&2; exit 2; } ;;
+        *) echo "wake drain: unexpected probe argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    ;;
   --ack-through)
     ACK_THROUGH=${2:-}
     case "$ACK_THROUGH" in ''|*[!0-9]*) echo "wake drain: invalid acknowledgement sequence" >&2; exit 2 ;; esac
@@ -228,7 +361,7 @@ case "${1:-}" in
     case "$ACK_GENERATION" in ''|*[!A-Za-z0-9._-]*) echo "wake drain: invalid recovery generation" >&2; exit 2 ;; esac
     [ "$#" -eq 4 ] || { echo "wake drain: unexpected acknowledgement arguments" >&2; exit 2; }
     ;;
-  *) echo "usage: fm-wake-drain.sh [--ack-through SEQUENCE --recovery-generation GENERATION]" >&2; exit 2 ;;
+  *) echo "usage: fm-wake-drain.sh [--ack-through SEQUENCE --recovery-generation GENERATION | --probe --reason REASON [--settle]]" >&2; exit 2 ;;
 esac
 
 [ "$ACTOR" != branch ] || require_branch_eligible_rows || exit 1
@@ -823,6 +956,8 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+[ "$PROBE" != true ] || run_probe
 
 if [ -n "$ACK_THROUGH" ]; then
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
