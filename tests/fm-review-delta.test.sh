@@ -99,7 +99,7 @@ test_own_change_differs() {
   out=$("$DELTA" --repo "$r" --reviewed "$reviewed" --base main 2>&1); rc=$?
   expect_code 1 "$rc" "changed own change exits 1"
   assert_contains "$out" "DELTA-OWN-CHANGED" "verdict"
-  assert_contains "$out" "DIFFER" "difference stated"
+  assert_contains "$out" "needs a fresh read" "difference stated"
   assert_contains "$out" "range-diff of the PR's own commits" "range-diff section"
   assert_contains "$out" "own: follow-up on line 7" "the new commit is in the range-diff"
   assert_not_contains "$out" "byte-identical" "no identical claim"
@@ -128,6 +128,80 @@ test_stacked_pr_after_base_landed() {
   pass "stacked PR: range-diff pairs the surviving own commit as equal"
 }
 
+test_post_review_own_commit_is_never_none() {
+  local r reviewed out rc
+  # A commit that only moves a line leaves the +/- multiset alone but changes behaviour.
+  r="$TMP_ROOT/moved"
+  git init -q -b main "$r"
+  printf 'f() {\n  use(x)\n}\n' > "$r/code.txt"
+  git -C "$r" add . && git -C "$r" commit -qm seed
+  git -C "$r" checkout -q -b feat
+  printf 'f() {\n  validate(x)\n  use(x)\n}\n' > "$r/code.txt"
+  git -C "$r" commit -qam 'own: validate before use'
+  reviewed=$(git -C "$r" rev-parse HEAD)
+  printf 'f() {\n  use(x)\n  validate(x)\n}\n' > "$r/code.txt"
+  git -C "$r" commit -qam 'own: move validate after use'
+  out=$("$DELTA" --repo "$r" --reviewed "$reviewed" --base main 2>&1); rc=$?
+  expect_code 1 "$rc" "a moved line needs a fresh read"
+  assert_contains "$out" "DELTA-OWN-CHANGED" "moved line is an own change"
+  assert_contains "$out" "own: move validate after use" "the new commit is listed"
+
+  # A post-review commit that changes a binary file shows no +/- lines at all.
+  r="$TMP_ROOT/binary"
+  git init -q -b main "$r"
+  printf 'x\n' > "$r/a.txt"
+  git -C "$r" add . && git -C "$r" commit -qm seed
+  git -C "$r" checkout -q -b feat
+  printf '\000\001\002' > "$r/blob.bin"
+  git -C "$r" add . && git -C "$r" commit -qm 'own: add blob'
+  reviewed=$(git -C "$r" rev-parse HEAD)
+  printf '\000\001\003' > "$r/blob.bin"
+  git -C "$r" commit -qam 'own: change blob'
+  out=$("$DELTA" --repo "$r" --reviewed "$reviewed" --base main 2>&1); rc=$?
+  expect_code 1 "$rc" "a binary change needs a fresh read"
+  assert_contains "$out" "DELTA-OWN-CHANGED" "binary change is an own change"
+
+  # A rewritten history (reviewed head no longer an ancestor) is never none.
+  r=$(make_repo rewritten)
+  reviewed=$(git -C "$r" rev-parse HEAD)
+  git -C "$r" commit -q --amend -m 'own: rewrite line 5 (amended)'
+  out=$("$DELTA" --repo "$r" --reviewed "$reviewed" --base main 2>&1); rc=$?
+  expect_code 1 "$rc" "an amended head needs a fresh read"
+  assert_contains "$out" "DELTA-OWN-CHANGED" "amended head is an own change"
+  pass "post-review own commits, binary changes and rewritten history: DELTA-OWN-CHANGED"
+}
+
+test_main_side_merge_is_not_this_prs_hunk() {
+  local r reviewed out rc
+  r=$(make_repo mainside)
+  reviewed=$(git -C "$r" rev-parse HEAD)
+  # Another branch lands on main through a conflict-resolved merge.
+  git -C "$r" checkout -q main
+  git -C "$r" checkout -q -b other
+  sed -i '9s/.*/OTHER9/' "$r/a.txt"; git -C "$r" commit -qam 'other: line 9'
+  git -C "$r" checkout -q main
+  sed -i '9s/.*/MAIN9/' "$r/a.txt"; git -C "$r" commit -qam 'main: line 9'
+  git -C "$r" merge --no-edit other >/dev/null 2>&1 && fail "fixture must conflict"
+  printf '%s\n' a1 a2 a3 a4 a5 a6 a7 a8 BOTH9 a10 > "$r/a.txt"
+  git -C "$r" commit -qam 'main: resolve other into main'
+  git -C "$r" checkout -q feat
+  git -C "$r" merge -q --no-edit main || fail "fixture merge into the PR must be clean"
+  out=$("$DELTA" --repo "$r" --reviewed "$reviewed" --base main 2>&1); rc=$?
+  expect_code 0 "$rc" "main's own merge is not this PR's"
+  assert_contains "$out" "DELTA-NONE" "verdict"
+  assert_not_contains "$out" "BOTH9" "main's resolution is not shown"
+  pass "a merge main brought in is not shown as this PR's resolved hunk"
+}
+
+test_missing_option_value_is_a_usage_error() {
+  local rc
+  timeout 10 "$DELTA" --repo >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "--repo without a value"
+  timeout 10 "$DELTA" --repo "$TMP_ROOT" --pin o/r >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "--pin without its PR"
+  pass "missing option values exit 2 instead of spinning"
+}
+
 test_pin_lookup_and_refusals() {
   local r reviewed out rc home
   r=$(make_repo pinned)
@@ -152,6 +226,9 @@ test_resolved_conflict_same_own_lines
 test_hand_edit_on_a_clean_merge_is_shown
 test_own_change_differs
 test_stacked_pr_after_base_landed
+test_post_review_own_commit_is_never_none
+test_main_side_merge_is_not_this_prs_hunk
+test_missing_option_value_is_a_usage_error
 test_pin_lookup_and_refusals
 
 echo '# all fm-review-delta tests passed'

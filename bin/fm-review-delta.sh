@@ -18,7 +18,10 @@
 #                        reviewed head and no merge was hand-resolved
 #   DELTA-RESOLVED-ONLY  own +/- lines identical, but a merge commit carries
 #                        hand-resolved hunks: review only those hunks
-#   DELTA-OWN-CHANGED    the PR's own change differs: review the range-diff
+#   DELTA-OWN-CHANGED    the PR's own change may differ: its +/- lines differ, the
+#                        reviewed head is no longer an ancestor, or a commit of the
+#                        PR's own was added after the review (a moved line or a
+#                        binary change shows no +/- difference): review the range-diff
 # Sections follow the first line:
 #   own change   an explicit sentence for the identical case, with the file and
 #                line counts; the PR's own change is compared on its +/- lines
@@ -43,12 +46,16 @@ usage() { sed -n 2,38p "$0"; }
 repo= reviewed= pin_slug= pin_pr= head=HEAD base=origin/main max=400
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo) repo=${2:-}; shift 2 ;;
-    --reviewed) reviewed=${2:-}; shift 2 ;;
-    --pin) pin_slug=${2:-}; pin_pr=${3:-}; shift 3 ;;
-    --head) head=${2:-}; shift 2 ;;
-    --base) base=${2:-}; shift 2 ;;
-    --max-lines) max=${2:-}; shift 2 ;;
+    --repo|--reviewed|--head|--base|--max-lines) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
+    --pin) [ $# -ge 3 ] || { echo "--pin takes OWNER/REPO and PR" >&2; exit 2; } ;;
+  esac
+  case "$1" in
+    --repo) repo=$2; shift 2 ;;
+    --reviewed) reviewed=$2; shift 2 ;;
+    --pin) pin_slug=$2; pin_pr=$3; shift 3 ;;
+    --head) head=$2; shift 2 ;;
+    --base) base=$2; shift 2 ;;
+    --max-lines) max=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -106,26 +113,40 @@ merge_hunks() {
 }
 
 resolved=
-merges=$(g rev-list --merges --reverse "$rev..$tip")
+# First parent only: a merge main itself brought in is main's, not this PR's.
+merges=$(g rev-list --merges --first-parent --reverse "$rev..$tip")
 for c in $merges; do
   hunks=$(merge_hunks "$c")
   [ -z "$hunks" ] || resolved+=$'\n'"merge $(g rev-parse --short=8 "$c") $(g log -1 --format=%s "$c" | cut -c1-70)"$'\n'"$(printf '%s\n' "$hunks" | capped)"$'\n'
 done
 
-if [ "$old_sum" = "$new_sum" ]; then
-  [ -n "$resolved" ] && verdict=DELTA-RESOLVED-ONLY || verdict=DELTA-NONE
-else
+# The +/- lines alone cannot see a moved line or a binary change, so the
+# verdict also needs the reviewed head to be an ancestor of the head and no
+# commit of the PR's own (non-merge, not already on the base) added since.
+why=
+if ! g merge-base --is-ancestor "$rev" "$tip"; then
+  why="the reviewed head is not an ancestor of the head (history was rewritten)"
+elif [ -n "$(g rev-list --no-merges "$rev..$tip" "^$base_tip")" ]; then
+  why="the PR's own commits were added after the review (a moved line or a binary change shows no +/- difference)"
+elif [ "$old_sum" != "$new_sum" ]; then
+  why="the PR's own +/- lines DIFFER from the reviewed head"
+fi
+if [ -n "$why" ]; then
   verdict=DELTA-OWN-CHANGED
+elif [ -n "$resolved" ]; then
+  verdict=DELTA-RESOLVED-ONLY
+else
+  verdict=DELTA-NONE
 fi
 
 echo "$verdict $(g rev-parse --short=8 "$rev")..$(g rev-parse --short=8 "$tip")"
 echo
 echo "== own change (compared on +/- lines, main ${base_rev:0:8} -> ${base_tipm:0:8})"
-if [ "$old_sum" = "$new_sum" ]; then
+if [ -z "$why" ]; then
   stat=$(g diff --no-renames --numstat "$base_tipm" "$tip" | awk '{f++; a+=$1; d+=$2} END {printf "%d files, +%d/-%d", f, a, d}')
   echo "The PR's own +/- lines are byte-identical to the reviewed head ($stat)."
 else
-  echo "The PR's own +/- lines DIFFER from the reviewed head."
+  echo "The PR's own change needs a fresh read: $why."
   echo
   echo "== range-diff of the PR's own commits (reviewed first, head second)"
   g range-diff --no-color "$base_rev..$rev" "$base_tipm..$tip" | capped
