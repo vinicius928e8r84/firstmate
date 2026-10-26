@@ -1849,8 +1849,8 @@ run_scripted_arm() {  # <case-dir> [env assignments...]
   local dir=$1; shift
   mkdir -p "$dir/home/data"
   env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" \
-    FM_ARM_CONFIRM_TIMEOUT=3 FM_ARM_RETRY_DELAY=0.1 FM_ARM_QUICK_EXIT_SECONDS=120 "$@" \
-    "$dir/bin/fm-watch-arm.sh" > "$dir/arm.out" 2>&1
+    FM_ARM_CONFIRM_TIMEOUT=10 FM_ARM_RETRY_DELAY=0.1 FM_ARM_QUICK_EXIT_SECONDS=120 "$@" \
+    "$dir/bin/fm-watch-arm.sh" ${SCRIPTED_ARM_ARGS:-} > "$dir/arm.out" 2>&1
 }
 
 test_arm_retries_once_after_a_quick_exit_1() {
@@ -1882,7 +1882,7 @@ test_arm_retries_only_once() {
 
 test_arm_does_not_retry_a_slow_or_non_1_exit() {
   local dir status
-  dir=$(make_scripted_watch_arm arm-no-retry-slow 'sleep 2
+  dir=$(make_scripted_watch_arm arm-no-retry-slow 'sleep 5
 exit 1')
   run_scripted_arm "$dir" FM_ARM_QUICK_EXIT_SECONDS=1
   status=$?
@@ -1936,6 +1936,91 @@ test_take_over_attaches_to_a_cycle_the_named_arm_does_not_own
 test_take_over_owns_a_fresh_cycle_and_keeps_queued_work_surfacing
 test_take_over_preserves_downtime_from_watcher_self_exit
 test_opencode_arm_plugin_decides_with_the_shared_predicate
+test_arm_retry_is_off_at_zero_and_leaves_no_marker() {
+  local dir status
+  dir=$(make_scripted_watch_arm arm-retry-off 'exit 1')
+  run_scripted_arm "$dir" FM_ARM_QUICK_EXIT_SECONDS=0
+  status=$?
+  expect_code 1 "$status" "FM_ARM_QUICK_EXIT_SECONDS=0 must surface the first exit 1: $(cat "$dir/arm.out")"
+  [ "$(cat "$dir/attempts")" = 1 ] || fail "retry was not off at 0 (attempts: $(cat "$dir/attempts"))"
+  dir=$(make_scripted_watch_arm arm-retry-marker '[ "$n" -ge 2 ] || exit 1
+env | grep -c "^FM_ARM_RETRIED=" > "$(dirname "$0")/../marker-count" || true
+tr "\0" " " < "/proc/$PPID/cmdline" > "$(dirname "$0")/../arm-cmdline"
+echo "check: scripted wake"
+exit 0')
+  SCRIPTED_ARM_ARGS=--restart run_scripted_arm "$dir"
+  status=$?
+  expect_code 0 "$status" "retry of a --restart arm must succeed: $(cat "$dir/arm.out")"
+  [ "$(cat "$dir/marker-count")" = 0 ] || fail "the retry marker leaked into the watcher's environment"
+  grep -q -- '--restart' "$dir/arm-cmdline" || fail "the retried arm lost --restart: $(cat "$dir/arm-cmdline")"
+  pass "watch-arm: the retry is off at 0, keeps --restart and leaves no marker in the watcher environment"
+}
+
+test_arm_does_not_retry_when_its_ground_was_removed() {
+  local dir status
+  dir=$(make_scripted_watch_arm arm-retry-ground-gone 'rm -rf "$FM_STATE_OVERRIDE"
+exit 1')
+  run_scripted_arm "$dir"
+  status=$?
+  expect_code 1 "$status" "a removed ground must not be retried into success: $(cat "$dir/arm.out")"
+  [ "$(cat "$dir/attempts")" = 1 ] || fail "arm retried after its state directory was removed (attempts: $(cat "$dir/attempts"))"
+  [ ! -e "$dir/state" ] || fail "the retry re-created the removed state directory"
+  pass "watch-arm: a removed state directory is not revived by the retry"
+}
+
+test_arm_does_not_retry_a_confirmed_watcher() {
+  local dir status
+  dir=$(make_scripted_watch_arm arm-retry-confirmed '. "$(dirname "$0")/fm-wake-lib.sh"
+l="$FM_STATE_OVERRIDE/.watch.lock"; mkdir -p "$l"
+echo $$ > "$l/pid"; fm_pid_identity $$ > "$l/pid-identity"; echo "$FM_HOME" > "$l/fm-home"
+echo "$(cd "$(dirname "$0")" && pwd)/fm-watch.sh" > "$l/watcher-path"; : > "$FM_STATE_OVERRIDE/.last-watcher-beat"
+sleep 3
+exit 1')
+  run_scripted_arm "$dir"
+  status=$?
+  expect_code 1 "$status" "a confirmed watcher that exits 1 must surface at once: $(cat "$dir/arm.out")"
+  [ "$(cat "$dir/attempts")" = 1 ] || fail "arm retried a watcher it had confirmed (attempts: $(cat "$dir/attempts"))"
+  [ "$(grep -c '^watcher: started' "$dir/arm.out")" = 1 ] || fail "arm printed a second started line: $(cat "$dir/arm.out")"
+  ! grep -q 'reason=nonzero-exit-retry' "$dir/state/.watch-cycle-exits.log" || fail "a confirmed watcher exit was ledgered as a retry"
+  pass "watch-arm: a watcher the arm already confirmed is never retried"
+}
+
+test_arm_retry_delay_honors_term_and_a_removed_script() {
+  local dir pid status i
+  dir=$(make_scripted_watch_arm arm-retry-term 'exit 1')
+  mkdir -p "$dir/home/data"
+  PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" FM_ARM_CONFIRM_TIMEOUT=10 \
+    FM_ARM_RETRY_DELAY=60 FM_ARM_QUICK_EXIT_SECONDS=120 "$dir/bin/fm-watch-arm.sh" > "$dir/arm.out" 2>&1 &
+  pid=$!
+  i=0
+  while [ "$i" -lt 600 ] && ! pgrep -P "$pid" -x sleep >/dev/null 2>&1; do sleep 0.1; i=$((i + 1)); done
+  pgrep -P "$pid" -x sleep >/dev/null 2>&1 || fail "arm never entered the retry delay: $(cat "$dir/arm.out")"
+  kill -TERM "$pid"
+  wait_for_exit "$pid" 100
+  status=$?
+  expect_code 143 "$status" "TERM during the retry delay must end the arm: $(cat "$dir/arm.out")"
+  [ "$(cat "$dir/attempts")" = 1 ] || fail "arm started a second attempt after TERM"
+  grep -q 'reason=arm-interrupted' "$dir/state/.watch-cycle-exits.log" || fail "TERM during the delay left no arm-interrupted row"
+  dir=$(make_scripted_watch_arm arm-retry-script-gone 'exit 1')
+  mkdir -p "$dir/home/data"
+  PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" FM_ARM_CONFIRM_TIMEOUT=10 \
+    FM_ARM_RETRY_DELAY=5 FM_ARM_QUICK_EXIT_SECONDS=120 "$dir/bin/fm-watch-arm.sh" > "$dir/arm.out" 2>&1 &
+  pid=$!
+  i=0
+  while [ "$i" -lt 600 ] && ! pgrep -P "$pid" -x sleep >/dev/null 2>&1; do sleep 0.1; i=$((i + 1)); done
+  pgrep -P "$pid" -x sleep >/dev/null 2>&1 || fail "arm never entered the retry delay: $(cat "$dir/arm.out")"
+  rm -f "$dir/bin/fm-watch-arm.sh"
+  wait_for_exit "$pid" 200
+  status=$?
+  expect_code 1 "$status" "a script removed during the delay must end in a typed failure: $(cat "$dir/arm.out")"
+  grep -q '^watcher: FAILED' "$dir/arm.out" || fail "no typed FAILED line when the re-arm could not exec: $(cat "$dir/arm.out")"
+  pass "watch-arm: TERM during the retry delay is recorded and a vanished script ends in a typed failure"
+}
+
 test_arm_retries_once_after_a_quick_exit_1
 test_arm_retries_only_once
 test_arm_does_not_retry_a_slow_or_non_1_exit
+test_arm_retry_is_off_at_zero_and_leaves_no_marker
+test_arm_does_not_retry_when_its_ground_was_removed
+test_arm_does_not_retry_a_confirmed_watcher
+test_arm_retry_delay_honors_term_and_a_removed_script
