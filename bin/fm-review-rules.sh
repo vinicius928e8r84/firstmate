@@ -15,9 +15,11 @@
 # It reads nothing and changes nothing.
 set -uo pipefail
 
-cat <<'RULES'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cat <<RULES
 Reviewer standing rules:
 - Do not run the project's full test suite on this machine. The suite runs once, on a rented machine, at the exact final head, and the orchestrator reads that result; a local full run only loads the shared host and repeats it.
 - Run only focused tests of the paths this change touches, and only when reading the code leaves a question a test can answer.
-- If an earlier clean review exists and the head moved, read the packet from bin/fm-review-delta.sh (the changed part only) instead of reading the whole PR again; a DELTA-OWN-CHANGED packet is the one case that calls for a fresh read of the own change.
+- If an earlier clean review exists and the head moved, read the packet from $SCRIPT_DIR/fm-review-delta.sh (the changed part only) instead of reading the whole PR again; a DELTA-OWN-CHANGED packet is the one case that calls for a fresh read of the own change.
 RULES

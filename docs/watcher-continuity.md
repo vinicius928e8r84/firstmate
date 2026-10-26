@@ -276,7 +276,8 @@ Handling it as an ordinary wake spends a full supervision turn, and a reply to t
 `bin/fm-wake-drain.sh --probe --reason '<wake reason line>' [--settle]` answers whether that is the case without presenting or consuming anything.
 It prints `QUIET` or `NEWS: <why>` and exits 0 for both.
 The verdict is `QUIET` only for the reason `check: rearm-resurface`, and only when the drain would print nothing: an empty queue, no interrupted handling episode, no unread note, no outcome backstop line, no open decision, no record divergence, no unprocessed or visible supervision outcome, and no supervision alarm.
-The probe runs the drain's own section writers over a status snapshot, so the definition of empty is the drain's and cannot drift.
+The probe runs the drain's own status section writers over a status snapshot, so for those sections the definition of empty is the drain's; the supervision-outcome check re-reads the same store through its read-only view and is the one separate implementation.
+The writers may refresh idempotent caches, such as the outcome indexes and the open-decisions fold, but the probe moves no read cursor and presents nothing.
 Any doubt is `NEWS`, and the caller then drains and handles the wake as usual; the probe consumes no presentation, so that drain still shows everything once.
 With `--settle`, a `QUIET` verdict also retires the open downtime episode through the generation-bound acknowledgement a drain uses, after rechecking the queue under its lock, so a row that arrives meanwhile turns the verdict into `NEWS`.
 Where the Pi extension has already run the drain inline (`bin/fm-wake-inline.sh`), the wake message carries the presentation instead, and an empty one for this reason is equally quiet; the probe is for the harnesses whose message tells the model to drain.
