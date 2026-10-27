@@ -431,6 +431,18 @@ A `nonzero-exit-retry` row carries one extra trailing `detail=` field.
 It names why the first attempt failed: `stale-live-holder` when the watcher refused a live singleton holder whose beacon is stale, `stderr` for any other output, or `no-stderr` for a silent exit.
 Any stderr text follows the label.
 
+## Load back-off
+
+A fixed confirmation window and an immediate retry fail together on an overloaded host: the watcher is slow to start, not dead, and each retry adds load.
+When the 1-minute load average per CPU is at least 1, `bin/fm-watch-arm.sh` stretches its confirmation window by that ratio, capped at `FM_ARM_CONFIRM_CAP`.
+Every unconfirmed start (a confirmation timeout or a failing exit) records a consecutive failure in `state/.watch-arm-backoff`.
+The next arm, and the quick-exit retry when its wait is longer, then waits `FM_ARM_BACKOFF_BASE` seconds doubled per consecutive failure and scaled by the load per CPU, capped at `FM_ARM_BACKOFF_CAP`, measured from the last failure.
+A confirmed watcher, an attached watcher, or a delivered wake clears the record, and a record older than `FM_ARM_BACKOFF_RESET` is ignored.
+An unloaded host never waits, so the retry-once behavior above is unchanged there.
+`fm_arm_backoff_*` and `fm_load_milli` in `bin/fm-wake-lib.sh` own the arithmetic; `FM_LOAD1_OVERRIDE` and `FM_NCPU_OVERRIDE` fake the load for tests.
+The Claude Stop auto-arm budget includes the stretched window and any pending wait.
+The Pi, omp, and OpenCode adapters keep their own ready timeouts, which an arm that is backing off can outlast.
+
 The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYCLE_LOG_KEEP_LINES`.
 `state/.watch-triage.log` remains only the watcher's bounded absorbed-wake debug log and carries no lifecycle semantics.
 

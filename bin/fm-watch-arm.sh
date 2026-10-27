@@ -65,6 +65,18 @@
 # environment so the watcher's descendants never see it. FM_ARM_QUICK_EXIT_SECONDS=0
 # turns the retry off. It stacks on any retry the harness adapter itself makes.
 #
+# Load back-off: on a host whose 1-minute load average per CPU is at least 1, the
+# confirmation window above is stretched by that ratio (cap FM_ARM_CONFIRM_CAP,
+# default 120s), and an arm that follows unconfirmed starts waits before it
+# launches another watcher instead of retrying at once. Each unconfirmed start
+# (confirmation timeout or a failing exit) records a consecutive failure in
+# state/.watch-arm-backoff; the wait is FM_ARM_BACKOFF_BASE (default 5s) doubled
+# per consecutive failure and scaled by the load per CPU, capped at
+# FM_ARM_BACKOFF_CAP (default 60s), measured from the last failure. The quick-exit
+# retry delay below uses the same wait when it is longer. A confirmed or attached
+# watcher clears the record. An unloaded host never waits. Helpers and their
+# test overrides live in bin/fm-wake-lib.sh (fm_arm_backoff_*, fm_load_milli).
+#
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
 # arm/watcher identities, timestamps, exit/signal classification, beacon age,
@@ -170,6 +182,10 @@ case "${OSTYPE:-}" in
   *) ARM_CONFIRM_DEFAULT=10 ;;
 esac
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-$ARM_CONFIRM_DEFAULT}
+# A loaded host stretches the window in proportion to its load per CPU (header,
+# "Load back-off"); an unloaded host keeps the configured value.
+case "$CONFIRM_TIMEOUT" in ''|*[!0-9]*) CONFIRM_TIMEOUT=$ARM_CONFIRM_DEFAULT ;; esac
+CONFIRM_TIMEOUT=$(fm_arm_confirm_window "$CONFIRM_TIMEOUT")
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
 # The beacon age at which the watcher's own re-arm evicts a live holder; an
@@ -364,6 +380,7 @@ healthy_watcher() {
 report_attached() {
   local age
   age=$(fm_path_age "$BEAT")
+  fm_arm_backoff_reset "$STATE"
   echo "watcher: attached pid=$HEALTHY_PID (beacon ${age}s)"
 }
 
@@ -755,6 +772,18 @@ trap 'handle_arm_signal HUP 129' HUP
 trap 'handle_arm_signal TERM 143' TERM
 trap 'handle_arm_signal INT 130' INT
 
+# Back off before launching when earlier starts failed on a loaded host. A retried
+# arm already waited in its predecessor, and the wait is a background sleep that is
+# waited on so a TERM during it still runs the handler above.
+if [ "$ARM_RETRIED" != 1 ]; then
+  backoff_left=$(fm_arm_backoff_remaining "$STATE")
+  if [ "$backoff_left" -gt 0 ]; then
+    echo "watcher: backing off ${backoff_left}s before re-arming (consecutive failures $(fm_arm_backoff_failures "$STATE"), load $(fm_load_milli)/1000 per CPU)" >&2
+    sleep "$backoff_left" &
+    wait $!
+  fi
+fi
+
 child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
@@ -807,6 +836,7 @@ owned_child_finished() {
   if [ "$rc" -eq 0 ] && watch_output_has_wake "$child_out"; then
     reason_type=$(watch_output_reason_type "$child_out")
     cycle_log_append "$rc" "$signal" "$reason_type" none
+    fm_arm_backoff_reset "$STATE"
     print_watch_output "$child_out"
     rm -f "$child_out" "$child_err" 2>/dev/null || true
     child=
@@ -852,7 +882,14 @@ owned_child_finished() {
     rm -f "$child_out" 2>/dev/null || true
     child=
     child_out=
-    sleep "$RETRY_DELAY" &
+    fm_arm_backoff_note_failure "$STATE"
+    retry_wait=$(fm_arm_backoff_seconds "$(fm_arm_backoff_failures "$STATE")")
+    if [ "$retry_wait" -gt 0 ] && awk -v w="$retry_wait" -v d="$RETRY_DELAY" 'BEGIN { exit !(w > d) }'; then
+      echo "watcher: backing off ${retry_wait}s before the retry (load $(fm_load_milli)/1000 per CPU)" >&2
+      sleep "$retry_wait" &
+    else
+      sleep "$RETRY_DELAY" &
+    fi
     wait $!
     cycle_log_append "$rc" "$signal" nonzero-exit-retry none "$(retry_detail "$child_err")"
     rm -f "$child_err" 2>/dev/null || true
@@ -863,6 +900,7 @@ owned_child_finished() {
     return 1
   fi
   cycle_log_append "$rc" "$signal" "$reason_type" none
+  [ "$ARM_CHILD_CONFIRMED" -eq 1 ] || fm_arm_backoff_note_failure "$STATE"
   print_watch_output "$child_out"
   if ! grep -q '^watcher: FAILED' "$child_out" 2>/dev/null; then
     echo "watcher: FAILED - watcher cycle exited $rc without an actionable reason"
@@ -898,6 +936,7 @@ while :; do
         exit 1
       fi
       ARM_CHILD_CONFIRMED=1
+      fm_arm_backoff_reset "$STATE"
       cycle_mark_predecessor_successor "started:$child"
       [ "$TAKEN_OVER" -eq 0 ] || cycle_mark_predecessor_successor "started:$child" "$ARM_PID"
       if [ -n "$handling_generation" ]; then
@@ -939,5 +978,6 @@ cleanup_child
 wait "$child" 2>/dev/null
 rc=$?
 cycle_log_append "$rc" "$(cycle_signal_name "$rc")" confirmation-timeout none
+fm_arm_backoff_note_failure "$STATE"
 echo "watcher: FAILED - no live watcher with a fresh beacon"
 exit 1

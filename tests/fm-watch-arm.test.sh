@@ -21,6 +21,11 @@ WATCH_ARM="$ROOT/bin/fm-watch-arm.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-watch-arm-tests)
+# The arm stretches its windows with the host load (bin/fm-wake-lib.sh
+# fm_arm_confirm_window), so pin an unloaded host: every case below asserts the
+# arm's logic, not the contention of the machine running it. The load back-off
+# cases set their own fake load.
+export FM_LOAD1_OVERRIDE=0
 
 # A re-arm does real work before and during its first poll: it steals the dead
 # watcher's lock, publishes and announces the downtime marker, then surfaces the
@@ -2052,6 +2057,90 @@ test_arm_retry_delay_honors_term_and_a_removed_script() {
   pass "watch-arm: TERM during the retry delay is recorded and a vanished script ends in a typed failure"
 }
 
+# Load back-off (bin/fm-watch-arm.sh header, "Load back-off"). The load is faked
+# with FM_LOAD1_OVERRIDE and FM_NCPU_OVERRIDE so the sequence is deterministic.
+backoff_sequence() {  # <load1> <ncpu> <failures...>
+  local load=$1 cpus=$2 n out=
+  shift 2
+  for n in "$@"; do
+    out="$out$(FM_LOAD1_OVERRIDE=$load FM_NCPU_OVERRIDE=$cpus FM_ARM_BACKOFF_BASE=5 FM_ARM_BACKOFF_CAP=60 \
+      bash -c '. "$1/bin/fm-wake-lib.sh"; fm_arm_backoff_seconds "$2"' _ "$ROOT" "$n") "
+  done
+  printf '%s\n' "${out% }"
+}
+
+test_backoff_grows_exponentially_scaled_by_load_per_cpu_and_is_capped() {
+  local seq
+  seq=$(backoff_sequence 16.0 4 0 1 2 3 4 5 9)
+  [ "$seq" = "0 20 40 60 60 60 60" ] || fail "load 4/cpu back-off must be 0 20 40 60 60 60 60, got: $seq"
+  seq=$(backoff_sequence 8.0 4 1 2 3 4 5)
+  [ "$seq" = "10 20 40 60 60" ] || fail "load 2/cpu back-off must be 10 20 40 60 60, got: $seq"
+  seq=$(backoff_sequence 36.0 4 1 2 3)
+  [ "$seq" = "45 60 60" ] || fail "load 9/cpu back-off must be 45 60 60, got: $seq"
+  seq=$(backoff_sequence 2.0 4 1 2 3)
+  [ "$seq" = "0 0 0" ] || fail "an unloaded host (load 0.5/cpu) must never back off, got: $seq"
+  pass "watch-arm: back-off doubles per failure, scales with load per CPU, is capped, and is zero when unloaded"
+}
+
+test_confirmation_window_stretches_with_load_and_is_capped() {
+  local w
+  w=$(FM_LOAD1_OVERRIDE=2.0 FM_NCPU_OVERRIDE=4 bash -c '. "$1/bin/fm-wake-lib.sh"; fm_arm_confirm_window 10' _ "$ROOT")
+  [ "$w" = 10 ] || fail "an unloaded host must keep the configured 10s window, got $w"
+  w=$(FM_LOAD1_OVERRIDE=36.0 FM_NCPU_OVERRIDE=4 bash -c '. "$1/bin/fm-wake-lib.sh"; fm_arm_confirm_window 10' _ "$ROOT")
+  [ "$w" = 90 ] || fail "load 9/cpu must stretch the 10s window to 90s, got $w"
+  w=$(FM_LOAD1_OVERRIDE=171.9 FM_NCPU_OVERRIDE=4 bash -c '. "$1/bin/fm-wake-lib.sh"; fm_arm_confirm_window 10' _ "$ROOT")
+  [ "$w" = 120 ] || fail "the window must be capped at 120s, got $w"
+  pass "watch-arm: the confirmation window stretches with the load per CPU up to its cap"
+}
+
+test_arm_waits_between_failed_starts_under_load_and_clears_on_success() {
+  local dir status start elapsed record
+  dir=$(make_scripted_watch_arm arm-load-backoff '[ "$n" -ge 3 ] || exit 1
+. "$(dirname "$0")/fm-wake-lib.sh"
+l="$FM_STATE_OVERRIDE/.watch.lock"; mkdir -p "$l"
+echo $$ > "$l/pid"; fm_pid_identity $$ > "$l/pid-identity"; echo "$FM_HOME" > "$l/fm-home"
+echo "$(cd "$(dirname "$0")" && pwd)/fm-watch.sh" > "$l/watcher-path"; : > "$FM_STATE_OVERRIDE/.last-watcher-beat"
+echo "check: scripted wake"
+exit 0')
+  # Load 2/cpu, base 1s, cap 3s: the waits after the 1st and 2nd failure are 2s and 3s.
+  start=$(date +%s)
+  run_scripted_arm "$dir" FM_LOAD1_OVERRIDE=8.0 FM_NCPU_OVERRIDE=4 FM_ARM_BACKOFF_BASE=1 FM_ARM_BACKOFF_CAP=3
+  status=$?
+  elapsed=$(( $(date +%s) - start ))
+  expect_code 1 "$status" "two quick exits must still surface a failure: $(cat "$dir/arm.out")"
+  grep -q 'backing off 2s before the retry' "$dir/arm.out" || fail "the retry did not wait 2s under load: $(cat "$dir/arm.out")"
+  [ "$elapsed" -ge 2 ] || fail "the retry delay did not wait in proportion to the load (${elapsed}s)"
+  record=$(cat "$dir/state/.watch-arm-backoff")
+  case "$record" in "2 "*) ;; *) fail "two unconfirmed starts must record two consecutive failures: $record" ;; esac
+
+  # The next arm waits out the remaining back-off (3s after the 2nd failure) before launching.
+  start=$(date +%s)
+  run_scripted_arm "$dir" FM_LOAD1_OVERRIDE=8.0 FM_NCPU_OVERRIDE=4 FM_ARM_BACKOFF_BASE=1 FM_ARM_BACKOFF_CAP=3
+  status=$?
+  elapsed=$(( $(date +%s) - start ))
+  expect_code 0 "$status" "the arm after the back-off must confirm the watcher: $(cat "$dir/arm.out")"
+  grep -q 'backing off [123]s before re-arming (consecutive failures 2' "$dir/arm.out" || fail "the next arm did not back off before launching: $(cat "$dir/arm.out")"
+  [ "$elapsed" -ge 2 ] || fail "the next arm did not wait before launching (${elapsed}s)"
+  [ "$(cat "$dir/attempts")" = 3 ] || fail "the next arm launched the watcher more than once (attempts: $(cat "$dir/attempts"))"
+  [ ! -e "$dir/state/.watch-arm-backoff" ] || fail "a confirmed watcher must clear the failure record: $(cat "$dir/state/.watch-arm-backoff")"
+  pass "watch-arm: under load the arm waits between failed starts in proportion to load and a confirmed watcher clears the record"
+}
+
+test_arm_does_not_back_off_on_an_unloaded_host() {
+  local dir status start elapsed
+  dir=$(make_scripted_watch_arm arm-no-backoff-unloaded 'exit 1')
+  start=$(date +%s)
+  run_scripted_arm "$dir" FM_LOAD1_OVERRIDE=0.5 FM_NCPU_OVERRIDE=4 FM_ARM_BACKOFF_BASE=30 FM_ARM_BACKOFF_CAP=60
+  status=$?
+  elapsed=$(( $(date +%s) - start ))
+  expect_code 1 "$status" "two quick exits must still surface a failure: $(cat "$dir/arm.out")"
+  [ "$elapsed" -lt 20 ] || fail "an unloaded host must not back off (${elapsed}s): $(cat "$dir/arm.out")"
+  ! grep -q 'backing off' "$dir/arm.out" || fail "an unloaded host announced a back-off: $(cat "$dir/arm.out")"
+  run_scripted_arm "$dir" FM_LOAD1_OVERRIDE=0.5 FM_NCPU_OVERRIDE=4 FM_ARM_BACKOFF_BASE=30 FM_ARM_BACKOFF_CAP=60
+  ! grep -q 'backing off' "$dir/arm.out" || fail "an unloaded host backed off before re-arming: $(cat "$dir/arm.out")"
+  pass "watch-arm: an unloaded host keeps the immediate retry"
+}
+
 test_arm_retries_once_after_a_quick_exit_1
 test_arm_retry_ledger_row_keeps_the_first_attempts_stderr_and_a_reason
 test_arm_retries_only_once
@@ -2060,3 +2149,7 @@ test_arm_retry_is_off_at_zero_and_leaves_no_marker
 test_arm_does_not_retry_when_its_ground_was_removed
 test_arm_does_not_retry_a_confirmed_watcher
 test_arm_retry_delay_honors_term_and_a_removed_script
+test_backoff_grows_exponentially_scaled_by_load_per_cpu_and_is_capped
+test_confirmation_window_stretches_with_load_and_is_capped
+test_arm_waits_between_failed_starts_under_load_and_clears_on_success
+test_arm_does_not_back_off_on_an_unloaded_host

@@ -162,6 +162,104 @@ fm_watcher_stall_bound() {
   printf '%s\n' "${FM_WATCHER_STALL_BOUND:-$((grace * 3))}"
 }
 
+# fm_load_milli
+# The host's 1-minute load average per logical CPU, in thousandths (4000 = four
+# runnable tasks per CPU). 0 when the load cannot be read. FM_LOAD1_OVERRIDE and
+# FM_NCPU_OVERRIDE replace the probes so tests can drive a fake load.
+fm_load_milli() {
+  local load cpus
+  load=${FM_LOAD1_OVERRIDE:-}
+  if [ -z "$load" ]; then
+    if [ -r /proc/loadavg ]; then
+      load=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+    else
+      load=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}')
+    fi
+  fi
+  cpus=${FM_NCPU_OVERRIDE:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)}
+  case "$cpus" in ''|*[!0-9]*|0) cpus=1 ;; esac
+  case "$load" in [0-9]*.[0-9]*|[0-9]*) ;; *) printf '0\n'; return 0 ;; esac
+  awk -v l="$load" -v c="$cpus" 'BEGIN { printf "%d\n", l * 1000 / c }'
+}
+
+# fm_load_scaled <base-seconds> <cap-seconds> [multiplier]
+# base * multiplier * (load per CPU), capped. A host at or below one runnable
+# task per CPU is not loaded, so the base is returned unscaled.
+fm_load_scaled() {
+  local base=$1 cap=$2 mult=${3:-1} milli
+  milli=$(fm_load_milli)
+  [ "$milli" -ge 1000 ] || milli=1000
+  awk -v b="$base" -v c="$cap" -v m="$mult" -v l="$milli" \
+    'BEGIN { v = b * m * l / 1000; if (v > c) v = c; printf "%d\n", (v == int(v)) ? v : int(v) + 1 }'
+}
+
+# fm_arm_confirm_window <base-seconds>
+# The watcher-arm confirmation window: the configured base, stretched in
+# proportion to the load per CPU and capped at FM_ARM_CONFIRM_CAP (default 120,
+# never below the base). A fresh watcher that needs longer than a fixed window to
+# start on a loaded host is slow, not dead.
+fm_arm_confirm_window() {
+  local base=$1 cap=${FM_ARM_CONFIRM_CAP:-120} window
+  case "$cap" in ''|*[!0-9]*) cap=120 ;; esac
+  [ "$cap" -ge "$base" ] || cap=$base
+  window=$(fm_load_scaled "$base" "$cap")
+  printf '%s\n' "$window"
+}
+
+# Arm-start back-off. Each unconfirmed watcher start records a consecutive
+# failure in <state>/.watch-arm-backoff ("<failures> <epoch>"); a confirmed
+# watcher clears it. While the host is loaded (load per CPU of at least 1) the
+# next arm waits base * 2^(failures-1) * (load per CPU) seconds since the last
+# failure, capped at FM_ARM_BACKOFF_CAP (default 60); FM_ARM_BACKOFF_BASE
+# defaults to 5. On an unloaded host there is no wait, so the existing
+# retry-once behavior is unchanged. A record older than FM_ARM_BACKOFF_RESET
+# (default 600) is ignored so an old streak cannot penalise a fresh failure.
+fm_arm_backoff_failures() {  # <state>
+  local failures epoch reset now
+  reset=${FM_ARM_BACKOFF_RESET:-600}
+  case "$reset" in ''|*[!0-9]*) reset=600 ;; esac
+  read -r failures epoch 2>/dev/null < "$1/.watch-arm-backoff" || { printf '0\n'; return 0; }
+  case "$failures:$epoch" in *[!0-9:]*|:*|*:) printf '0\n'; return 0 ;; esac
+  now=$(date +%s)
+  if [ $((now - epoch)) -gt "$reset" ]; then printf '0\n'; else printf '%s\n' "$failures"; fi
+}
+
+# fm_arm_backoff_seconds <failures>
+fm_arm_backoff_seconds() {
+  local failures=$1 base=${FM_ARM_BACKOFF_BASE:-5} cap=${FM_ARM_BACKOFF_CAP:-60} milli exp
+  case "$base" in ''|*[!0-9]*) base=5 ;; esac
+  case "$cap" in ''|*[!0-9]*) cap=60 ;; esac
+  [ "$failures" -ge 1 ] 2>/dev/null || { printf '0\n'; return 0; }
+  milli=$(fm_load_milli)
+  [ "$milli" -ge 1000 ] || { printf '0\n'; return 0; }
+  exp=$((failures - 1))
+  [ "$exp" -le 16 ] || exp=16
+  fm_load_scaled "$base" "$cap" $((1 << exp))
+}
+
+fm_arm_backoff_note_failure() {  # <state>
+  local failures
+  failures=$(fm_arm_backoff_failures "$1")
+  { printf '%s %s\n' $((failures + 1)) "$(date +%s)" > "$1/.watch-arm-backoff"; } 2>/dev/null || true
+}
+
+fm_arm_backoff_reset() {  # <state>
+  rm -f "$1/.watch-arm-backoff" 2>/dev/null || true
+}
+
+# fm_arm_backoff_remaining <state>
+# Whole seconds the next arm should still wait; 0 when none.
+fm_arm_backoff_remaining() {
+  local failures wait epoch left
+  failures=$(fm_arm_backoff_failures "$1")
+  wait=$(fm_arm_backoff_seconds "$failures")
+  [ "$wait" -gt 0 ] || { printf '0\n'; return 0; }
+  epoch=$(awk '{print $2}' "$1/.watch-arm-backoff" 2>/dev/null)
+  left=$((wait - ($(date +%s) - epoch)))
+  [ "$left" -gt 0 ] || left=0
+  printf '%s\n' "$left"
+}
+
 # fm_watcher_lock_unheld <state>
 # True when the watcher lock or its symlinked owner directory is absent, or when
 # the existing lock records no pid at all. Any non-empty pid remains held here;
