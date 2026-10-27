@@ -36,6 +36,7 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-brief.sh`            | Scaffold ship (explicit `--mode`, plus the project's registered `--forge`), scout, secondmate-charter, and Herdr-lab briefs, with Captain's intent and Firstmate spec subsections on ship/scout |
 | [`fm-dod-lib.sh`](../bin/fm-dod-lib.sh) | Own ship/scout worker role scope, ship definitions of done, the named-head reachability gate on ship `done:` acceptance, and the no-mistakes `--intent` contract |
 | `fm-claude-budget.sh`    | Compute the daily Claude budget from the remaining quota and record the `above_budget` flag the dispatch resolver relays as advice |
+| `fm-summary-gate.sh`     | Quiet-orchestrator gate: allow at most one routine summary per hour while merge-ready, blocker, and decision messages always go out |
 | `fm-brief-heading-lib.sh` | Single owner of reading a brief's sections, shared by the `--intent` contract, spawn and promotion validation, and `fm-dispatch-resolve.sh` |
 | `fm-herdr-lab.sh`        | Provision and guardedly operate an isolated, never-default Herdr lab session         |
 | `fm-herdr-lab-viewer.py` | The pty engine behind `fm-herdr-lab.sh viewer`: one real foreground Herdr client on a non-zero window grid |
