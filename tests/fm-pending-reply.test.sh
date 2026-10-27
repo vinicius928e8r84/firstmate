@@ -38,6 +38,10 @@
 #      the decision; a retry while that decision is still open appends nothing
 #  19. A request summary keeps accented letters, drops control characters, and
 #      caps at 120 characters without splitting one under any caller locale
+#  20. The guarded ghost close (bin/fm-pending-reply-close-ghost.sh) needs an
+#      explicit reason, refuses a live resolvable endpoint, and for a retired or
+#      unresolvable one resolves the record and closes its escalation decision
+#      with the owned close note, so the open-decision fold really drops it
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -2151,6 +2155,78 @@ test_unrelated_and_stale_corr_cannot_resolve
 test_another_mates_echo_cannot_resolve
 test_restart_preserves_expectation_and_parent_destination
 test_wrong_home_detected_not_acknowledged
+
+# A pending reply whose task has no endpoint record (a retired host) or whose
+# remote host is unreachable can never be answered; its escalation stays open
+# in the fold until the guarded operator close writes the owned close note.
+test_ghost_close_guards_and_closes() {
+  local dir state corr task rec out rc
+  dir="$TMP_ROOT/ghost-close"; mkdir -p "$dir"
+  state="$dir/home/state"; mkdir -p "$state/pending-replies"
+  corr=9bc3b9eb60bd5420; task=pc-aux
+  rec="$state/pending-replies/$corr"
+  cat > "$rec" <<RECORD
+schema=fm-pending-reply.v1
+corr_id=$corr
+task_id=$task
+parent_home=$dir/home
+parent_status=$state/$task.status
+request_summary=resume the proof
+created_epoch=1000
+delivered_epoch=1001
+phase=escalated
+escalated_epoch=1500
+recovery_delivery_outcome=failed
+grace_secs=120
+RECORD
+  cp "$rec" "$dir/pristine-record"
+  printf 'blocked [key=pending-reply-%s] [at=1500]: pending-reply-recovery-delivery-failed: task=%s pending-reply-id=%s request=resume the proof\n' \
+    "$corr" "$task" "$corr" > "$state/$task.status"
+  local close="$ROOT/bin/fm-pending-reply-close-ghost.sh"
+  out=$(FM_HOME="$dir/home" "$close" "$corr" 2>&1); rc=$?
+  expect_code 1 "$rc" "a ghost close without --reason must be refused"
+  assert_contains "$out" "--reason" "the refusal should name the missing reason"
+  out=$(FM_HOME="$dir/home" "$close" "$corr" --reason "   " 2>&1); rc=$?
+  expect_code 1 "$rc" "a blank reason must be refused"
+  out=$(FM_HOME="$dir/home" "$close" ffffffffffffffff --reason "gone" 2>&1); rc=$?
+  expect_code 1 "$rc" "an unknown pending-reply id must be refused"
+  [ "$(fm_pending_reply_get "$rec" phase)" = escalated ] || fail "a refused close must leave the record untouched"
+
+  # A remote endpoint that answers is live and resolvable: refused.
+  printf 'window=remote:%s\nremote_host=pc-aux2\nkind=secondmate\n' "$task" > "$state/$task.meta"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/probe-up"; chmod +x "$dir/probe-up"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/probe-down"; chmod +x "$dir/probe-down"
+  out=$(FM_HOME="$dir/home" FM_PENDING_REPLY_REMOTE_PROBE="$dir/probe-up" "$close" "$corr" --reason "retired" 2>&1); rc=$?
+  expect_code 1 "$rc" "a live resolvable endpoint must be refused"
+  assert_contains "$out" "live and resolvable" "the refusal should say why"
+  [ "$(fm_pending_reply_get "$rec" phase)" = escalated ] || fail "a refused close must leave the record untouched"
+  assert_contains "$(status_open_decisions "$state/$task.status")" "pending-reply-$corr" "the decision must stay open after a refusal"
+
+  # The same endpoint unreachable is a ghost: the close goes through.
+  out=$(FM_HOME="$dir/home" FM_PENDING_REPLY_REMOTE_PROBE="$dir/probe-down" "$close" "pending-reply-$corr" --reason "host pc-aux retired" 2>&1); rc=$?
+  expect_code 0 "$rc" "an unreachable endpoint should close: $out"
+  [ "$(fm_pending_reply_get "$rec" phase)" = resolved ] || fail "the record should be resolved"
+  [ "$(fm_pending_reply_get "$rec" resolved_via)" = ghost-close ] || fail "the record should say how it closed"
+  [ -z "$(status_open_decisions "$state/$task.status")" ] || fail "the escalation decision should be closed in the fold:"$'\n'"$(status_open_decisions "$state/$task.status")"
+  grep -qF "pending-reply-resolved: task=$task pending-reply-id=$corr via=ghost-close reason=host pc-aux retired" "$state/$task.status" \
+    || fail "the close should carry the owned note and the reason:"$'\n'"$(cat "$state/$task.status")"
+  out=$(FM_HOME="$dir/home" "$close" "$corr" --reason "again" 2>&1); rc=$?
+  expect_code 0 "$rc" "closing an already-closed record is a reported no-op"
+  [ "$(grep -c '^resolved' "$state/$task.status")" = 1 ] || fail "a repeat must not append a second close"
+
+  # No endpoint record at all (the retired host's own task): also a ghost.
+  rm -f "$state/$task.meta"
+  corr=7a8e7980bab51eb1
+  sed "s/9bc3b9eb60bd5420/$corr/" "$dir/pristine-record" > "$state/pending-replies/$corr"
+  rec="$state/pending-replies/$corr"
+  printf 'blocked [key=pending-reply-%s] [at=1600]: pending-reply-recovery-delivery-failed: task=%s pending-reply-id=%s request=resume the proof\n' \
+    "$corr" "$task" "$corr" >> "$state/$task.status"
+  out=$(FM_HOME="$dir/home" "$close" "$corr" --reason "no endpoint record" 2>&1); rc=$?
+  expect_code 0 "$rc" "a task without endpoint metadata is a ghost: $out"
+  [ -z "$(status_open_decisions "$state/$task.status")" ] || fail "the second decision should be closed too"
+  pass "ghost close: needs a reason, refuses a live endpoint, closes retired and unreachable ones with the owned note"
+}
+
 test_unmarked_captain_input_creates_no_expectation
 test_fm_send_marked_secondmate_creates_pending_and_embeds_corr
 test_document_pointer_resolves
@@ -2174,5 +2250,6 @@ test_local_parent_replies_is_wrong_home_evidence
 test_escalated_undelivered_correlation_stays_retryable
 test_same_kind_escalation_reopens_after_operator_close
 test_summary_keeps_accents_and_caps_by_character
+test_ghost_close_guards_and_closes
 
 printf 'ok - all pending-reply tests passed\n'

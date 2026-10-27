@@ -33,6 +33,8 @@
 #                              so later polls suppress another escalation
 #   <task>.inbox/.retry-ring   name of a fire-and-forget record still owed its
 #                              one retry ring (fm_task_inbox_mark_retry)
+#   <task>.inbox/.receipts     delivery receipts, append-only, one line per event:
+#                              "<sent|read|resent>\t<record>\t<epoch>[\t<new-record>]"
 #
 # Record format (fm_task_inbox_write / fm_task_inbox_body):
 #   schema=fm-task-inbox.v1
@@ -80,6 +82,21 @@
 # acknowledged record drops its mark. The remote steer leg has no watcher
 # ladder and owes no retry.
 #
+# Delivery receipts (fm_task_inbox_receipt_*): every ordinary steer gets a
+# `sent` receipt at enqueue; the worker's handled/ move is the read
+# confirmation and the poller records it as a `read` receipt the first time it
+# sees it. An ordinary record still unread FM_TASK_INBOX_RECEIPT_SECS after it
+# was sent (default 600, measured from its `sent` receipt; a record written
+# without one, such as a process-event or remote-leg record, is not tracked) is
+# re-sent exactly once as a NEW record carrying the same body behind
+# a one-line resend notice, and a `resent` receipt naming both records spends
+# the one resend. The caller (the steering-inbox poll in bin/fm-watch.sh) warns
+# main when it resends. A resend record is never itself resent, a
+# fire-and-forget record never gets a receipt, and the receipts are the only
+# new state: the re-ring ladder above still owns doorbell retries and the stale
+# escalation. A crash between the resend record and its `resent` receipt can
+# resend once more (at-least-once, the direction the escalation marker favors).
+#
 # Inbox names containing bytes outside printable ASCII are unsupported. The
 # doorbell refuses them rather than sending terminal control bytes to a pane.
 #
@@ -91,6 +108,8 @@
 #   FM_TASK_INBOX_GRACE_SECS   default 90; delivery-attempt grace and spacing
 #   FM_TASK_INBOX_RING_MAX     default 3; delivery attempts before escalation
 #   FM_TASK_INBOX_BUSY_MAX     default 2; consecutive busy-deferred due polls before escalation
+#   FM_TASK_INBOX_RECEIPT_SECS default 600; unread age before the one resend
+#   FM_TASK_INBOX_NOW          optional fixed epoch for the receipt clock (tests)
 
 _FM_TASK_INBOX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Both dependencies are canonical lint roots in their own right. Keep them as
@@ -106,6 +125,7 @@ FM_TASK_INBOX_GRACE_DEFAULT=90
 FM_TASK_INBOX_RING_MAX_DEFAULT=3
 FM_TASK_INBOX_BUSY_MAX_DEFAULT=2
 FM_TASK_INBOX_LOCK_WAIT_DEFAULT=5
+FM_TASK_INBOX_RECEIPT_DEFAULT=600
 
 fm_task_inbox_grace_secs() {
   local g=${FM_TASK_INBOX_GRACE_SECS:-$FM_TASK_INBOX_GRACE_DEFAULT}
@@ -543,4 +563,120 @@ fm_task_inbox_record_escalated() {  # <state-dir> <task-id> <record-path>
     [ -d "$dir" ] || return 0
     return 1
   fi
+}
+
+# --- delivery receipts -------------------------------------------------------
+
+fm_task_inbox_receipt_secs() {
+  local s=${FM_TASK_INBOX_RECEIPT_SECS:-$FM_TASK_INBOX_RECEIPT_DEFAULT}
+  case "$s" in ''|*[!0-9]*) s=$FM_TASK_INBOX_RECEIPT_DEFAULT ;; esac
+  printf '%s' "$s"
+}
+
+fm_task_inbox_receipt_now() {
+  case "${FM_TASK_INBOX_NOW:-}" in
+    ''|*[!0-9]*) date +%s ;;
+    *) printf '%s' "$FM_TASK_INBOX_NOW" ;;
+  esac
+}
+
+fm_task_inbox_receipts_path() {  # <state-dir> <task-id>
+  printf '%s/.receipts' "$(fm_task_inbox_dir "$1" "$2")"
+}
+
+_fm_task_inbox_receipt_append() {  # <state-dir> <task-id> <event> <record-base> [new-record-base]
+  local path
+  path=$(fm_task_inbox_receipts_path "$1" "$2")
+  [ -d "${path%/*}" ] || return 1
+  if [ -n "${5:-}" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$3" "$4" "$(fm_task_inbox_receipt_now)" "$5" >> "$path"
+  else
+    printf '%s\t%s\t%s\n' "$3" "$4" "$(fm_task_inbox_receipt_now)" >> "$path"
+  fi
+}
+
+# The epoch of the first <event> receipt for <record-base>, or fail.
+_fm_task_inbox_receipt_epoch() {  # <state-dir> <task-id> <event> <record-base>
+  local path
+  path=$(fm_task_inbox_receipts_path "$1" "$2")
+  [ -f "$path" ] || return 1
+  awk -F'\t' -v e="$3" -v r="$4" '$1 == e && $2 == r { print $3; found = 1; exit } END { exit(found ? 0 : 1) }' "$path"
+}
+
+# Record the `sent` receipt of an ordinary record. A fire-and-forget record
+# deliberately expects no acknowledgement and gets none.
+fm_task_inbox_receipt_sent() {  # <state-dir> <task-id> <record-path>
+  ! fm_task_inbox_is_fire_and_forget "$3" || return 0
+  _fm_task_inbox_receipt_append "$1" "$2" sent "${3##*/}"
+}
+
+# Record a `read` receipt for every sent record the worker has moved into
+# handled/. Idempotent; prints nothing.
+fm_task_inbox_receipt_observe() {  # <state-dir> <task-id>
+  local dir path base sent_list
+  dir=$(fm_task_inbox_dir "$1" "$2")
+  path=$(fm_task_inbox_receipts_path "$1" "$2")
+  [ -f "$path" ] || return 0
+  sent_list=$(awk -F'\t' '$1 == "sent" { print $2 }' "$path")
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    [ -f "$dir/handled/$base" ] || continue
+    ! _fm_task_inbox_receipt_epoch "$1" "$2" read "$base" >/dev/null || continue
+    _fm_task_inbox_receipt_append "$1" "$2" read "$base" || return 1
+  done <<< "$sent_list"
+}
+
+# One of: read | unread | unsent (no receipt) for a record basename.
+fm_task_inbox_receipt_status() {  # <state-dir> <task-id> <record-base>
+  local dir
+  dir=$(fm_task_inbox_dir "$1" "$2")
+  if [ -f "$dir/handled/$3" ]; then
+    printf 'read'
+  elif _fm_task_inbox_receipt_epoch "$1" "$2" sent "$3" >/dev/null; then
+    printf 'unread'
+  else
+    printf 'unsent'
+  fi
+}
+
+# Prints `quiet` or `resend <record-path>` for the oldest unread ordinary
+# record that has waited FM_TASK_INBOX_RECEIPT_SECS without its one resend.
+fm_task_inbox_receipt_due() {  # <state-dir> <task-id>
+  local dir path f base sent now secs
+  dir=$(fm_task_inbox_dir "$1" "$2")
+  path=$(fm_task_inbox_receipts_path "$1" "$2")
+  secs=$(fm_task_inbox_receipt_secs)
+  now=$(fm_task_inbox_receipt_now)
+  for f in "$dir"/*.msg; do
+    [ -e "$f" ] || continue
+    base=${f##*/}
+    ! fm_task_inbox_is_fire_and_forget "$f" || continue
+    if [ -f "$path" ] && awk -F'\t' -v r="$base" '$1 == "resent" && ($2 == r || $4 == r) { found = 1 } END { exit(found ? 0 : 1) }' "$path"; then
+      continue
+    fi
+    sent=$(_fm_task_inbox_receipt_epoch "$1" "$2" sent "$base") || continue
+    if [ "$((now - sent))" -ge "$secs" ]; then
+      printf 'resend %s' "$f"
+      return 0
+    fi
+  done
+  printf 'quiet'
+}
+
+# Re-send an unread record exactly once: a new ordinary record with the same
+# body behind a one-line notice, then the `resent` receipt that spends the
+# resend. Prints the new record path. Fails without a receipt when the new
+# record cannot be written.
+fm_task_inbox_receipt_resend() {  # <state-dir> <task-id> <record-path>
+  local state=$1 task=$2 rec=$3 base body new
+  base=${rec##*/}
+  [ -f "$rec" ] || return 1
+  body=$(fm_task_inbox_body "$rec"; printf x) || return 1
+  body=${body%x}
+  new=$(fm_task_inbox_write "$state" "$task" \
+    "[Firstmate resend: ${base} was not acknowledged after $(fm_task_inbox_receipt_secs) seconds; this is the same instruction, act on it once and move both records into handled/.]
+${body}") || return 1
+  _fm_task_inbox_receipt_append "$state" "$task" sent "${new##*/}" || return 1
+  _fm_task_inbox_receipt_append "$state" "$task" resent "$base" "${new##*/}" || return 1
+  printf '%s' "$new"
 }
