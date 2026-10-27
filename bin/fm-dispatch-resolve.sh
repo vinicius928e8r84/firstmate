@@ -51,6 +51,12 @@
 #     reason: <why the status is not clear>
 #     candidate: <harness>:<model> provider=.. scope=.. remaining=..% spendPriority=.. runway=.. -> eligible | eligible, unranked: <reason> | not eligible: <reason>
 #     profile: --harness <h> [--model <m>] [--effort <e>]     (status clear only)
+#     advice: <text>      only when bin/fm-claude-budget.sh has recorded the Claude
+#                         daily budget as exceeded: non-HIGH-risk proofs and all
+#                         scouts should run on Sonnet 5.5, HIGH-risk reviews stay
+#                         on Opus 5.5. Advice only - it never changes the status,
+#                         the candidates, or the profile line, and an explicit
+#                         captain model choice always wins.
 #   clear     -> pass the profile line to fm-spawn.sh unless you state a reason to override
 #   ambiguous -> confidence below the floor; decide as today from the probabilities
 #   escalate  -> the rule requires captain approval, no candidate is rankable, or a genuine tie
@@ -102,8 +108,18 @@ OR_TIMEOUT=10
 DEFAULT_WHEN="No listed rule applies to this task."
 
 die() { printf 'error: %s\n' "$1" >&2; exit 2; }
+# The Claude daily-budget advice (bin/fm-claude-budget.sh owns the flag and the
+# text); empty unless the recorded flag is above_budget, never an override.
+budget_advice() {
+  local kind=ship
+  [ -z "${BRIEF:-}" ] || ! grep -qxF 'This is a SCOUT task: the deliverable is a written report, not a PR.' "$BRIEF" 2>/dev/null || kind=scout
+  [ -x "$SCRIPT_DIR/fm-claude-budget.sh" ] || return 0
+  "$SCRIPT_DIR/fm-claude-budget.sh" --advice "$kind" 2>/dev/null | sed 's/^/  /'
+  return 0
+}
 no_rules() {
   printf 'dispatch-resolve:\n  status: escalate\n  reason: no rules to match\n'
+  budget_advice
   exit 0
 }
 usage() {
@@ -264,6 +280,7 @@ emit_error() {
   local reason=$1
   echo "dispatch-resolve: error ($reason)" >&2
   printf 'dispatch-resolve:\n  status: error\n  reason: %s\n' "$reason"
+  budget_advice
   exit 0
 }
 
@@ -558,4 +575,5 @@ TEXT=$(jq -r '
       + (if .chosen.profile.model then " --model \(.chosen.profile.model | shell_arg)" else "" end)
       + (if .chosen.profile.effort then " --effort \(.chosen.profile.effort | shell_arg)" else "" end) else empty end)' <<<"$RESULT") || emit_error "output rendering failed"
 printf '%s\n' "$TEXT"
+budget_advice
 exit 0
