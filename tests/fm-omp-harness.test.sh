@@ -605,7 +605,7 @@ while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
 SH
     chmod +x "$repo/bin/fm-watch-arm.sh"
     if [ "$budget" = with ]; then
-      printf '#!/usr/bin/env bash\necho 4\n' > "$repo/bin/fm-arm-budget.sh"
+      printf '#!/usr/bin/env bash\necho 8\n' > "$repo/bin/fm-arm-budget.sh"
       chmod +x "$repo/bin/fm-arm-budget.sh"
     fi
     out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$TMP_ROOT/budget-$budget.stop" FM_BUDGET_CASE="$budget" \
