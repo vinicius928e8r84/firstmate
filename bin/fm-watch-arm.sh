@@ -76,6 +76,16 @@
 # retry delay below uses the same wait when it is longer. A confirmed or attached
 # watcher clears the record. An unloaded host never waits. Helpers and their
 # test overrides live in bin/fm-wake-lib.sh (fm_arm_backoff_*, fm_load_milli).
+# An arm terminated before it confirmed a watcher (an adapter that gave up on a
+# slow start) counts as one more failed start, and leaves within about
+# FM_ARM_TERM_WAIT_MS (default 500) however long its window is.
+#
+# --budget: print the whole extra seconds a start may take beyond the base
+# FM_ARM_CONFIRM_TIMEOUT - the load stretch of the window plus any back-off still
+# pending - and exit 0 without touching a watcher or any state. The Pi, omp and
+# OpenCode adapters add it to their own ready timeout, which they otherwise
+# enforce with a fixed number. It is 0 on an unloaded host, so their timeouts
+# are unchanged there.
 #
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
@@ -185,7 +195,23 @@ CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-$ARM_CONFIRM_DEFAULT}
 # A loaded host stretches the window in proportion to its load per CPU (header,
 # "Load back-off"); an unloaded host keeps the configured value.
 case "$CONFIRM_TIMEOUT" in ''|*[!0-9]*) CONFIRM_TIMEOUT=$ARM_CONFIRM_DEFAULT ;; esac
+BASE_CONFIRM_TIMEOUT=$CONFIRM_TIMEOUT
 CONFIRM_TIMEOUT=$(fm_arm_confirm_window "$CONFIRM_TIMEOUT")
+# How long a TERM waits for a starting watcher to reach its cleanup-ready point,
+# in milliseconds (default 500): the Pi, omp and OpenCode adapters allow an arm
+# about one second to exit after they terminate it. Wall-clock, not a poll
+# count, because each poll forks and a loaded host makes polls slow.
+TERM_WAIT_MS=${FM_ARM_TERM_WAIT_MS:-500}
+case "$TERM_WAIT_MS" in ''|*[!0-9]*) TERM_WAIT_MS=500 ;; esac
+# shellcheck disable=SC2329 # Invoked indirectly by the signal handler below.
+now_ms() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    local t=${EPOCHREALTIME/[.,]/}
+    printf '%s\n' $((t / 1000))
+  else
+    printf '%s\n' $(($(date +%s) * 1000))
+  fi
+}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
 # The beacon age at which the watcher's own re-arm evicts a live holder; an
@@ -586,6 +612,13 @@ case "${1:-}" in
   ''|arm|--arm) mode=arm ;;
   --restart) mode=restart ;;
   --stop) mode=stop ;;
+  --budget)
+    [ "$#" -eq 1 ] || { echo "watcher: unexpected budget arguments" >&2; exit 2; }
+    extra=$((CONFIRM_TIMEOUT - BASE_CONFIRM_TIMEOUT + $(fm_arm_backoff_remaining "$STATE")))
+    [ "$extra" -gt 0 ] || extra=0
+    printf '%s\n' "$extra"
+    exit 0
+    ;;
   --take-over)
     mode=take-over
     take_over_arm_pid=${2:-}
@@ -601,7 +634,7 @@ case "${1:-}" in
     case "$handling_watcher_pid" in ''|*[!0-9]*) echo "watcher: invalid successor watcher pid" >&2; exit 2 ;; esac
     [ "$#" -eq 4 ] || { echo "watcher: unexpected handling delivery arguments" >&2; exit 2; }
     ;;
-  *) echo "usage: $(basename "$0") [--restart | --stop | --take-over ARM_PID | --handling-delivered GENERATION --watcher-pid PID]" >&2; exit 2 ;;
+  *) echo "usage: $(basename "$0") [--restart | --stop | --budget | --take-over ARM_PID | --handling-delivered GENERATION --watcher-pid PID]" >&2; exit 2 ;;
 esac
 
 if [ "$mode" = handling-delivered ]; then
@@ -752,9 +785,11 @@ handle_arm_signal() {
     # publishing the home-bound lock identity. Do not TERM it in the middle of
     # stale-lock acquisition: that can abandon the steal mutex. Let startup
     # reach that cleanup-ready point (or exit naturally) before forwarding TERM,
-    # but never past the startup confirmation deadline.
+    # but never past the startup confirmation deadline nor FM_ARM_TERM_WAIT_MS.
+    local term_deadline_ms=$(( $(now_ms) + TERM_WAIT_MS ))
     while fm_pid_alive "$child"; do
-      if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$child" "$FM_HOME" \
+      if [ "$(now_ms)" -ge "$term_deadline_ms" ] \
+        || fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$child" "$FM_HOME" \
         || [ "$(date +%s)" -ge "$deadline" ]; then
         kill -TERM "$child" 2>/dev/null || true
         break
@@ -762,6 +797,8 @@ handle_arm_signal() {
       sleep 0.02
     done
     wait "$child" 2>/dev/null || true
+    # Terminated before it confirmed a watcher: one more failed start.
+    [ "${ARM_CHILD_CONFIRMED:-0}" -eq 1 ] || fm_arm_backoff_note_failure "$STATE"
   fi
   cycle_log_append "$rc" "$signal" arm-interrupted none
   cleanup_child

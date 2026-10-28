@@ -441,7 +441,9 @@ A confirmed watcher, an attached watcher, or a delivered wake clears the record,
 An unloaded host never waits, so the retry-once behavior above is unchanged there.
 `fm_arm_backoff_*` and `fm_load_milli` in `bin/fm-wake-lib.sh` own the arithmetic; `FM_LOAD1_OVERRIDE` and `FM_NCPU_OVERRIDE` fake the load for tests.
 The Claude Stop auto-arm budget includes the stretched window and any pending wait.
-The Pi, omp, and OpenCode adapters keep their own ready timeouts, which an arm that is backing off can outlast.
+The Pi, omp, and OpenCode adapters enforce their own fixed ready timeout, so each asks `bin/fm-arm-budget.sh` (a read-only wrapper over `bin/fm-watch-arm.sh --budget`) for the extra seconds the load stretch and any pending back-off allow, adds them to that timeout, and only then terminates an unready arm.
+The extra is 0 on an unloaded host, so their timeouts are unchanged there.
+An arm terminated mid-start leaves within `FM_ARM_TERM_WAIT_MS` and counts as a failed start, so an adapter that kills slow arms still drives the back-off.
 
 The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYCLE_LOG_KEEP_LINES`.
 `state/.watch-triage.log` remains only the watcher's bounded absorbed-wake debug log and carries no lifecycle semantics.

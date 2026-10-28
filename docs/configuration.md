@@ -2937,6 +2937,7 @@ FM_ARM_CONFIRM_CAP=120  # ceiling for the confirmation window once fm-watch-arm 
 FM_ARM_BACKOFF_BASE=5  # seconds of back-off after the first unconfirmed watcher start on a loaded host; doubles per consecutive failure and scales with the load per CPU
 FM_ARM_BACKOFF_CAP=30  # ceiling for that back-off
 FM_ARM_BACKOFF_RESET=600  # seconds after which an old failure streak in state/.watch-arm-backoff is ignored
+FM_ARM_TERM_WAIT_MS=500  # milliseconds a terminated fm-watch-arm waits for a starting watcher to reach its cleanup-ready point before it forwards the TERM
 FM_OPENCODE_ARM_READY_TIMEOUT_MS=12000   # milliseconds the OpenCode primary watcher plugin waits for an arm attempt to report started, healthy, wake, or failure; default 35000 on Windows to stay above the MSYS confirm budget
 FM_PI_ARM_READY_TIMEOUT_MS=12000   # milliseconds the Pi watcher extension waits for a successor arm to report started or attached; default 35000 on Windows to stay above the MSYS confirm budget
 FM_WATCH_ARM_RETIRE_TIMEOUT_MS=1000   # milliseconds Pi/OpenCode wait for an unready successor arm to exit before abandoning retries

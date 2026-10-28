@@ -150,6 +150,7 @@ const fmRoot = process.env.FM_ROOT_OVERRIDE || root;
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
+const armBudgetScript = `${fmRoot}/bin/fm-arm-budget.sh`;
 const inlineScript = `${fmRoot}/bin/fm-wake-inline.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
 const handoffDir = `${state}/extensions/pi-primary-watch`;
@@ -252,6 +253,26 @@ function extensionLogKeepLines(): number {
   const value = Math.floor(Number(raw));
   if (!Number.isFinite(value) || value <= 0) return 0;
   return value;
+}
+
+// Extra milliseconds a loaded host may need beyond the fixed ready timeout: the
+// arm stretches its confirmation window with the load and may back off before
+// launching (bin/fm-watch-arm.sh "Load back-off"), and a timeout that ignores it
+// terminates a slow but healthy start. bin/fm-arm-budget.sh owns the number; 0
+// when it is unavailable or the host is unloaded.
+async function armLoadBudgetMs(): Promise<number> {
+  const query = runCommandAsync("bash", [armBudgetScript], {
+    cwd: fmRoot,
+    env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_CONFIG_OVERRIDE: config, FM_ROOT_OVERRIDE: fmRoot },
+  });
+  const bound = new Promise<null>((resolveBound) => {
+    const timer = setTimeout(() => resolveBound(null), 5000);
+    timer.unref();
+  });
+  const result = await Promise.race([query, bound]);
+  if (!result || result.status !== 0) return 0;
+  const seconds = Number(result.stdout.trim());
+  return Number.isInteger(seconds) && seconds > 0 ? seconds * 1000 : 0;
 }
 
 function parentPid(pid: string): string {
@@ -1110,9 +1131,21 @@ export default function (pi: ExtensionAPI) {
     const readiness = armReadiness.get(armChild);
     if (!readiness) return Promise.resolve(false);
     return new Promise((resolveReady) => {
-      const timer = setTimeout(() => resolveReady(false), armReadyTimeoutMs);
+      const startedAt = Date.now();
+      let settled = false;
+      let timer = setTimeout(() => resolveReady(false), armReadyTimeoutMs);
       timer.unref();
+      // The load budget only ever extends the fixed timeout, so it is read
+      // beside the wait rather than before it: a start that fails fast is not
+      // delayed by the query.
+      void armLoadBudgetMs().then((extraMs) => {
+        if (settled || extraMs <= 0) return;
+        clearTimeout(timer);
+        timer = setTimeout(() => resolveReady(false), Math.max(0, armReadyTimeoutMs + extraMs - (Date.now() - startedAt)));
+        timer.unref();
+      });
       void readiness.then((ready) => {
+        settled = true;
         clearTimeout(timer);
         resolveReady(ready);
       });
@@ -1408,7 +1441,10 @@ export default function (pi: ExtensionAPI) {
     if (!liveArmChild(owner) && !owner.retryTimer) owner.retryFailures = 0;
     const started = activateOwnedWatch(owner);
     if (!started.ok) return false;
-    const deadline = Date.now() + armReadyTimeoutMs;
+    let deadline = Date.now() + armReadyTimeoutMs;
+    void armLoadBudgetMs().then((extraMs) => {
+      deadline += extraMs;
+    });
     while (Date.now() < deadline) {
       const child = liveArmChild(owner);
       if (child) {
