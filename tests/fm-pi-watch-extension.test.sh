@@ -432,7 +432,7 @@ EOF
 # asks bin/fm-arm-budget.sh how much longer to wait and must not terminate the
 # successor arm (and spend its retry ladder) before that budget is spent. The
 # first arm delivers a wake and exits; its successor reports ready after 2.5s
-# against a 1s ready timeout, and the budget stub says 4s.
+# against a 1s ready timeout, and the budget stub says 8s.
 test_pi_ready_timeout_honors_the_arm_load_budget() {
   local repo home log out status budget
   for budget in with without; do
@@ -459,7 +459,7 @@ while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
 SH
     chmod +x "$repo/bin/fm-watch-arm.sh"
     if [ "$budget" = with ]; then
-      printf '#!/usr/bin/env bash\necho 4\n' > "$repo/bin/fm-arm-budget.sh"
+      printf '#!/usr/bin/env bash\necho 8\n' > "$repo/bin/fm-arm-budget.sh"
       chmod +x "$repo/bin/fm-arm-budget.sh"
     fi
     out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" \
@@ -5562,7 +5562,7 @@ while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
 SH
     chmod +x "$repo/bin/fm-watch-arm.sh"
     if [ "$budget" = with ]; then
-      printf '#!/usr/bin/env bash\necho 4\n' > "$repo/bin/fm-arm-budget.sh"
+      printf '#!/usr/bin/env bash\necho 8\n' > "$repo/bin/fm-arm-budget.sh"
       chmod +x "$repo/bin/fm-arm-budget.sh"
     fi
     out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_STOP_FILE="$TMP_ROOT/opencode-load-budget-$budget.stop" FM_BUDGET_CASE="$budget" \
