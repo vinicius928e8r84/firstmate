@@ -1039,6 +1039,62 @@ test_squash_merged_pr_allows_replayed_unpushed_patch() {
   pass "squash-merged PR accepts replayed unpushed local patches contained in the PR head"
 }
 
+test_merged_pr_patch_matching_preserves_indentation() {
+  local case_dir mode rc pr_head local_head expected
+  for mode in exact amended old-git; do
+    case_dir=$(make_case "pr-indentation-$mode")
+    write_meta "$case_dir" no-mistakes ship
+    # A pushed parent makes the YAML patch the only unpushed commit, while
+    # giving the local replay a different parent from the recorded PR head.
+    wt_commit_file "$case_dir" local-parent.txt parent "local parent"
+    git -C "$case_dir/wt" push -q origin HEAD:refs/heads/fm/task-x1
+    git -C "$case_dir/project" fetch -q origin fm/task-x1
+    wt_commit_file "$case_dir" config.yml $'a:\n  b: 1' "add YAML"
+    append_pr_meta_url "$case_dir"
+    pr_head=$(land_equivalent_patch_on_origin_branch "$case_dir" pr-head config.yml $'a:\n  b: 1' "add YAML")
+    printf 'pr_head=%s\n' "$pr_head" >> "$case_dir/state/task-x1.meta"
+    add_gh_pr_merged_for_head "$case_dir" "$pr_head"
+    if [ "$mode" = amended ]; then
+      printf 'a:\nb: 1\n' > "$case_dir/wt/config.yml"
+      git -C "$case_dir/wt" add -- config.yml
+      git -C "$case_dir/wt" commit -q --amend --no-edit
+    elif [ "$mode" = old-git ]; then
+      cat > "$case_dir/fakebin/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = patch-id ]; then
+  printf '%s\n' "$*" >> "$FM_PATCH_ID_LOG"
+  if [ "${2:-}" = --verbatim ]; then
+    echo 'error: unknown option `verbatim`' >&2
+    exit 129
+  fi
+fi
+exec "$REAL_GIT_FOR_TEST" "$@"
+SH
+      chmod +x "$case_dir/fakebin/git"
+    fi
+    local_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+    [ "$local_head" != "$pr_head" ] || fail "$mode: fixture did not diverge"
+
+    set +e
+    FM_PATCH_ID_LOG="$case_dir/patch-id.log" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+    rc=$?
+    set -e
+
+    expected=1
+    [ "$mode" != exact ] || expected=0
+    expect_code "$expected" "$rc" "pr-indentation-$mode: teardown exit"$'\n'"$(cat "$case_dir/stderr")"
+    if [ "$expected" = 1 ]; then
+      assert_grep REFUSED "$case_dir/stderr" "$mode: no refusal diagnostic"
+      assert_refusal_retained_task_state "$case_dir" "$mode" "$local_head"
+    fi
+    if [ "$mode" = old-git ]; then
+      assert_grep 'patch-id --verbatim' "$case_dir/patch-id.log" "old-git: capability rejection was not exercised"
+      ! grep -q -- --stable "$case_dir/patch-id.log" || fail "old-git: fell back to whitespace-insensitive matching"
+    fi
+  done
+  pass "merged PR patch matching preserves indentation, allows exact replays, and refuses unsupported Git"
+}
+
 test_merged_pr_with_later_local_commit_refuses() {
   local case_dir rc pr_head
   case_dir=$(make_case stale-pr-head)
@@ -5658,6 +5714,7 @@ test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
 test_squash_merged_pr_allows_replayed_unpushed_patch
+test_merged_pr_patch_matching_preserves_indentation
 test_merged_pr_with_later_local_commit_refuses
 test_squash_merged_rebased_branch_allows
 test_squash_merged_forgejo_pr_allows_when_main_moved_on

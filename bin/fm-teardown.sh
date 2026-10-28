@@ -57,7 +57,7 @@
 # the PR head. A diverged copy is not treated as landed: path-set coverage, git
 # cherry, and merge-tree containment each fail to prove content landed without also
 # accepting unlanded edits to the same paths. Teardown still accepts a merged PR
-# whose head contains the current local work (ancestor or equivalent patch ids),
+# whose head contains the current local work (ancestor or whitespace-exact patch ids),
 # or a clean content-in-default tree match. Anything else refuses.
 # The PR itself is resolved from the task's recorded pr= when present, or - when
 # no pr= was ever recorded (e.g. a yolo-authorized merge on a repo with no PR CI,
@@ -1623,8 +1623,10 @@ ensure_commit_object() {
 
 patch_id_for_commit() {
   local commit=$1
+  # Indentation can change semantics. Unsupported --verbatim yields no id,
+  # so callers fall back to the content check or refuse, never ignore whitespace.
   git -C "$WT" show --pretty=medium --no-ext-diff "$commit" 2>/dev/null \
-    | git patch-id --stable 2>/dev/null \
+    | git patch-id --verbatim 2>/dev/null \
     | awk 'NR == 1 { print $1 }'
 }
 
