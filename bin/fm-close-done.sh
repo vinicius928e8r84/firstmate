@@ -35,6 +35,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case "${1:-}" in
+  -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
 if [ -z "${FM_HOME:-}" ]; then
   echo "error: FM_HOME is not set; fm-close-done refuses to resolve workers without an explicit firstmate home" >&2
   exit 2
@@ -52,7 +55,6 @@ IDS=()
 for arg in "$@"; do
   case "$arg" in
     --close) CLOSE=1 ;;
-    -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "usage: fm-close-done.sh [--close] [<task-id>...]" >&2; exit 2 ;;
     *) IDS+=("$arg") ;;
   esac
