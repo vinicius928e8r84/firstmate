@@ -174,7 +174,7 @@ const armReadyTimeoutMs = positiveInteger(
   "FM_PI_ARM_READY_TIMEOUT_MS",
   process.platform === "win32" ? 35000 : 12000,
 );
-const armRetireTimeoutMs = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 1000);
+const armRetireTimeoutMs = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 3000);
 // The drain itself takes 45-60 s on a loaded 4-core host (measured 48.7 s on
 // 24/10 at load 6-7), so a 60 s cap timed out on every wake and the model ran
 // the same drain again. The model's own drain is no faster, so a longer cap
