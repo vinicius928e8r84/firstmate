@@ -72,7 +72,7 @@
 # (confirmation timeout or a failing exit) records a consecutive failure in
 # state/.watch-arm-backoff; the wait is FM_ARM_BACKOFF_BASE (default 5s) doubled
 # per consecutive failure and scaled by the load per CPU, capped at
-# FM_ARM_BACKOFF_CAP (default 60s), measured from the last failure. The quick-exit
+# FM_ARM_BACKOFF_CAP (default 30s), measured from the last failure. The quick-exit
 # retry delay below uses the same wait when it is longer. A confirmed or attached
 # watcher clears the record. An unloaded host never waits. Helpers and their
 # test overrides live in bin/fm-wake-lib.sh (fm_arm_backoff_*, fm_load_milli).

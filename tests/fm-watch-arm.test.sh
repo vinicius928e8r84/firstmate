@@ -2079,6 +2079,8 @@ test_backoff_grows_exponentially_scaled_by_load_per_cpu_and_is_capped() {
   [ "$seq" = "45 60 60" ] || fail "load 9/cpu back-off must be 45 60 60, got: $seq"
   seq=$(backoff_sequence 2.0 4 1 2 3)
   [ "$seq" = "0 0 0" ] || fail "an unloaded host (load 0.5/cpu) must never back off, got: $seq"
+  seq=$(FM_LOAD1_OVERRIDE=171.9 FM_NCPU_OVERRIDE=4 bash -c '. "$1/bin/fm-wake-lib.sh"; fm_arm_backoff_seconds 1; fm_arm_backoff_seconds 6' _ "$ROOT" | tr '\n' ' ')
+  [ "$seq" = "30 30 " ] || fail "the default cap must be 30s under the captain's measured peak load, got: $seq"
   pass "watch-arm: back-off doubles per failure, scales with load per CPU, is capped, and is zero when unloaded"
 }
 
