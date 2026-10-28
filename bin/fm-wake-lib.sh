@@ -210,7 +210,8 @@ fm_arm_confirm_window() {
 # failure in <state>/.watch-arm-backoff ("<failures> <epoch>"); a confirmed
 # watcher clears it. While the host is loaded (load per CPU of at least 1) the
 # next arm waits base * 2^(failures-1) * (load per CPU) seconds since the last
-# failure, capped at FM_ARM_BACKOFF_CAP (default 60); FM_ARM_BACKOFF_BASE
+# failure, capped at FM_ARM_BACKOFF_CAP (default 30: with the 120s confirmation
+# cap it stays inside the Claude Stop hook's 180s timeout). FM_ARM_BACKOFF_BASE
 # defaults to 5. On an unloaded host there is no wait, so the existing
 # retry-once behavior is unchanged. A record older than FM_ARM_BACKOFF_RESET
 # (default 600) is ignored so an old streak cannot penalise a fresh failure.
@@ -226,7 +227,7 @@ fm_arm_backoff_failures() {  # <state>
 
 # fm_arm_backoff_seconds <failures>
 fm_arm_backoff_seconds() {
-  local failures=$1 base=${FM_ARM_BACKOFF_BASE:-5} cap=${FM_ARM_BACKOFF_CAP:-60} milli exp
+  local failures=$1 base=${FM_ARM_BACKOFF_BASE:-5} cap=${FM_ARM_BACKOFF_CAP:-30} milli exp
   case "$base" in ''|*[!0-9]*) base=5 ;; esac
   case "$cap" in ''|*[!0-9]*) cap=60 ;; esac
   [ "$failures" -ge 1 ] 2>/dev/null || { printf '0\n'; return 0; }
