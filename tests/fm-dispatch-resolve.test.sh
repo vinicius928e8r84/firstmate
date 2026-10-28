@@ -1087,4 +1087,51 @@ expect_code 0 "$code" "--help exits 0"
 assert_contains "$out" 'Usage:' "--help prints usage"
 pass "configuration errors exit 2 before any network call"
 
+# --- Claude daily-budget advice: printed, never an override -----------------
+BUDGET_TOOL="$ROOT/bin/fm-claude-budget.sh"
+BUDGET_QUOTA="$TMP_ROOT/budget-quota.json"
+SCOUT_BRIEF="$TMP_ROOT/scout-brief.md"
+printf '# Task\nThis is a SCOUT task: the deliverable is a written report, not a PR.\nInvestigate the pager.\n' > "$SCOUT_BRIEF"
+budget_epoch() { jq -nr --arg t "$1" '$t | fromdateiso8601'; }
+run_budget_at() {  # <epoch> <claude remaining percent>
+  jq --argjson p "$2" '(.providers[] | select(.provider == "claude").quotaSemantics.effectiveAvailability[] | select(.scope == "all_models")).effectivePercentRemaining = $p' "$QUOTA" > "$BUDGET_QUOTA"
+  PATH="$FAKEBIN:$BASE_PATH" FM_HOME="$HOME_DIR" FM_CLAUDE_BUDGET_NOW="$1" QUOTA_AXI_FIXTURE="$BUDGET_QUOTA" "$BUDGET_TOOL" >/dev/null
+}
+B1=$(budget_epoch 2026-10-27T01:00:00Z)
+rm -f "$HOME_DIR/state/claude-budget.state"
+reset_log
+write_response "$RESPONSE" rule_4 0.9
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF"
+expect_code 0 "$code" "no budget record exits 0"
+assert_not_contains "$out" 'advice:' "no recorded budget means no advice"
+PROFILE_BASE=$(printf '%s\n' "$out" | grep -F '  profile:')
+
+run_budget_at "$B1" 52
+run_budget_at "$((B1 + 3600))" 50
+export FM_CLAUDE_BUDGET_NOW=$((B1 + 3600))
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF"
+assert_not_contains "$out" 'advice:' "a within-budget day prints no advice"
+
+run_budget_at "$((B1 + 7200))" 40
+export FM_CLAUDE_BUDGET_NOW=$((B1 + 7200))
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF"
+expect_code 0 "$code" "advice never changes the exit code"
+assert_contains "$out" '  status: clear' "advice never changes the status"
+assert_contains "$out" 'advice: Claude daily budget exceeded (spent 12.00% of today'"'"'s 8.85% allowance' "an exceeded budget prints the advice with the numbers"
+assert_contains "$out" 'non-HIGH-risk proofs run on Sonnet 5.5 (claude-sonnet-5-5) and HIGH-risk reviews stay on Opus 5.5 (claude-opus-5-5)' "ship briefs get the proof and review split"
+assert_contains "$out" 'an explicit captain model choice wins' "the advice defers to an explicit captain model choice"
+assert_equals "$PROFILE_BASE" "$(printf '%s\n' "$out" | grep -F '  profile:')" "the profile line is byte-identical with and without the advice"
+TYPESAFE_API_KEY=$KEY run code out err "$SCOUT_BRIEF"
+assert_contains "$out" 'this scout runs on Sonnet 5.5 (claude-sonnet-5-5)' "a scout brief is advised onto Sonnet 5.5"
+assert_not_contains "$out" 'HIGH-risk reviews stay' "a scout gets the scout-only advice"
+assert_equals "$PROFILE_BASE" "$(printf '%s\n' "$out" | grep -F '  profile:')" "the scout profile line is not overridden either"
+export FM_CLAUDE_BUDGET_NOW=$((B1 + 7200 + 2 * 3600 + 1))
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF"
+assert_not_contains "$out" 'advice:' "a record older than two hourly runs is not advice"
+unset FM_CLAUDE_BUDGET_NOW
+rm -f "$HOME_DIR/state/claude-budget.state"
+pass "budget advice: printed only when the recorded flag is above budget, never changes the resolved profile"
+
 printf '# all fm-dispatch-resolve tests passed\n'

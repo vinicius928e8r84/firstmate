@@ -646,6 +646,41 @@ inbox_steer_check() {  # <window> <task>
   esac
 }
 
+# Delivery-receipt check, one cheap pass per recorded window per poll.
+# bin/fm-task-inbox-lib.sh owns the policy: a sent steer the worker has not
+# moved into handled/ after FM_TASK_INBOX_RECEIPT_SECS (10 minutes) is re-sent
+# exactly once as a new record, and main is warned with a check wake. An
+# unavailable endpoint is left to the stale path above, and a busy pane gets
+# the record without a typed doorbell (the ladder or the worker's own checkpoint
+# finds it), so the resend never types into a busy or dead worker.
+inbox_receipt_check() {  # <window> <task>
+  local w=$1 task=$2 action rec new backend agent_state reason ring_rc=skipped
+  fm_task_inbox_receipt_observe "$STATE" "$task" || true
+  action=$(fm_task_inbox_receipt_due "$STATE" "$task") || return 0
+  [ "${action%% *}" = resend ] || return 0
+  rec=${action#resend }
+  backend=$(window_backend "$w")
+  agent_state=$(fm_backend_agent_state "$backend" "$w" 2>/dev/null || true)
+  case "$agent_state" in
+    dead|missing) return 0 ;;
+  esac
+  if ! new=$(fm_task_inbox_receipt_resend "$STATE" "$task" "$rec"); then
+    [ -f "$rec" ] || return 0
+    reason="stale: $w (delivery receipt: $rec is unread but its one resend could not be recorded under ${rec%/*}; inspect the inbox directory)"
+    fm_wake_append stale "$w" "$reason" || exit 1
+    wake "$reason"
+  fi
+  watcher_capture "$backend" "$w" 40 "$(window_label "$w")" || WATCHER_CAPTURE=
+  if ! window_is_busy "$w" "$WATCHER_CAPTURE"; then
+    ring_rc=0
+    fm_task_inbox_ring "$backend" "$w" "$new" "$(window_label "$w")" || ring_rc=$?
+  fi
+  triage_log "steer-inbox receipt resend: $task ${rec##*/} -> ${new##*/} ring=$ring_rc"
+  reason="check: steer unread: $task never confirmed reading ${rec##*/} after $(fm_task_inbox_receipt_secs)s; re-sent once as ${new##*/}"
+  fm_wake_append check "steer-unread-$task-${rec##*/}" "$reason" || exit 1
+  wake "$reason"
+}
+
 # 0 (benign/absorb) if EVERY task in a no-verb "signal:" wake has positive work
 # evidence; 1 otherwise. Each task may satisfy the authoritative working proof,
 # or an eligible bare turn-end may use the opt-in pane-churn proof below.
@@ -3837,6 +3872,7 @@ EOF
     # Steering-inbox loss detection runs before the secondmate stale
     # exemption below, because a mate's steers land in an inbox too.
     [ -z "$task" ] || inbox_steer_check "$w" "$task"
+    [ -z "$task" ] || inbox_receipt_check "$w" "$task"
     key=$(window_key "$w")
     last=$(status_declared_wait_line "$STATE/$task.status")
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then

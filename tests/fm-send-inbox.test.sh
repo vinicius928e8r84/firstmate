@@ -27,6 +27,8 @@
 #  10. An empty or whitespace-only text steer is refused before anything is
 #      marked, recorded, or typed - on the marked secondmate path that means
 #      no marker-only record and no pending-reply expectation.
+#  11. An ordinary steer is recorded as sent in the inbox's delivery receipts
+#      and reports unread until the worker's handled/ move.
 # Every case below that passes a literal `$...` message quotes it on purpose
 # (the point is sending an unexpanded `$` line), so SC2016 is disabled.
 # shellcheck disable=SC2016
@@ -504,7 +506,23 @@ test_empty_message_refused() {
   pass "fm-send: an empty or whitespace-only text steer refuses before marking, recording, or typing"
 }
 
+test_ordinary_steer_gets_a_delivery_receipt() {
+  local dir err rc inbox
+  dir=$(setup_case receipt)
+  err="$dir/send.err"
+  inbox="$dir/home/state/t1.inbox"
+  run_send "$dir" "$err" -- t1 "please rebase onto main"; rc=$?
+  expect_code 0 "$rc" "an inbox-plane steer should exit 0 at enqueue"
+  [ "$(bash -c '. "$1"; fm_task_inbox_receipt_status "$2" t1 001.msg' _ "$ROOT/bin/fm-task-inbox-lib.sh" "$dir/home/state")" = unread ] \
+    || fail "a fresh ordinary steer should report unread:"$'\n'"$(cat "$inbox/.receipts" 2>/dev/null)"
+  mv "$inbox/001.msg" "$inbox/handled/"
+  [ "$(bash -c '. "$1"; fm_task_inbox_receipt_status "$2" t1 001.msg' _ "$ROOT/bin/fm-task-inbox-lib.sh" "$dir/home/state")" = read ] \
+    || fail "the handled/ move should read as the read confirmation"
+  pass "fm-send inbox: an ordinary steer is recorded as sent and reads unread until the worker's handled/ move"
+}
+
 test_text_steer_rides_inbox
+test_ordinary_steer_gets_a_delivery_receipt
 test_deep_home_doorbell_stays_short
 test_multiline_steer_is_legal
 test_resend_enqueues_new_sequence

@@ -1662,6 +1662,16 @@ A match stops the request: the resolver behaves exactly as when it is off, print
 A list that is present but not a readable regular file also stops the request the same way rather than sending unchecked text.
 That one diagnostic names the list line number at most and never prints the listed value or the matching text.
 
+**Claude daily budget advice**
+
+`bin/fm-claude-budget.sh` computes the daily Claude budget (the remaining all-models quota percent from `quota-axi --json`, divided by the days to the end date) and records an `above_budget` flag in `state/claude-budget.state`, with one row per run in `data/claude-budget.log`.
+Run it hourly from cron: `7 * * * * FM_HOME=<home> <code-root>/bin/fm-claude-budget.sh >> <home>/state/.claude-budget.cron.log 2>&1`.
+The end date defaults to `2026-11-01T22:00:00Z` and is set by `--end`, `FM_CLAUDE_BUDGET_END`, or the first non-comment line of an optional `config/claude-budget-end`, in that order.
+The day's allowance is fixed at the first run of each UTC day, so the flag means the quota spent since then exceeds that allowance; the script header owns the exact record fields.
+When the recorded flag is `above_budget` and less than two hours old, the resolver appends one `advice:` line to its output: non-HIGH-risk proofs and all scouts should run on Sonnet 5.5, HIGH-risk reviews stay on Opus 5.5.
+The line is advice only.
+It never changes the status, the candidates, or the `profile:` line, and an explicit captain model choice always wins.
+
 **Missing or invalid rules**
 
 An absent rules file, a default-only file, or `rules: []` returns the non-clear reason `no rules to match` without a model or quota request, leaving firstmate's existing routing in control; an existing but unreadable or malformed rules file, including a broken symlink, remains an actionable exit 2 configuration error.
