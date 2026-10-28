@@ -83,15 +83,45 @@ gate "$T0" decide summary
 expect_code 0 "$CODE" "a corrupt mark counts as no summary yet"
 pass "summary gate: the mark is a durable file, mark and status work, a corrupt mark is ignored"
 
-# 4. Simultaneous summaries send exactly once.
+# 4. Simultaneous summaries send exactly once, and every caller gets a
+# contract answer: `send` with exit 0 or `suppress` with exit 1, never an
+# error that a caller testing the exit status would read as silence.
 rm -f "$HOME_DIR/state/.last-summary"
-for i in 1 2 3 4 5 6; do
+for i in $(seq 1 24); do
   (FM_HOME="$HOME_DIR" FM_SUMMARY_GATE_NOW="$T0" "$TOOL" decide summary > "$TMP_ROOT/race.$i" 2>&1; echo $? > "$TMP_ROOT/race.$i.rc") &
 done
 wait
-sends=$(cat "$TMP_ROOT"/race.? | grep -c '^send$' || true)
-[ "$sends" = 1 ] || fail "exactly one of six simultaneous summaries should send, got $sends"
-pass "summary gate: six simultaneous summaries send exactly once"
+sends=0
+for i in $(seq 1 24); do
+  out=$(cat "$TMP_ROOT/race.$i"); rc=$(cat "$TMP_ROOT/race.$i.rc")
+  case "$out/$rc" in
+    send/0) sends=$((sends + 1)) ;;
+    suppress/1) ;;
+    *) fail "simultaneous caller $i broke the contract: '$out' exit $rc" ;;
+  esac
+done
+[ "$sends" = 1 ] || fail "exactly one of 24 simultaneous summaries should send, got $sends"
+[ ! -d "$HOME_DIR/state/.summary-gate.lock" ] || fail "the lock must be released after the race"
+pass "summary gate: 24 simultaneous summaries send exactly once and every caller gets send/0 or suppress/1"
+
+# 4b. A mark dated in the future (clock step back, a test clock) never mutes summaries.
+printf '%s\n' "$((T0 + 99999999))" > "$HOME_DIR/state/.last-summary"
+gate "$T0" decide summary
+expect_code 0 "$CODE" "a future-dated mark counts as no summary yet"
+assert_equals send "$OUT" "a future-dated mark sends"
+assert_equals "$T0" "$(cat "$HOME_DIR/state/.last-summary")" "and is replaced by the real time"
+printf '%s\n' "$((T0 + 99999999))" > "$HOME_DIR/state/.last-summary"
+gate "$T0" status
+assert_contains "$OUT" 'last-summary: never' "status reads a future-dated mark as never"
+pass "summary gate: a mark in the future is ignored, not obeyed for decades"
+
+# 4c. A stale lock left by a dead holder is stolen, and a held fresh lock is not.
+rm -f "$HOME_DIR/state/.last-summary"
+mkdir "$HOME_DIR/state/.summary-gate.lock"
+touch -t 202001010000 "$HOME_DIR/state/.summary-gate.lock"
+gate "$T0" decide summary
+expect_code 0 "$CODE" "a stale lock is stolen: $OUT"
+pass "summary gate: a stale lock from a dead holder is stolen"
 
 # 5. Errors are never a silent suppress.
 gate "$T0" decide nonsense
