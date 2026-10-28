@@ -28,6 +28,9 @@
 #      every change; there is no force path here, and nothing is deleted, so
 #      cleanup (bin/fm-teardown.sh) stays a separate, later step.
 #
+# A closed worker keeps its worktree and task record, so `bin/fm-control.sh <id>
+# relaunch` can bring an agent back if the work needs another round.
+#
 # Output is one line per worker: `candidate`, `closed`, or `skipped` followed by
 # the task id and the reason or log path. Exit 0 when every candidate was closed
 # or there was none, 1 when a worker was skipped or a close failed, 2 on usage
