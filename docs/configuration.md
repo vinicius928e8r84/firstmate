@@ -887,6 +887,22 @@ With the flag absent the wedge timer spends no read for it and keeps the unchang
 The flag is a home-local supervision-noise preference and is not inherited by secondmate homes.
 [`architecture.md`](architecture.md) owns the wait-evidence contract and `bin/fm-classify-lib.sh`'s `status_worker_wait_verb` owns which lines count.
 
+## Open-decision reminders (config/open-decision-reminders)
+
+The optional local, gitignored `config/open-decision-reminders` presence flag enables a default-off watcher backstop for unanswered keyed `needs-decision` and `blocked` records.
+On each poll, the watcher queues at most one `check: open decision overdue: <task> key=<key> age=<seconds>s` wake for the oldest eligible overdue key, independently of pane state or supervision-branch classification.
+Declared `paused:` waits and tasks already held for the captain are exempt.
+Resolving a key stops its reminders, and a later opening starts a new reminder episode.
+Only explicit keys with valid source `[at=<epoch>]` timestamps can be aged.
+
+`FM_OPEN_DECISION_OVERDUE_SECS` defaults to `1800` seconds.
+Repeats start at that interval, double after each repeat, and cap at `FM_OPEN_DECISION_BACKOFF_MAX_SECS`, which defaults to `14400` seconds.
+Both settings must be canonical positive integers of at most nine digits, with the cap at least the threshold.
+Invalid settings stop the watcher with an error when the flag is present.
+Pass them in the watcher's environment, or export them in `config/watch.env` for watchers started through `bin/fm-watch-arm.sh`.
+The flag is home-local and is not inherited by secondmate homes.
+`bin/fm-watch.sh`'s `open_decision_reminder_tick` owns the per-key schedule, which persists across watcher restarts.
+
 ## Validating-run deferral (config/wedge-defer-validating)
 
 The optional local, gitignored `config/wedge-defer-validating` presence flag opts this home into a default-off deferral in the watcher's wedge timer.
