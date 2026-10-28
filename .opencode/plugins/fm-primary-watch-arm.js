@@ -50,14 +50,45 @@ function setArmStatus(status) {
   armStatus = status;
 }
 
-function waitForArmReady(armChild) {
+// Extra milliseconds a loaded host may need beyond the fixed ready timeout: the
+// arm stretches its confirmation window with the load and may back off before
+// launching (bin/fm-watch-arm.sh "Load back-off"). bin/fm-arm-budget.sh owns the
+// number; 0 when it is unavailable or the host is unloaded.
+async function armLoadBudgetMs(paths) {
+  const query = runProcess("bash", [`${paths.root}/bin/fm-arm-budget.sh`], {
+    cwd: paths.root,
+    env: { ...process.env, FM_HOME: paths.home, FM_STATE_OVERRIDE: paths.state, FM_CONFIG_OVERRIDE: paths.config, FM_ROOT_OVERRIDE: paths.root },
+  });
+  const bound = new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 5000);
+    timer.unref();
+  });
+  const result = await Promise.race([query, bound]);
+  if (!result || result.code !== 0) return 0;
+  const seconds = Number(result.stdout.trim());
+  return Number.isInteger(seconds) && seconds > 0 ? seconds * 1000 : 0;
+}
+
+function waitForArmReady(armChild, paths) {
   const readiness = armReadiness.get(armChild);
   if (!readiness) return Promise.resolve("failed");
-  const timeout = armHostMode.get(armChild) ? HOST_READY_TIMEOUT_MS : ARM_READY_TIMEOUT_MS;
+  const base = armHostMode.get(armChild) ? HOST_READY_TIMEOUT_MS : ARM_READY_TIMEOUT_MS;
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve("timeout"), timeout);
+    const startedAt = Date.now();
+    let settled = false;
+    let timer = setTimeout(() => resolve("timeout"), base);
     timer.unref();
+    // The load budget only ever extends the fixed timeout, so it is read beside
+    // the wait rather than before it: a start that fails fast is not delayed by
+    // the query.
+    void armLoadBudgetMs(paths).then((extraMs) => {
+      if (settled || extraMs <= 0) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => resolve("timeout"), Math.max(0, base + extraMs - (Date.now() - startedAt)));
+      timer.unref();
+    });
     void readiness.then((status) => {
+      settled = true;
       clearTimeout(timer);
       resolve(status);
     });
@@ -554,7 +585,7 @@ async function ensureArm(paths, sessionID, client, predecessorArmPid = "", inclu
   if (!armChild) {
     return armAttempt(launchResult.status, null, includeArmChild);
   }
-  return armAttempt(await waitForArmReady(armChild), armChild, includeArmChild);
+  return armAttempt(await waitForArmReady(armChild, paths), armChild, includeArmChild);
 }
 
 export const FmPrimaryWatchArm = async ({ client, directory, worktree }) => {

@@ -579,6 +579,72 @@ EOF
   pass ".omp watch extension: fm_watch_arm_omp arms once, repeats as a no-op, and delivers an actionable close as one follow-up"
 }
 
+# The omp twin of test_pi_ready_timeout_honors_the_arm_load_budget: the fixed
+# ready timeout must not terminate a successor that is slow only because the
+# host is loaded, so the extension adds bin/fm-arm-budget.sh's seconds to it.
+test_watch_extension_honors_the_arm_load_budget() {
+  local repo home log out status budget
+  for budget in with without; do
+    repo="$TMP_ROOT/budget-$budget/repo"; home="$TMP_ROOT/budget-$budget/home"; log="$TMP_ROOT/budget-$budget/arm.log"
+    install_omp_extension_fixture "$repo"
+    mkdir -p "$home/state"
+    cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+if [ "$count" -eq 1 ]; then
+  printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+  printf 'signal: synthetic wake\n'
+  exit 0
+fi
+trap 'exit 0' TERM INT
+sleep 2.5 &
+wait $!
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
+SH
+    chmod +x "$repo/bin/fm-watch-arm.sh"
+    if [ "$budget" = with ]; then
+      printf '#!/usr/bin/env bash\necho 4\n' > "$repo/bin/fm-arm-budget.sh"
+      chmod +x "$repo/bin/fm-arm-budget.sh"
+    fi
+    out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$TMP_ROOT/budget-$budget.stop" FM_BUDGET_CASE="$budget" \
+      FM_OMP_ARM_READY_TIMEOUT_MS=1000 FM_WATCH_ARM_RETIRE_TIMEOUT_MS=1000 FM_WATCH_REARM_RETRY_LIMIT=1 FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 \
+      EXT="$repo/.omp/extensions/fm-primary-omp-watch.ts" node --input-type=module 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+import { readFileSync, writeFileSync } from "node:fs";
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const handlers = new Map(); let tool = null; const sent = [];
+const pi = {
+  on(e, h) { handlers.set(e, h); },
+  registerCommand() {},
+  registerTool(t) { tool = t; },
+  sendUserMessage(m, o) { sent.push({ m, o }); return undefined; },
+};
+const mod = await import(pathToFileURL(process.env.EXT).href);
+mod.default(pi);
+await tool.execute();
+for (let i = 0; i < 600 && !sent.some((x) => x.m.includes("synthetic wake")); i += 1) {
+  await new Promise((r) => setTimeout(r, 20));
+}
+const all = sent.map((x) => x.m).join(" | ");
+const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").length;
+const failed = all.includes("could not restore watcher continuity");
+const withBudget = process.env.FM_BUDGET_CASE === "with";
+if (!all.includes("synthetic wake")) throw new Error(`the wake never surfaced: ${all}`);
+if (withBudget && (failed || rows !== 2)) throw new Error(`a slow successor inside its load budget was given up on (rows ${rows}): ${all}`);
+if (!withBudget && !failed) throw new Error(`without a budget the 1s ready timeout must still apply: ${all}`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+process.exit(0);
+EOF
+)
+    status=$?
+    expect_code 0 "$status" "omp ready timeout (budget $budget): $out"
+    [ -z "$out" ] || fail "omp load-budget test printed output: $out"
+  done
+  pass ".omp watch extension waits out the arm's load budget before it terminates an unready arm"
+}
+
 # An opted-in home spawns the supervision host in the arm's place; its streamed
 # status line drives readiness and the handling handoff, and a handed-back
 # wake is delivered with every host line and the away note.
@@ -872,6 +938,7 @@ test_control_composer_and_model_tables
 test_ownership_proof_is_omp_keyed
 test_turnend_guard_extension_compels_one_continuation
 test_watch_extension_arms_and_delivers
+test_watch_extension_honors_the_arm_load_budget
 test_watch_extension_runs_the_supervision_host
 test_watch_extension_runs_the_supervision_host quiet
 test_watch_extension_keeps_the_arm_without_the_file_or_with_off

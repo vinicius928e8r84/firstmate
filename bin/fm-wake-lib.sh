@@ -229,7 +229,7 @@ fm_arm_backoff_failures() {  # <state>
 fm_arm_backoff_seconds() {
   local failures=$1 base=${FM_ARM_BACKOFF_BASE:-5} cap=${FM_ARM_BACKOFF_CAP:-30} milli exp
   case "$base" in ''|*[!0-9]*) base=5 ;; esac
-  case "$cap" in ''|*[!0-9]*) cap=60 ;; esac
+  case "$cap" in ''|*[!0-9]*) cap=30 ;; esac
   [ "$failures" -ge 1 ] 2>/dev/null || { printf '0\n'; return 0; }
   milli=$(fm_load_milli)
   [ "$milli" -ge 1000 ] || { printf '0\n'; return 0; }

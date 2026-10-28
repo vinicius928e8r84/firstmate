@@ -427,6 +427,85 @@ EOF
   pass "Pi self-heal request restarts an exhausted cycle once and is idempotent"
 }
 
+# A loaded host stretches the arm's confirmation window, so a start that takes
+# longer than the adapter's fixed ready timeout is slow, not dead. The adapter
+# asks bin/fm-arm-budget.sh how much longer to wait and must not terminate the
+# successor arm (and spend its retry ladder) before that budget is spent. The
+# first arm delivers a wake and exits; its successor reports ready after 2.5s
+# against a 1s ready timeout, and the budget stub says 4s.
+test_pi_ready_timeout_honors_the_arm_load_budget() {
+  local repo home log out status budget
+  for budget in with without; do
+    repo="$TMP_ROOT/pi-load-budget-$budget-root"
+    home="$TMP_ROOT/pi-load-budget-$budget-home"
+    log="$TMP_ROOT/pi-load-budget-$budget.log"
+    rm -f "$log"
+    mkdir -p "$repo/bin" "$home/state" "$home/config"
+    install_pi_watch_extension_fixture "$repo"
+    cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+if [ "$count" -eq 1 ]; then
+  printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+  printf 'signal: synthetic wake\n'
+  exit 0
+fi
+trap 'exit 0' TERM INT
+sleep 2.5 &
+wait $!
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
+SH
+    chmod +x "$repo/bin/fm-watch-arm.sh"
+    if [ "$budget" = with ]; then
+      printf '#!/usr/bin/env bash\necho 4\n' > "$repo/bin/fm-arm-budget.sh"
+      chmod +x "$repo/bin/fm-arm-budget.sh"
+    fi
+    out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" \
+      FM_STOP_FILE="$TMP_ROOT/pi-load-budget-$budget.stop" FM_BUDGET_CASE="$budget" \
+      FM_PI_ARM_READY_TIMEOUT_MS=1000 FM_WATCH_ARM_RETIRE_TIMEOUT_MS=1000 FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 \
+      FM_WATCH_REARM_RETRY_LIMIT=1 FM_WATCH_SELFHEAL_ROUNDS=0 \
+      node --input-type=module 2>&1 <<'EOF'
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const prompts = [];
+const pi = {
+  on() {},
+  events: { on() {}, emit() {} },
+  registerCommand() {},
+  registerTool(candidate) { if (candidate.name === "fm_watch_arm_pi") tool = candidate; },
+  sendUserMessage: async (message) => { prompts.push(message); },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("load-budget", {}, undefined, undefined, {});
+for (let i = 0; i < 600 && !prompts.some((p) => p.includes("synthetic wake")); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+const all = prompts.join(" | ");
+const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").length;
+const failed = all.includes("could not restore watcher continuity");
+const withBudget = process.env.FM_BUDGET_CASE === "with";
+if (!all.includes("synthetic wake")) throw new Error(`the wake never surfaced: ${all}`);
+if (withBudget && (failed || rows !== 2)) {
+  throw new Error(`a slow successor inside its load budget was given up on (rows ${rows}): ${all}`);
+}
+if (!withBudget && !failed) throw new Error(`without a budget the 1s ready timeout must still apply: ${all}`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+process.exit(0);
+EOF
+)
+    status=$?
+    expect_code 0 "$status" "Pi ready timeout (budget $budget): $out"
+    [ -z "$out" ] || fail "Pi load-budget test printed output: $out"
+  done
+  pass "Pi extension waits out the arm's load budget before it terminates an unready arm"
+}
+
 test_pi_selfheal_request_is_refused_without_the_session_lock() {
   local repo home log stop out status
   repo="$TMP_ROOT/pi-selfheal-nolock-root"
@@ -5452,6 +5531,71 @@ EOF
   pass "OpenCode hung successor falls back to one typed actionable wake"
 }
 
+# The OpenCode twin of test_pi_ready_timeout_honors_the_arm_load_budget.
+test_opencode_ready_timeout_honors_the_arm_load_budget() {
+  local plugin repo home log out status budget
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  for budget in with without; do
+    repo="$TMP_ROOT/opencode-load-budget-$budget-root"
+    home="$TMP_ROOT/opencode-load-budget-$budget-home"
+    log="$TMP_ROOT/opencode-load-budget-$budget.log"
+    rm -f "$log"
+    mkdir -p "$repo/bin" "$home/state" "$home/config"
+    git init -q "$repo"
+    : > "$repo/AGENTS.md"
+    cp "$ROOT/bin/fm-supervision-lib.sh" "$repo/bin/fm-supervision-lib.sh"
+    : > "$home/state/task.meta"
+    cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+if [ "$count" -eq 1 ]; then
+  printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+  printf 'signal: synthetic wake\n'
+  exit 0
+fi
+trap 'exit 0' TERM INT
+sleep 2.5 &
+wait $!
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
+SH
+    chmod +x "$repo/bin/fm-watch-arm.sh"
+    if [ "$budget" = with ]; then
+      printf '#!/usr/bin/env bash\necho 4\n' > "$repo/bin/fm-arm-budget.sh"
+      chmod +x "$repo/bin/fm-arm-budget.sh"
+    fi
+    out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_STOP_FILE="$TMP_ROOT/opencode-load-budget-$budget.stop" FM_BUDGET_CASE="$budget" \
+      FM_OPENCODE_ARM_READY_TIMEOUT_MS=1000 FM_WATCH_ARM_RETIRE_TIMEOUT_MS=1000 FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 FM_WATCH_REARM_RETRY_LIMIT=1 node 2>&1 <<'EOF'
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+let prompt = "";
+const client = { session: { promptAsync: async (request) => { prompt += request.body.parts[0].text; } } };
+const hooks = await mod.FmPrimaryWatchArm({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+for (let i = 0; i < 600 && !prompt.includes("synthetic wake"); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").length;
+const failed = prompt.includes("could not restore watcher continuity");
+const withBudget = process.env.FM_BUDGET_CASE === "with";
+if (!prompt.includes("synthetic wake")) throw new Error(`the wake never surfaced: ${prompt}`);
+if (withBudget && (failed || rows !== 2)) throw new Error(`a slow successor inside its load budget was given up on (rows ${rows}): ${prompt}`);
+if (!withBudget && !failed) throw new Error(`without a budget the 1s ready timeout must still apply: ${prompt}`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+process.exit(0);
+EOF
+)
+    status=$?
+    expect_code 0 "$status" "OpenCode ready timeout (budget $budget): $out"
+    [ -z "$out" ] || fail "OpenCode load-budget test printed output: $out"
+  done
+  pass "OpenCode plugin waits out the arm's load budget before it terminates an unready arm"
+}
+
 test_opencode_unretired_successor_falls_back_without_retry() {
   local plugin repo home log release out status
   plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
@@ -6021,6 +6165,7 @@ test_pi_slow_inline_drain_under_the_default_cap_stays_inline
 test_pi_timed_out_inline_drain_falls_back_and_leaves_no_orphan_ack_file
 test_pi_selfheal_request_restarts_an_exhausted_cycle_once
 test_pi_selfheal_request_is_refused_without_the_session_lock
+test_pi_ready_timeout_honors_the_arm_load_budget
 test_pi_selfheal_rounds_recover_before_the_model_is_told
 test_pi_selfheal_rounds_surface_once_when_every_round_fails
 test_pi_selfheal_rounds_zero_keeps_the_original_failure
@@ -6082,6 +6227,7 @@ test_opencode_primary_watch_plugin_runs_the_supervision_host
 test_opencode_primary_watch_plugin_runs_the_supervision_host quiet
 test_opencode_pre_ready_actionable_close_preserves_its_successor
 test_opencode_hung_successor_falls_back_to_typed_wake
+test_opencode_ready_timeout_honors_the_arm_load_budget
 test_opencode_unretired_successor_falls_back_without_retry
 test_opencode_late_unretired_close_resumes_supervision
 test_opencode_empty_close_retries_instead_of_disappearing

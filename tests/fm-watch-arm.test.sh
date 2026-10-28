@@ -1858,6 +1858,57 @@ run_scripted_arm() {  # <case-dir> [env assignments...]
     "$dir/bin/fm-watch-arm.sh" ${SCRIPTED_ARM_ARGS:-} > "$dir/arm.out" 2>&1
 }
 
+# Adapter coupling (bin/fm-watch-arm.sh header, "Load back-off"): the Pi, omp and
+# OpenCode adapters kill an arm that is not ready within their own timeout and
+# allow it about a second to exit, so the arm must tell them how much longer
+# than its base window a start may take (--budget), and it must leave quickly
+# when terminated mid-start.
+arm_budget() {  # <fixture> [env assignments...]
+  local dir=$1; shift
+  env FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" FM_ARM_CONFIRM_TIMEOUT=10 "$@" "$dir/bin/fm-watch-arm.sh" --budget
+}
+
+test_arm_budget_reports_the_extra_seconds_a_loaded_start_may_take() {
+  local dir out
+  dir=$(make_scripted_watch_arm arm-budget 'exit 0')
+  mkdir -p "$dir/home/data"
+  out=$(arm_budget "$dir" FM_LOAD1_OVERRIDE=0.5 FM_NCPU_OVERRIDE=4)
+  [ "$out" = 0 ] || fail "an unloaded host must add no extra seconds, got: $out"
+  out=$(arm_budget "$dir" FM_LOAD1_OVERRIDE=16.0 FM_NCPU_OVERRIDE=4)
+  [ "$out" = 30 ] || fail "load 4/cpu stretches the 10s window to 40s, so the extra is 30s, got: $out"
+  printf '2 %s\n' "$(date +%s)" > "$dir/state/.watch-arm-backoff"
+  out=$(arm_budget "$dir" FM_LOAD1_OVERRIDE=16.0 FM_NCPU_OVERRIDE=4)
+  [ "$out" -ge 45 ] && [ "$out" -le 60 ] || fail "a pending 30s back-off must add to the extra window (up to 60s), got: $out"
+  [ ! -e "$dir/attempts" ] || fail "--budget launched a watcher"
+  pass "watch-arm: --budget tells an adapter how many extra seconds a loaded start may take"
+}
+
+test_arm_terminated_mid_start_exits_within_the_adapter_retire_window() {
+  local dir pid start elapsed i record
+  dir=$(make_scripted_watch_arm arm-term-mid-start 'sleep 60')
+  mkdir -p "$dir/home/data"
+  PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/state" FM_ARM_CONFIRM_TIMEOUT=10 \
+    FM_LOAD1_OVERRIDE=160.0 FM_NCPU_OVERRIDE=4 "$dir/bin/fm-watch-arm.sh" > "$dir/arm.out" 2>&1 &
+  pid=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$dir/attempts" ]; do sleep 0.1; i=$((i + 1)); done
+  [ -e "$dir/attempts" ] || fail "arm never launched its watcher: $(cat "$dir/arm.out")"
+  # The arm opens its cycle record right after the fork; let it, so the TERM
+  # lands in a started cycle rather than before one exists.
+  sleep 2
+  start=$(date +%s)
+  kill -TERM "$pid"
+  wait_for_exit "$pid" 400 > /dev/null 2>&1
+  elapsed=$(( $(date +%s) - start ))
+  # The window is stretched to its 120s cap here. The arm itself waits at most
+  # 0.5s; the ceiling leaves room for slow forks on a contended test host while
+  # still failing by a wide margin if the TERM waits out the window.
+  [ "$elapsed" -le 25 ] || fail "a TERM during a stretched (120s) start took ${elapsed}s to exit; adapters allow about 1s"
+  record=$(cat "$dir/state/.watch-arm-backoff" 2>/dev/null || true)
+  case "$record" in "1 "*) ;; *) fail "an arm killed before it confirmed a watcher must count as a failed start, got record: ${record:-none}" ;; esac
+  pass "watch-arm: TERM mid-start exits within the adapter retire window and counts as a failed start"
+}
+
 test_arm_retries_once_after_a_quick_exit_1() {
   local dir status
   dir=$(make_scripted_watch_arm arm-retry-recovers '[ "$n" -ge 2 ] || exit 1
@@ -2081,6 +2132,8 @@ test_backoff_grows_exponentially_scaled_by_load_per_cpu_and_is_capped() {
   [ "$seq" = "0 0 0" ] || fail "an unloaded host (load 0.5/cpu) must never back off, got: $seq"
   seq=$(FM_LOAD1_OVERRIDE=171.9 FM_NCPU_OVERRIDE=4 bash -c '. "$1/bin/fm-wake-lib.sh"; fm_arm_backoff_seconds 1; fm_arm_backoff_seconds 6' _ "$ROOT" | tr '\n' ' ')
   [ "$seq" = "30 30 " ] || fail "the default cap must be 30s under the captain's measured peak load, got: $seq"
+  seq=$(FM_ARM_BACKOFF_CAP=bogus FM_LOAD1_OVERRIDE=171.9 FM_NCPU_OVERRIDE=4 bash -c '. "$1/bin/fm-wake-lib.sh"; fm_arm_backoff_seconds 1' _ "$ROOT")
+  [ "$seq" = 30 ] || fail "a malformed cap must fall back to the 30s default, got: $seq"
   pass "watch-arm: back-off doubles per failure, scales with load per CPU, is capped, and is zero when unloaded"
 }
 
@@ -2155,3 +2208,5 @@ test_backoff_grows_exponentially_scaled_by_load_per_cpu_and_is_capped
 test_confirmation_window_stretches_with_load_and_is_capped
 test_arm_waits_between_failed_starts_under_load_and_clears_on_success
 test_arm_does_not_back_off_on_an_unloaded_host
+test_arm_budget_reports_the_extra_seconds_a_loaded_start_may_take
+test_arm_terminated_mid_start_exits_within_the_adapter_retire_window
