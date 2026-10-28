@@ -78,7 +78,7 @@
 # test overrides live in bin/fm-wake-lib.sh (fm_arm_backoff_*, fm_load_milli).
 # An arm terminated before it confirmed a watcher (an adapter that gave up on a
 # slow start) counts as one more failed start, and leaves within about
-# FM_ARM_TERM_WAIT_MS (default 500) however long its window is.
+# FM_ARM_TERM_WAIT_MS (default 200) plus its own cleanup, however long its window is.
 #
 # --budget: print the whole extra seconds a start may take beyond the base
 # FM_ARM_CONFIRM_TIMEOUT - the load stretch of the window plus any back-off still
@@ -198,11 +198,12 @@ case "$CONFIRM_TIMEOUT" in ''|*[!0-9]*) CONFIRM_TIMEOUT=$ARM_CONFIRM_DEFAULT ;; 
 BASE_CONFIRM_TIMEOUT=$CONFIRM_TIMEOUT
 CONFIRM_TIMEOUT=$(fm_arm_confirm_window "$CONFIRM_TIMEOUT")
 # How long a TERM waits for a starting watcher to reach its cleanup-ready point,
-# in milliseconds (default 500): the Pi, omp and OpenCode adapters allow an arm
-# about one second to exit after they terminate it. Wall-clock, not a poll
-# count, because each poll forks and a loaded host makes polls slow.
-TERM_WAIT_MS=${FM_ARM_TERM_WAIT_MS:-500}
-case "$TERM_WAIT_MS" in ''|*[!0-9]*) TERM_WAIT_MS=500 ;; esac
+# in milliseconds (default 200): the Pi, omp and OpenCode adapters allow an arm
+# a few seconds to exit after they terminate it (FM_WATCH_ARM_RETIRE_TIMEOUT_MS),
+# and the rest of the handler costs a second or less on a busy host. Wall-clock,
+# not a poll count, because each poll forks and a loaded host makes polls slow.
+TERM_WAIT_MS=${FM_ARM_TERM_WAIT_MS:-200}
+case "$TERM_WAIT_MS" in ''|*[!0-9]*) TERM_WAIT_MS=200 ;; esac
 # shellcheck disable=SC2329 # Invoked indirectly by the signal handler below.
 now_ms() {
   if [ -n "${EPOCHREALTIME:-}" ]; then
