@@ -52,6 +52,11 @@ export FM_GATE_REFUSE_BYPASS=1
 # leaked harness pin alone stays inert outside a suite.
 export FM_TEST_SEAM=1
 
+# The host-memory floor on spawns (bin/fm-memory-floor-lib.sh) is a property of
+# the machine, not of the behavior a test pins, so the suite runs with it off;
+# tests/fm-memory-floor.test.sh sets its own floor to cover the refusal.
+export FM_SPAWN_MIN_FREE_MB=0
+
 # Clear the task-worker marker bin/fm-spawn.sh exports into ship and scout
 # panes. This suite builds git-init fixture repositories whose primary checkout
 # it runs a copied bin/fm-test-run.sh in, and that runner refuses the primary

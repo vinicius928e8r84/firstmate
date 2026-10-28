@@ -1487,6 +1487,14 @@ A malformed or unreadable file refuses every fresh ship or scout spawn until it 
 Firstmate cannot see which part of a worker's life uses the resource, so the number bounds whole workers from launch to handoff, and the tightest resource every worker needs should decide it.
 [`bin/fm-project-capacity-lib.sh`](../bin/fm-project-capacity-lib.sh) owns the file format, what holds a place, and why concurrent spawns cannot both take the last one.
 
+## Memory floor (FM_SPAWN_MIN_FREE_MB)
+
+`bin/fm-spawn.sh` refuses to open any new agent session - a ship, a scout, a secondmate, or a relaunch - while the host has less than 2048 MB of available memory, because every extra session on a memory-starved host slows the whole fleet and starves the supervision watcher.
+The refusal prints one `error: spawn refused:` line and exits 76 before a brief, endpoint, worktree, record, or backlog move exists, so the task stays exactly as queued as it was; a batch reports the pair as `batch: DEFERRED` and exits 76 when nothing else failed.
+Free memory by closing finished workers with `bin/fm-close-done.sh`, then dispatch again.
+`FM_SPAWN_MIN_FREE_MB` in the environment changes the floor in megabytes, and `0` turns it off; a host whose figure cannot be read is not blocked.
+[`bin/fm-memory-floor-lib.sh`](../bin/fm-memory-floor-lib.sh) owns the probe and the override, and the test suite runs with the floor off.
+
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
 `config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.

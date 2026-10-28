@@ -218,6 +218,12 @@
 #   A batch reports such a pair as `batch: DEFERRED` and exits 75 when nothing
 #   else failed. A relaunch and a --secondmate spawn are never counted against
 #   capacity.
+#   Memory floor: every launch kind, a relaunch and a --secondmate spawn
+#   included, refuses with exit 76 and one `error: spawn refused:` line before
+#   anything is created when the host has less than 2048 MB of available memory
+#   (bin/fm-memory-floor-lib.sh owns the probe; FM_SPAWN_MIN_FREE_MB overrides
+#   the floor, 0 turns it off). A batch reports such a pair as `batch: DEFERRED`
+#   and exits 76 when nothing else failed.
 #   With no harness arg, a crewmate/scout spawn resolves the CREW harness only when
 #   config/crew-dispatch.json is absent. When that file exists, crewmate/scout
 #   spawns require an explicit harness so firstmate cannot silently skip dispatch
@@ -865,6 +871,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-project-capacity-lib.sh"
 # shellcheck source=bin/fm-worker-account-lib.sh
 . "$SCRIPT_DIR/fm-worker-account-lib.sh"
+# shellcheck source=bin/fm-memory-floor-lib.sh
+. "$SCRIPT_DIR/fm-memory-floor-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -1903,7 +1911,10 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
     [ "$KIND" != scout ] || pair_args+=(--scout)
     pair_rc=0
     FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "${pair_args[@]}" || pair_rc=$?
-    if [ "$pair_rc" -eq "$FM_PROJECT_CAPACITY_DEFER_EXIT" ]; then
+    if [ "$pair_rc" -eq "$FM_MEMORY_FLOOR_EXIT" ]; then
+      echo "batch: DEFERRED ${pair%%=*} (${pair#*=}) - the host is below its free-memory floor, so it stays queued" >&2
+      [ "$rc" -ne 0 ] || rc=$FM_MEMORY_FLOOR_EXIT
+    elif [ "$pair_rc" -eq "$FM_PROJECT_CAPACITY_DEFER_EXIT" ]; then
       echo "batch: DEFERRED ${pair%%=*} (${pair#*=}) - its project is at capacity, so it stays queued" >&2
       [ "$rc" -ne 0 ] || rc=$FM_PROJECT_CAPACITY_DEFER_EXIT
     elif [ "$pair_rc" -ne 0 ]; then
@@ -1918,6 +1929,11 @@ fm_task_id_creation_valid "$ID" || {
   echo "error: invalid task id" >&2
   exit 2
 }
+# Memory floor (bin/fm-memory-floor-lib.sh): checked before any brief render,
+# endpoint, worktree, record, or backlog move exists, for every launch kind
+# including a relaunch and a secondmate, so a refusal leaves the task exactly as
+# queued as it was.
+fm_memory_floor_check "task $ID" || exit $?
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = ship ]; then
   BRANCH="$BRANCH_PREFIX$ID"
   if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
