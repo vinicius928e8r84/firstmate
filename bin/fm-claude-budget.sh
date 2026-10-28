@@ -143,7 +143,10 @@ write_state() {  # key=value lines on stdin
   local tmp
   mkdir -p "$STATE" || die "cannot create $STATE"
   tmp=$(mktemp "$STATE/.claude-budget.XXXXXX") || die "cannot write $STATE"
-  cat > "$tmp" && mv "$tmp" "$STATE_FILE" || { rm -f "$tmp"; die "cannot write $STATE_FILE"; }
+  if ! { cat > "$tmp" && mv "$tmp" "$STATE_FILE"; }; then
+    rm -f "$tmp"
+    die "cannot write $STATE_FILE"
+  fi
 }
 
 prev_above=$(state_get above_budget)
