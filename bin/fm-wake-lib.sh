@@ -255,6 +255,7 @@ fm_arm_backoff_remaining() {
   wait=$(fm_arm_backoff_seconds "$failures")
   [ "$wait" -gt 0 ] || { printf '0\n'; return 0; }
   epoch=$(awk '{print $2}' "$1/.watch-arm-backoff" 2>/dev/null)
+  case "$epoch" in ''|*[!0-9]*) printf '0\n'; return 0 ;; esac
   left=$((wait - ($(date +%s) - epoch)))
   [ "$left" -gt 0 ] || left=0
   printf '%s\n' "$left"
