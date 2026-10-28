@@ -1212,7 +1212,7 @@ fm_pending_reply_close_escalation() {  # <state-dir> <corr_id>
 
 _fm_pending_reply_close_escalation_locked() {  # <state-dir> <corr_id>
   local state=$1 corr=$2 rec escalated closed parent_status escalation key note
-  local open_line open_key open_note now close_line close_rc _task _via
+  local open_line open_key open_note now close_line close_rc _task _via _reason
   rec=$(fm_pending_reply_path "$state" "$corr")
   [ -f "$rec" ] || return 1
   [ "$(fm_pending_reply_get "$rec" phase)" = resolved ] || return 0
@@ -1240,7 +1240,8 @@ _fm_pending_reply_close_escalation_locked() {  # <state-dir> <corr_id>
       # OPEN above stays a plain append because a new blocker must wake.
       _task=$(fm_pending_reply_get "$rec" task_id)
       _via=$(fm_pending_reply_get "$rec" resolved_via)
-      close_line="resolved [key=${key}]: $(fm_pending_reply_resolved_note "$_task" "$corr" "$_via")"
+      _reason=$(fm_pending_reply_get "$rec" ghost_reason)
+      close_line="resolved [key=${key}]: $(fm_pending_reply_resolved_note "$_task" "$corr" "$_via" "${_reason:+reason=$_reason}")"
       close_rc=0
       fm_wake_status_append_self_announced "${parent_status%/*}" "$parent_status" "$close_line" \
         2>/dev/null || close_rc=$?
@@ -1697,4 +1698,118 @@ fm_pending_reply_task_has_open() {  # <state-dir> <task_id>
     return 0
   done
   return 1
+}
+
+# --- ghost pending-reply close -----------------------------------------------
+#
+# A pending-reply record whose endpoint is gone (the task has no recorded
+# metadata, its local agent is dead or missing, or its remote host cannot be
+# reached) can never receive the correlated report that resolves it, so its
+# escalation decision stays open forever. fm_pending_reply_close_ghost is the
+# guarded operator close for exactly that case: it refuses without a reason,
+# refuses an already-resolved record, refuses while the endpoint is live, and
+# otherwise resolves the record via=ghost-close and closes the keyed decision
+# through the one close path above, whose note is
+# fm_pending_reply_resolved_note (the reserved-key vocabulary the fold
+# accepts), with the operator's reason appended. Entry point:
+# bin/fm-pending-reply-close-ghost.sh.
+#
+# FM_PENDING_REPLY_REMOTE_PROBE optionally replaces the default
+# `ssh -o BatchMode=yes -o ConnectTimeout=8 <host> true` reachability probe of
+# a remote secondmate's host (tests); it receives the host as $1 and exit 0
+# means reachable.
+
+# Prints live | ghost:<why> for the endpoint of <task_id> recorded in <state-dir>.
+fm_pending_reply_endpoint_verdict() {  # <state-dir> <task_id>
+  local state=$1 task_id=$2 meta host backend target agent
+  meta="$state/$task_id.meta"
+  if [ ! -f "$meta" ]; then
+    printf 'ghost:no endpoint record (%s.meta) for this task' "$task_id"
+    return 0
+  fi
+  host=$(fm_meta_get "$meta" remote_host)
+  if [ -n "$host" ]; then
+    if [ -n "${FM_PENDING_REPLY_REMOTE_PROBE:-}" ]; then
+      if "$FM_PENDING_REPLY_REMOTE_PROBE" "$host" >/dev/null 2>&1; then
+        printf 'live'
+      else
+        printf 'ghost:remote host %s is unreachable' "$host"
+      fi
+    elif ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" true >/dev/null 2>&1 </dev/null; then
+      printf 'live'
+    else
+      printf 'ghost:remote host %s is unreachable' "$host"
+    fi
+    return 0
+  fi
+  backend=$(fm_backend_of_meta "$meta")
+  target=$(fm_backend_target_of_meta "$meta")
+  agent=$(fm_backend_agent_state "$backend" "$target" 2>/dev/null || true)
+  case "$agent" in
+    dead|missing) printf 'ghost:local agent is %s' "$agent" ;;
+    *) printf 'live' ;;
+  esac
+}
+
+# 0 closed (or already closed), 1 refused or failed; the reason is printed on
+# stderr. Serialized per correlation like every resolve and escalation.
+fm_pending_reply_close_ghost() {  # <state-dir> <corr_id> <reason>
+  local state=$1 corr=$2 reason=$3 rec phase task_id verdict key parent_status now still rc=0
+  local STATE FM_WAKE_QUEUE FM_WAKE_QUEUE_LOCK lock
+  reason=$(printf '%s' "$reason" | tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177' | sed 's/^ *//; s/ *$//')
+  if [ -z "$reason" ]; then
+    echo "error: a non-empty --reason is required to close a ghost pending reply" >&2
+    return 1
+  fi
+  reason=$(printf '%s' "$reason" | cut -c1-160)
+  case "$corr" in
+    *[!A-Fa-f0-9]*|'') echo "error: '$corr' is not a pending-reply correlation id" >&2; return 1 ;;
+  esac
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  if [ ! -f "$rec" ]; then
+    echo "error: no pending-reply record $corr under $state" >&2
+    return 1
+  fi
+  task_id=$(fm_pending_reply_get "$rec" task_id)
+  parent_status=$(fm_pending_reply_get "$rec" parent_status)
+  key=$(fm_pending_reply_escalation_key "$corr")
+  phase=$(fm_pending_reply_get "$rec" phase)
+  verdict=$(fm_pending_reply_endpoint_verdict "$state" "$task_id")
+  case "$verdict" in
+    ghost:*) ;;
+    *)
+      echo "error: refusing to close pending reply $corr: the endpoint of task '$task_id' is live and resolvable, so the request can still be answered; resend or wait instead" >&2
+      return 1
+      ;;
+  esac
+  STATE=$state
+  lock="$state/.pending-reply-$corr.lock"
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$_FM_PENDING_REPLY_LIB_DIR/fm-wake-lib.sh"
+  fm_lock_acquire_wait "$lock" || { echo "error: could not lock pending reply $corr" >&2; return 1; }
+  if [ "$phase" != resolved ]; then
+    now=$(fm_pending_reply_now)
+    fm_pending_reply_set "$rec" ghost_reason "$reason" &&
+      fm_pending_reply_set "$rec" phase resolved &&
+      fm_pending_reply_set "$rec" resolved_epoch "$now" &&
+      fm_pending_reply_set "$rec" resolved_via ghost-close || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    _fm_pending_reply_close_escalation_locked "$state" "$corr" || rc=1
+  fi
+  fm_lock_release "$lock"
+  if [ "$rc" -ne 0 ]; then
+    echo "error: closing ghost pending reply $corr failed; the record is resolved but its escalation close is retried by the watcher tick" >&2
+    return 1
+  fi
+  if [ -n "$parent_status" ] && [ -f "$parent_status" ]; then
+    still=$(status_open_decisions "$parent_status")
+    case "$still" in
+      "$key"$'\t'* | *$'\n'"$key"$'\t'*)
+        echo "error: decision $key is still open in $parent_status after the close; the fold did not accept it" >&2
+        return 1
+        ;;
+    esac
+  fi
+  return 0
 }

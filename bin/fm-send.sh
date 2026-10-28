@@ -49,7 +49,10 @@
 # "was the message acted on" is, and that is answered asynchronously for an
 # ordinary record by the worker's acknowledgement move into handled/.
 # bin/fm-task-inbox-lib.sh owns the record format, doorbell line, and retry and
-# escalation policy for ordinary and fire-and-forget records.
+# escalation policy for ordinary and fire-and-forget records. It also owns the
+# delivery receipts: each ordinary steer is recorded as sent here, the worker's
+# handled/ move is its read confirmation, and a steer still unread after 10
+# minutes is re-sent exactly once by the watcher, which warns main.
 # The composer pre-check before the ring is ADVISORY only: when
 # the composer visibly holds pending text the ring is skipped with a notice and
 # the watcher re-rings an ordinary record later; no composer verdict is
@@ -1048,6 +1051,11 @@ else
       exit 1
     fi
     fm_lock_release "$INBOX_META_LOCK"
+    # Delivery receipt (bin/fm-task-inbox-lib.sh): the steer is now owed a read
+    # confirmation. A failed receipt write never fails the delivered steer; it
+    # only leaves this one record outside the 10-minute unread check.
+    fm_task_inbox_receipt_sent "$STATE" "$INBOX_TASK_ID" "$INBOX_RECORD" ||
+      echo "notice: the steer was recorded at $INBOX_RECORD, but its delivery receipt could not be written, so its unread check is off. Do not resend." >&2
     # Enqueue IS durable delivery to the task's record: mark the pending
     # expectation delivered now, without resolving it - only a correlated
     # parent report acknowledges the request.

@@ -29,6 +29,13 @@
 #   7. A fire-and-forget record stays outside the ladder, but one whose first
 #      ring did not land gets exactly one retry ring and never escalates. The
 #      retry waits while the worker has an open decision of its own.
+#   8. Delivery receipts: a sent steer reads unread until its handled/ move,
+#      an unread steer is due its one resend exactly at the receipt window on a
+#      fake clock and never a second one, a fire-and-forget or receipt-less
+#      record is never tracked, and a real watcher re-sends an unread steer
+#      once, rings the new record, and warns firstmate with a check wake. The
+#      quiet verdicts (inside the window, after a read) are pinned on the
+#      library, where a missed poll cannot make them pass vacuously.
 set -u
 
 # shellcheck source=tests/wake-helpers.sh
@@ -1198,6 +1205,80 @@ test_fire_and_forget_retry_is_quiet_without_the_flag
 test_ring_ladder_policy
 test_watcher_rerings_idle_pane_quietly
 test_watcher_waits_on_busy_pane
+
+# A fake clock drives the receipt window: the receipt epoch is stamped from
+# FM_TASK_INBOX_NOW, so no case sleeps for ten minutes.
+test_receipts_resend_once_on_a_fake_clock() {
+  local state rec action new status body
+  state="$TMP_ROOT/receipts/state"; mkdir -p "$state"
+  rec=$(inbox_lib "$state" fm_task_inbox_write "$state" t1 $'first line\nsecond line')
+  FM_TASK_INBOX_NOW=1000 inbox_lib "$state" fm_task_inbox_receipt_sent "$state" t1 "$rec" \
+    || fail "the sent receipt was not written"
+  status=$(inbox_lib "$state" fm_task_inbox_receipt_status "$state" t1 "${rec##*/}")
+  [ "$status" = unread ] || fail "a fresh steer should report unread, got: $status"
+  action=$(FM_TASK_INBOX_NOW=1599 inbox_lib "$state" fm_task_inbox_receipt_due "$state" t1)
+  [ "$action" = quiet ] || fail "one second before the window nothing is due, got: $action"
+  action=$(FM_TASK_INBOX_NOW=1600 inbox_lib "$state" fm_task_inbox_receipt_due "$state" t1)
+  [ "$action" = "resend $rec" ] || fail "at ten minutes the steer is due its resend, got: $action"
+  new=$(FM_TASK_INBOX_NOW=1600 inbox_lib "$state" fm_task_inbox_receipt_resend "$state" t1 "$rec") \
+    || fail "the resend failed"
+  [ "$new" = "$state/t1.inbox/002.msg" ] || fail "the resend should be a new record, got: $new"
+  body=$(inbox_lib "$state" fm_task_inbox_body "$new")
+  case "$body" in
+    "[Firstmate resend: 001.msg "*$'\n'"first line"$'\n'"second line") ;;
+    *) fail "the resend should carry a notice and the exact original body, got: $body" ;;
+  esac
+  action=$(FM_TASK_INBOX_NOW=999999 inbox_lib "$state" fm_task_inbox_receipt_due "$state" t1)
+  [ "$action" = quiet ] || fail "the one resend is spent; got another: $action"
+  [ "$(grep -c '^resent' "$state/t1.inbox/.receipts")" = 1 ] || fail "exactly one resent receipt expected"
+  # The worker reads both: each move is recorded as a read receipt, once.
+  mv "$rec" "$new" "$state/t1.inbox/handled/"
+  FM_TASK_INBOX_NOW=1700 inbox_lib "$state" fm_task_inbox_receipt_observe "$state" t1
+  FM_TASK_INBOX_NOW=1800 inbox_lib "$state" fm_task_inbox_receipt_observe "$state" t1
+  [ "$(grep -c '^read' "$state/t1.inbox/.receipts")" = 2 ] || fail "each record should read exactly once:"$'\n'"$(cat "$state/t1.inbox/.receipts")"
+  grep -q $'^read\t001.msg\t1700$' "$state/t1.inbox/.receipts" || fail "the read receipt should carry the observation time"
+  status=$(inbox_lib "$state" fm_task_inbox_receipt_status "$state" t1 001.msg)
+  [ "$status" = read ] || fail "a handled steer should report read, got: $status"
+  pass "inbox: an unread steer is re-sent exactly once at ten minutes on a fake clock and reads once handled"
+}
+
+test_receipts_skip_untracked_records() {
+  local state ff plain action
+  state="$TMP_ROOT/receipts-skip/state"; mkdir -p "$state"
+  ff=$(inbox_lib "$state" fm_task_inbox_write "$state" t1 "background" fire-and-forget)
+  FM_TASK_INBOX_NOW=1000 inbox_lib "$state" fm_task_inbox_receipt_sent "$state" t1 "$ff"
+  [ ! -e "$state/t1.inbox/.receipts" ] || fail "a fire-and-forget record must get no receipt"
+  plain=$(inbox_lib "$state" fm_task_inbox_write "$state" t1 "written without fm-send")
+  action=$(FM_TASK_INBOX_NOW=999999 inbox_lib "$state" fm_task_inbox_receipt_due "$state" t1)
+  [ "$action" = quiet ] || fail "a record with no sent receipt is not tracked, got: $action ($plain)"
+  pass "inbox: fire-and-forget and receipt-less records are never re-sent by the receipt check"
+}
+
+test_watcher_resends_unread_steer_once_and_warns() {
+  local dir state out log pid rec rings
+  dir=$(setup_watch_case receipt-resend)
+  state="$dir/state"; out="$dir/watch.out"; log="$dir/send.log"; : > "$log"
+  rec=$(inbox_lib "$state" fm_task_inbox_write "$state" t1 "please continue")
+  FM_TASK_INBOX_NOW=1000 inbox_lib "$state" fm_task_inbox_receipt_sent "$state" t1 "$rec"
+  # The watcher runs on a clock ten minutes later; the ladder stays out of the
+  # way (fresh record, long grace) so only the receipt check can act.
+  watch_bg "$state" "$dir/fakebin" "$out" \
+    FM_SEND_LOG="$log" FM_FAKE_TMUX_CAPTURE="$(idle_capture "$dir")" \
+    FM_TASK_INBOX_NOW=1600 FM_TASK_INBOX_GRACE_SECS=99999
+  pid=$!
+  wait_watcher_gone "$pid" 1800 \
+    || { kill "$pid" 2>/dev/null; fail "the watcher never re-sent the unread steer"; }
+  [ -f "$state/t1.inbox/002.msg" ] || fail "the unread steer was not re-sent as a new record"
+  [ ! -e "$state/t1.inbox/003.msg" ] || fail "the steer must be re-sent exactly once"
+  rings=$(grep -cF 'Firstmate instruction waiting' "$log" || true)
+  [ "$rings" = 1 ] || fail "the resend should ring the doorbell once, got $rings:"$'\n'"$(cat "$log")"
+  grep -qF 'check: steer unread: t1' "$state/.wake-queue" \
+    || fail "firstmate should be warned with a check wake:"$'\n'"$(cat "$state/.wake-queue" 2>/dev/null)"
+  grep -qF 'check:' "$out" || fail "the watcher should exit through a check wake:"$'\n'"$(cat "$out")"
+  [ "$(grep -c '^resent' "$state/t1.inbox/.receipts")" = 1 ] || fail "exactly one resent receipt expected"
+  pass "watcher: an unread steer is re-sent once after ten minutes, rung, and warned to firstmate"
+}
+
 test_watcher_busy_budget_resets_on_ring_and_ack
 test_watcher_busy_bookkeeping_failure_surfaces
 test_watcher_successor_busy_reset_failure_surfaces idle
@@ -1228,3 +1309,6 @@ test_watcher_retry_keeps_a_newer_mark
 test_watcher_escalates_once_after_budget
 test_watcher_dead_pane_escalates_once_without_ringing
 test_watcher_dead_pane_ignores_stale_busy_state
+test_receipts_resend_once_on_a_fake_clock
+test_receipts_skip_untracked_records
+test_watcher_resends_unread_steer_once_and_warns
