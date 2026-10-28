@@ -189,6 +189,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-worker-account-lib.sh"
 # shellcheck source=bin/fm-exclude-tools-lib.sh
 . "$SCRIPT_DIR/fm-exclude-tools-lib.sh"
+# shellcheck source=bin/fm-memory-floor-lib.sh
+. "$SCRIPT_DIR/fm-memory-floor-lib.sh"
 
 POLL=${FM_CONTROL_POLL:-0.5}
 SETTLE_WAIT=${FM_CONTROL_SETTLE_WAIT:-5}
@@ -1158,6 +1160,10 @@ do_relaunch() {
 
   require_state_verified_backend relaunch
   resolve_relaunch_profile
+  # The replacement is a new session, so the memory floor (bin/fm-memory-floor-lib.sh)
+  # applies, and it is checked here, before the old agent stops: fm-spawn --relaunch
+  # checks it again, but by then the running agent is already gone.
+  fm_memory_floor_check "the relaunch of task $ID" || exit $?
 
   case "$KIND" in
     ship|scout)

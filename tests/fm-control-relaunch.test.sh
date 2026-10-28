@@ -929,6 +929,20 @@ test_signed_out_worker_account_pin_refuses_before_stop() {
   pass "fm-control relaunch: a signed-out worker account pin refuses before the old agent stops"
 }
 
+test_relaunch_below_the_memory_floor_refuses_before_the_agent_stops() {
+  local dir out rc id=rl-mem
+  dir=$(new_case mem-floor "$id")
+  add_ship_task "$dir" "$id" claude
+  cp "$dir/home/state/$id.meta" "$dir/meta-before"
+  out=$(FM_SPAWN_MIN_FREE_MB=999999999 run_control "$dir" "$id" relaunch --note "memory is short"); rc=$?
+  expect_code 76 "$rc" "a relaunch below the memory floor must exit with the floor's code"
+  assert_contains "$out" "spawn refused: only" "the refusal should name the memory floor"
+  [ "$(cat "$dir/fake/command")" = claude ] || fail "a memory-floor refusal must leave the running agent alone"
+  [ ! -s "$dir/fake/literal" ] || fail "a memory-floor refusal must send no lifecycle input"
+  cmp -s "$dir/meta-before" "$dir/home/state/$id.meta" || fail "a refused relaunch must leave the task record untouched"
+  pass "fm-control relaunch: the memory floor refuses before the old agent stops, not after"
+}
+
 test_worker_account_pin_follows_the_relaunch() {
   local dir out rc id=rl-acct
   dir=$(new_case acct "$id")
@@ -2989,6 +3003,7 @@ test_prefixed_recorded_harness_requires_explicit_replacement
 test_same_harness_relaunch_keeps_the_profile_axes
 test_native_ultra_relaunch_preserves_profile_and_rejects_before_stop
 test_signed_out_worker_account_pin_refuses_before_stop
+test_relaunch_below_the_memory_floor_refuses_before_the_agent_stops
 test_worker_account_pin_follows_the_relaunch
 test_secondmate_account_pin_follows_relaunch_and_refuses_before_stop
 test_pi_exclude_tools_follow_the_relaunch

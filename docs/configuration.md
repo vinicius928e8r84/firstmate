@@ -1493,6 +1493,8 @@ Firstmate cannot see which part of a worker's life uses the resource, so the num
 The refusal prints one `error: spawn refused:` line and exits 76 before a brief, endpoint, worktree, record, or backlog move exists, so the task stays exactly as queued as it was; a batch reports the pair as `batch: DEFERRED` and exits 76 when nothing else failed.
 Free memory by closing finished workers with `bin/fm-close-done.sh`, then dispatch again.
 `FM_SPAWN_MIN_FREE_MB` in the environment changes the floor in megabytes, and `0` turns it off; a host whose figure cannot be read is not blocked.
+A relaunch applies the same floor before it stops the running agent, so a refused relaunch leaves that agent working.
+A secondmate registered on another host is checked by that host's own spawn, not by this one.
 [`bin/fm-memory-floor-lib.sh`](../bin/fm-memory-floor-lib.sh) owns the probe and the override, and the test suite runs with the floor off.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)

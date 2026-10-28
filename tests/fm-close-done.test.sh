@@ -29,7 +29,7 @@ cp "$(command -v sleep)" "$AGENT_BIN"
 
 make_fixture() {  # <name>
   local dir=$TMP_ROOT/$1
-  mkdir -p "$dir/home/state" "$dir/home/data" "$dir/home/config" "$dir/crew"
+  mkdir -p "$dir/home/state" "$dir/home/data" "$dir/home/config" "$dir/crew" "$dir/hold"
   cp -R "$ROOT/bin" "$dir/bin"
   cat > "$dir/bin/fm-crew-state.sh" <<'SH'
 #!/usr/bin/env bash
@@ -41,23 +41,39 @@ echo "$1 $2" >> "$FM_FIXTURE/control.log"
 [ ! -e "$FM_FIXTURE/control-fails" ] || { echo "control refused" >&2; exit 1; }
 tmux kill-window -t "fixture:fm-$1"
 SH
-  chmod +x "$dir/bin/fm-crew-state.sh" "$dir/bin/fm-control.sh"
+  # `open <id> --distinguish-absent`: exit 0 held for the captain, 1 not held,
+  # 2 cannot tell, 3 absent (the answer when no fixture says otherwise).
+  cat > "$dir/bin/fm-captain-hold.sh" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = open ] || exit 9
+if [ -f "$FM_FIXTURE/hold/$2" ]; then exit "$(cat "$FM_FIXTURE/hold/$2")"; fi
+exit 3
+SH
+  chmod +x "$dir/bin/fm-crew-state.sh" "$dir/bin/fm-control.sh" "$dir/bin/fm-captain-hold.sh"
   printf '%s\n' "$dir"
 }
 
-# add_worker <fixture> <id> <kind> <crew-state-line> [dirty]
+# add_worker <fixture> <id> <kind> <crew-state-line> [dirty] [spawned-ago-seconds] [done-ago-seconds]
+# The agent was spawned <spawned-ago> seconds ago (default 100) and its last
+# `done` line was written <done-ago> seconds ago (default 50, i.e. after the
+# spawn); a done-ago above spawned-ago is a `done` left over from an earlier
+# incarnation.
 add_worker() {
-  local dir=$1 id=$2 kind=$3 line=$4 dirty=${5:-}
-  local wt=$dir/wt/$id
+  local dir=$1 id=$2 kind=$3 line=$4 dirty=${5:-} spawned_ago=${6:-100} done_ago=${7:-50}
+  local wt=$dir/wt/$id now
+  now=$(date +%s)
   mkdir -p "$wt"
   git -C "$wt" init -q
   git -C "$wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
   [ -z "$dirty" ] || echo changed > "$wt/leftover.txt"
-  tmux has-session -t fixture 2>/dev/null \
-    && tmux new-window -d -t fixture: -n "fm-$id" "exec '$AGENT_BIN' 600" \
-    || tmux new-session -d -s fixture -n "fm-$id" "exec '$AGENT_BIN' 600"
-  printf 'window=fixture:fm-%s\nworktree=%s\nproject=%s\nharness=pi\nkind=%s\nbackend=tmux\n' \
-    "$id" "$wt" "$dir/proj" "$kind" > "$dir/home/state/$id.meta"
+  if tmux has-session -t fixture 2>/dev/null; then
+    tmux new-window -d -t fixture: -n "fm-$id" "exec '$AGENT_BIN' 600"
+  else
+    tmux new-session -d -s fixture -n "fm-$id" "exec '$AGENT_BIN' 600"
+  fi
+  printf 'window=fixture:fm-%s\nworktree=%s\nproject=%s\nharness=pi\nkind=%s\nbackend=tmux\nspawn_gen=s%s.1.1\n' \
+    "$id" "$wt" "$dir/proj" "$kind" "$((now - spawned_ago))" > "$dir/home/state/$id.meta"
+  printf 'done [at=%s]: ready\n' "$((now - done_ago))" > "$dir/home/state/$id.status"
   printf '%s\n' "$line" > "$dir/crew/$id"
 }
 
@@ -104,10 +120,11 @@ test_close_saves_the_log_first_and_closes_through_fm_control_without_force() {
   [ "$(cat "$dir/control.log")" = "$(printf 'c-one exit\nc-two exit')" ] || fail "fm-control must be called once per worker, in order, with exit only: $(cat "$dir/control.log")"
   wait_agent_gone c-one || fail "c-one's agent is still open"
   wait_agent_gone c-two || fail "c-two's agent is still open"
-  log=$(ls "$dir"/home/data/c-one/session-log-*.txt 2>/dev/null | head -1)
+  log=$(find "$dir/home/data/c-one" -name 'session-log-*.txt' 2>/dev/null | head -1)
   [ -n "$log" ] && [ -s "$log" ] || fail "no session log was saved for c-one before closing"
   [ "$(stat -c %a "$log")" = 600 ] || fail "the session log must be private (0600), got $(stat -c %a "$log")"
-  grep -q '^closed c-one' "$dir/out" && grep -q '^closed c-two' "$dir/out" || fail "closed lines missing: $(cat "$dir/out")"
+  grep -q '^closed c-one' "$dir/out" || fail "closed line for c-one missing: $(cat "$dir/out")"
+  grep -q '^closed c-two' "$dir/out" || fail "closed line for c-two missing: $(cat "$dir/out")"
   [ -d "$dir/wt/c-one" ] && [ -d "$dir/home/state" ] && [ -f "$dir/home/state/c-one.meta" ] || fail "closing must not delete the worktree or the task record"
   pass "fm-close-done: saves each log first, then closes through fm-control exit, one at a time"
 }
@@ -158,6 +175,70 @@ test_a_failed_close_stops_the_run() {
   pass "fm-close-done: a failed close stops the run so cleanups stay one at a time"
 }
 
+test_a_done_from_before_a_relaunch_does_not_close_the_new_agent() {
+  local dir status
+  dir=$(make_fixture stale)
+  # Spawned 100s ago, but the only `done` line is 500s old: the previous round's.
+  add_worker "$dir" r-one ship "state: done · source: status-log · first round done" "" 100 500
+  run_close "$dir" r-one --close
+  status=$?
+  expect_code 1 "$status" "a stale done must not close a relaunched agent: $(cat "$dir/out")"
+  grep -q '^skipped r-one: .*predates' "$dir/out" || fail "the skip reason must say the done predates this agent: $(cat "$dir/out")"
+  [ ! -e "$dir/control.log" ] || fail "the relaunched agent was closed on a stale done"
+  tmux list-windows -t fixture -F '#{window_name}' | grep -qx fm-r-one || fail "the relaunched agent's window is gone"
+  printf 'done [at=%s]: second round done\n' "$(date +%s)" >> "$dir/home/state/r-one.status"
+  sleep 1
+  run_close "$dir" r-one --close
+  status=$?
+  expect_code 0 "$status" "a done written after the relaunch must close it: $(cat "$dir/out")"
+  grep -q '^closed r-one' "$dir/out" || fail "the new round's done did not close the agent: $(cat "$dir/out")"
+  pass "fm-close-done: a done older than the current agent is never trusted, a newer one is"
+}
+
+test_a_done_without_a_timestamp_is_not_trusted() {
+  local dir status
+  dir=$(make_fixture notime)
+  add_worker "$dir" n-one ship "state: done · source: status-log · ready"
+  printf 'done: ready with no timestamp\n' > "$dir/home/state/n-one.status"
+  run_close "$dir" n-one --close
+  status=$?
+  expect_code 1 "$status" "a done with no [at=] cannot be shown to postdate the agent: $(cat "$dir/out")"
+  [ ! -e "$dir/control.log" ] || fail "a done with no timestamp closed the agent"
+  pass "fm-close-done: a done line with no timestamp is skipped"
+}
+
+test_a_captain_held_task_is_not_closed() {
+  local dir status
+  dir=$(make_fixture held)
+  add_worker "$dir" h-one ship "state: done · source: status-log · ready"
+  add_worker "$dir" h-two ship "state: done · source: status-log · ready"
+  echo 0 > "$dir/hold/h-one"
+  echo 2 > "$dir/hold/h-two"
+  run_close "$dir" --close
+  status=$?
+  expect_code 1 "$status" "held or undeterminable tasks must be reported as skipped: $(cat "$dir/out")"
+  grep -q '^skipped h-one: .*captain' "$dir/out" || fail "a task held for the captain was not skipped: $(cat "$dir/out")"
+  grep -q '^skipped h-two: ' "$dir/out" || fail "a task whose hold state cannot be read was not skipped: $(cat "$dir/out")"
+  [ ! -e "$dir/control.log" ] || fail "a held task was closed: $(cat "$dir/control.log")"
+  pass "fm-close-done: a task held for the captain, or one whose hold cannot be read, is not closed"
+}
+
+test_an_unresolved_decision_is_not_closed_by_a_later_done() {
+  local dir status
+  dir=$(make_fixture decision)
+  add_worker "$dir" o-one ship "state: done · source: status-log · ready"
+  printf 'needs-decision [at=%s] [key=scope]: which way?\ndone [at=%s]: ready anyway\n' "$(( $(date +%s) - 80 ))" "$(( $(date +%s) - 40 ))" > "$dir/home/state/o-one.status"
+  run_close "$dir" --close
+  status=$?
+  expect_code 1 "$status" "an open decision must keep the agent: $(cat "$dir/out")"
+  grep -q '^skipped o-one: .*scope' "$dir/out" || fail "the skip reason must name the open decision: $(cat "$dir/out")"
+  printf 'resolved [at=%s] [key=scope]: answered\n' "$(date +%s)" >> "$dir/home/state/o-one.status"
+  run_close "$dir" --close
+  status=$?
+  expect_code 0 "$status" "a resolved decision must no longer block: $(cat "$dir/out")"
+  pass "fm-close-done: a decision with no resolved line keeps the agent even when a later done follows"
+}
+
 test_requires_an_explicit_home() {
   local dir status
   dir=$(make_fixture nohome)
@@ -172,4 +253,8 @@ test_close_saves_the_log_first_and_closes_through_fm_control_without_force
 test_uncommitted_work_is_never_closed
 test_scout_needs_its_report
 test_a_failed_close_stops_the_run
+test_a_done_from_before_a_relaunch_does_not_close_the_new_agent
+test_a_done_without_a_timestamp_is_not_trusted
+test_a_captain_held_task_is_not_closed
+test_an_unresolved_decision_is_not_closed_by_a_later_done
 test_requires_an_explicit_home

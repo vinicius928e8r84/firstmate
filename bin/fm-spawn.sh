@@ -223,7 +223,10 @@
 #   anything is created when the host has less than 2048 MB of available memory
 #   (bin/fm-memory-floor-lib.sh owns the probe; FM_SPAWN_MIN_FREE_MB overrides
 #   the floor, 0 turns it off). A batch reports such a pair as `batch: DEFERRED`
-#   and exits 76 when nothing else failed.
+#   and exits 76 when nothing else failed. A secondmate registered on another
+#   host is exempt here: that host's own fm-spawn checks that host's memory.
+#   bin/fm-control.sh relaunch applies the same floor before it stops the
+#   running agent.
 #   With no harness arg, a crewmate/scout spawn resolves the CREW harness only when
 #   config/crew-dispatch.json is absent. When that file exists, crewmate/scout
 #   spawns require an explicit harness so firstmate cannot silently skip dispatch
@@ -1931,9 +1934,13 @@ fm_task_id_creation_valid "$ID" || {
 }
 # Memory floor (bin/fm-memory-floor-lib.sh): checked before any brief render,
 # endpoint, worktree, record, or backlog move exists, for every launch kind
-# including a relaunch and a secondmate, so a refusal leaves the task exactly as
+# including a relaunch and a local secondmate, so a refusal leaves the task exactly as
 # queued as it was.
-fm_memory_floor_check "task $ID" || exit $?
+# A secondmate registered on another host runs there, so it is that host's own
+# fm-spawn that checks that host's memory, not this one.
+if [ "$KIND" != secondmate ] || [ "$(secondmate_registry_field "$DATA/secondmates.md" "$ID" remote 2>/dev/null || true)" != 1 ]; then
+  fm_memory_floor_check "task $ID" || exit $?
+fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = ship ]; then
   BRANCH="$BRANCH_PREFIX$ID"
   if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then

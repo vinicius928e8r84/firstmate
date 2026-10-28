@@ -91,6 +91,18 @@ test_every_launch_kind_is_refused() {
   pass "fm-spawn: scout, secondmate, relaunch and batch launches are all held at the floor"
 }
 
+test_a_remote_secondmate_is_not_held_by_this_hosts_memory() {
+  local dir status
+  dir=$(make_fixture remote-mate 1000000)
+  printf -- '- rsm - a mate on another host (host: remote-mac; root: /nonexistent/root; home: /nonexistent/home; scope: anything; projects: none; added 2026-10-28)\n' \
+    > "$dir/home/data/secondmates.md"
+  run_spawn "$dir" FM_SPAWN_MIN_FREE_MB= -- rsm "$dir/proj" --secondmate
+  status=$?
+  [ "$status" -ne 76 ] || fail "a secondmate that runs on another host was held by this host's memory: $(cat "$dir/out")"
+  ! grep -q 'spawn refused: only' "$dir/out" || fail "the remote secondmate hit the local memory floor: $(cat "$dir/out")"
+  pass "fm-spawn: a remote secondmate is not held by this host's memory floor"
+}
+
 test_unreadable_memory_figure_does_not_block() {
   local dir status
   dir=$(make_fixture unreadable 1500000)
@@ -106,3 +118,4 @@ test_just_at_the_floor_is_not_refused
 test_override_changes_or_disables_the_floor
 test_every_launch_kind_is_refused
 test_unreadable_memory_figure_does_not_block
+test_a_remote_secondmate_is_not_held_by_this_hosts_memory
