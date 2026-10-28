@@ -203,6 +203,7 @@ CONFIRM_TIMEOUT=$(fm_arm_confirm_window "$CONFIRM_TIMEOUT")
 # count, because each poll forks and a loaded host makes polls slow.
 TERM_WAIT_MS=${FM_ARM_TERM_WAIT_MS:-500}
 case "$TERM_WAIT_MS" in ''|*[!0-9]*) TERM_WAIT_MS=500 ;; esac
+# shellcheck disable=SC2329 # Invoked indirectly by the signal handler below.
 now_ms() {
   if [ -n "${EPOCHREALTIME:-}" ]; then
     local t=${EPOCHREALTIME/[.,]/}

@@ -2150,6 +2150,7 @@ test_confirmation_window_stretches_with_load_and_is_capped() {
 
 test_arm_waits_between_failed_starts_under_load_and_clears_on_success() {
   local dir status start elapsed record
+  # shellcheck disable=SC2016 # the scripted watcher body expands in the fixture, not here.
   dir=$(make_scripted_watch_arm arm-load-backoff '[ "$n" -ge 3 ] || exit 1
 . "$(dirname "$0")/fm-wake-lib.sh"
 l="$FM_STATE_OVERRIDE/.watch.lock"; mkdir -p "$l"
