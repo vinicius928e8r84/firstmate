@@ -2023,10 +2023,10 @@ EOF
 # of fact can prove its first reading wrong - so the report says only that the
 # two records disagree and names both reconciliation directions above.
 #
-# Cost stays flat on a healthy home: one `tasks-axi list`, one key scan per
-# status log, and the precise per-key fold only for a key that already names a
-# still-open task. If tasks-axi is unavailable or its listing cannot be parsed,
-# the guard cannot read the structured record and prints nothing.
+# Cost stays flat on a healthy home: one `tasks-axi list`, one key scan over
+# every status log, and the precise per-key fold only for a key that already
+# names a still-open task. If tasks-axi is unavailable or its listing cannot be
+# parsed, the guard cannot read the structured record and prints nothing.
 #
 # Output: one `<task-id>\t<origin>\t<key>\t<title>` line per divergence, in
 # status-log then key order; nothing when the two records agree.
@@ -2046,23 +2046,51 @@ open_task_ids() {
   '
 }
 
-# Every key token stated anywhere in a status log. A cheap candidate scan: it
-# over-includes tokens that are only prose, and status_key_closing_verb below is
-# what actually decides what the stream says about a key.
-status_log_key_tokens() {  # <status-file>
-  grep -o '\[key=[A-Za-z0-9._-]*\]' "$1" 2>/dev/null |
-    sed 's/^\[key=//; s/\]$//' | LC_ALL=C sort -u
-}
-
-list_has_line() {  # <newline-separated-list> <value>
-  case $'\n'"$1"$'\n' in
-    *$'\n'"$2"$'\n'*) return 0 ;;
-    *) return 1 ;;
-  esac
+# Candidate pairs, one `<status-file>\t<task-id>\t<key>` line per task whose
+# key token appears in that status log, in status-log then task order. One grep
+# over every readable log and one awk replace a per-log, per-task bash loop that
+# forked on every log of every presentation; the tokens still only over-include,
+# and status_key_closing_verb below is what decides.
+diverged_candidates() {  # <newline-separated task ids> <status-file>...
+  local ids=$1
+  shift
+  grep -o -H '\[key=[A-Za-z0-9._-]*\]' "$@" 2>/dev/null |
+    FM_DIVERGED_IDS=$ids awk '
+      BEGIN {
+        n = split(ENVIRON["FM_DIVERGED_IDS"], all, "\n")
+        for (i = 1; i <= n; i++) if (all[i] != "") ids[++count] = all[i]
+      }
+      function flush(   i, id, origin, suffix, key) {
+        if (file == "") return
+        origin = file
+        sub(/.*\//, "", origin)
+        sub(/\.status$/, "", origin)
+        for (i = 1; i <= count; i++) {
+          id = ids[i]
+          if (id in tokens) printf "%s\t%s\t%s\n", file, id, id
+          suffix = origin "-decision-"
+          if (length(id) > length(suffix) && substr(id, 1, length(suffix)) == suffix \
+              && (substr(id, length(suffix) + 1) in tokens)) {
+            key = substr(id, length(suffix) + 1)
+            printf "%s\t%s\t%s\n", file, id, key
+          }
+        }
+        delete tokens
+      }
+      {
+        cut = match($0, /:\[key=[A-Za-z0-9._-]*\]$/)
+        if (!cut) next
+        name = substr($0, 1, cut - 1)
+        token = substr($0, cut + 6, length($0) - cut - 6)
+        if (name != file) { flush(); file = name }
+        tokens[token] = 1
+      }
+      END { flush() }
+    '
 }
 
 command_diverged() {
-  local ids resolve f origin tokens id keys key show title
+  local ids resolve f origin id key show title files=() candidates
   [ "$#" -eq 0 ] || { usage >&2; exit 2; }
   # Both records must belong to the SAME home or the comparison is meaningless:
   # tasks-axi reads $FM_HOME's backlog, so a state dir pointed somewhere else
@@ -2079,38 +2107,32 @@ command_diverged() {
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
   for f in "$STATE"/*.status; do
     [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || continue
-    origin=$(basename "$f"); origin=${origin%.status}
-    tokens=$(status_log_key_tokens "$f")
-    [ -n "$tokens" ] || continue
-    while IFS= read -r id; do
-      [ -n "$id" ] || continue
-      # The keys that could name this task in THIS log: the collapsed identity
-      # (the key IS the task id) and, for a pre-collapse row, the legacy derived
-      # one this origin would have minted.
-      keys=$id
-      case "$id" in
-        "$origin-decision-"?*) keys="$keys"$'\n'"${id#"$origin-decision-"}" ;;
-      esac
-      while IFS= read -r key; do
-        list_has_line "$tokens" "$key" || continue
-        [ "$(status_key_closing_verb "$f" "$key")" = "$resolve" ] || continue
-        task_show "$id" || continue
-        show=$TASK_SHOW_OUTPUT
-        [ "$(show_field "$show" state)" != "done" ] || continue
-        [ "$(show_field_value "$show" hold_kind)" = captain ] || continue
-        # The title is the only free-text field here, and the report is
-        # TAB-separated, so it goes through the same sanitizer every other
-        # emitted field uses rather than being trusted to stay one clean line.
-        title=$(sanitize_field "$(show_field_value "$show" title)")
-        printf '%s\t%s\t%s\t%s\n' "$id" "$origin" "$key" "$title"
-        break
-      done <<INNER
-$keys
-INNER
-    done <<EOF
-$ids
-EOF
+    files+=("$f")
   done
+  [ "${#files[@]}" -gt 0 ] || return 0
+  candidates=$(diverged_candidates "$ids" "${files[@]}") || return 0
+  [ -n "$candidates" ] || return 0
+  # One report line per task and status log: a task already reported for a log
+  # is not looked at again through its other key.
+  local reported=''
+  while IFS=$'\t' read -r f id key; do
+    origin=${f##*/}
+    origin=${origin%.status}
+    case $'\n'"$reported" in *$'\n'"$f"$'\t'"$id"$'\n'*) continue ;; esac
+    [ "$(status_key_closing_verb "$f" "$key")" = "$resolve" ] || continue
+    task_show "$id" || continue
+    show=$TASK_SHOW_OUTPUT
+    [ "$(show_field "$show" state)" != "done" ] || continue
+    [ "$(show_field_value "$show" hold_kind)" = captain ] || continue
+    # The title is the only free-text field here, and the report is
+    # TAB-separated, so it goes through the same sanitizer every other
+    # emitted field uses rather than being trusted to stay one clean line.
+    title=$(sanitize_field "$(show_field_value "$show" title)")
+    printf '%s\t%s\t%s\t%s\n' "$id" "$origin" "$key" "$title"
+    reported="$reported$f"$'\t'"$id"$'\n'
+  done <<EOF
+$candidates
+EOF
 }
 
 # Still an open captain call? Exit 0 yes, 1 no, 2 cannot tell (see the header).

@@ -1196,8 +1196,11 @@ EOF
 # re-derives from whatever offset actually landed on disk.
 _fm_open_decisions_cursor_path() {  # <status-file>
   local f=$1 dir base
-  dir=$(dirname "$f")
-  base=$(basename "$f")
+  case "$f" in
+    */*) dir=${f%/*}; [ -n "$dir" ] || dir=/ ;;
+    *) dir=. ;;
+  esac
+  base=${f##*/}
   printf '%s/.%s.open-decisions-cursor' "$dir" "${base%.status}"
 }
 
@@ -1235,12 +1238,54 @@ _fm_open_decisions_file_ident() {  # <file> -> strongest available identity
     epoch=$(LC_ALL=C /usr/bin/stat -f '%B' "$f" 2>/dev/null) || epoch=0
     if [ "$epoch" != 0 ]; then birth=$(LC_ALL=C /usr/bin/stat -f '%FB' "$f" 2>/dev/null) || birth=''; else birth=''; fi
   else
-    ident=$(LC_ALL=C stat -c '%d:%i' "$f" 2>/dev/null) || return 1
-    epoch=$(LC_ALL=C stat -c '%W' "$f" 2>/dev/null) || epoch=0
-    if [ "$epoch" != 0 ]; then birth=$(LC_ALL=C stat -c '%w' "$f" 2>/dev/null) || birth=''; else birth=''; fi
+    # One stat for all three fields: this runs once per status log on every
+    # presentation, and each extra stat is a fork.
+    ident=$(LC_ALL=C stat -c '%d:%i|%W|%w' "$f" 2>/dev/null) || return 1
+    birth=${ident#*|}
+    ident=${ident%%|*}
+    epoch=${birth%%|*}
+    birth=${birth#*|}
+    [ -n "$epoch" ] || epoch=0
+    if [ "$epoch" = 0 ]; then birth=''; fi
   fi
   case "$ident$birth" in *$'\t'*|*$'\n'*|'') return 1 ;; esac
   if [ -n "$birth" ]; then printf 'strong:%s:%s' "$ident" "$birth"; else printf 'weak:%s' "$ident"; fi
+}
+
+# Size and identity of one status log from a single stat, set in
+# FM_STATUS_STAT_SIZE and FM_STATUS_STAT_IDENT: the same values
+# _fm_status_file_size and _fm_open_decisions_file_ident print, which remain the
+# path when a reader override or a non-Linux stat is in play. Fails when either
+# value cannot be read, like the pair it replaces.
+FM_STATUS_STAT_SIZE=
+FM_STATUS_STAT_IDENT=
+# shellcheck disable=SC2034 # Output globals are consumed by the scans below.
+_fm_status_size_and_ident() {  # <status-file>
+  local f=$1 out size rest epoch birth
+  FM_STATUS_STAT_SIZE=
+  FM_STATUS_STAT_IDENT=
+  if [ -n "${FM_STATUS_IDENTITY_READER:-}" ] || [ -n "${FM_STATUS_SIZE_READER:-}" ] \
+    || [ "$_FM_CLASSIFY_UNAME_S" = Darwin ]; then
+    FM_STATUS_STAT_SIZE=$(_fm_status_file_size "$f") || return 1
+    FM_STATUS_STAT_IDENT=$(_fm_open_decisions_file_ident "$f") || return 1
+    return 0
+  fi
+  out=$(LC_ALL=C stat -c '%s|%d:%i|%W|%w' "$f" 2>/dev/null) || return 1
+  size=${out%%|*}
+  rest=${out#*|}
+  FM_STATUS_STAT_SIZE=$size
+  case "$rest" in
+    *'|'*'|'*) ;;
+    *) FM_STATUS_STAT_SIZE=; return 1 ;;
+  esac
+  FM_STATUS_STAT_IDENT=${rest%%|*}
+  rest=${rest#*|}
+  epoch=${rest%%|*}
+  birth=${rest#*|}
+  [ -n "$epoch" ] || epoch=0
+  if [ "$epoch" = 0 ]; then birth=''; fi
+  case "$FM_STATUS_STAT_IDENT$birth" in *$'\t'*|*$'\n'*|'') FM_STATUS_STAT_IDENT=; return 1 ;; esac
+  if [ -n "$birth" ]; then FM_STATUS_STAT_IDENT="strong:$FM_STATUS_STAT_IDENT:$birth"; else FM_STATUS_STAT_IDENT="weak:$FM_STATUS_STAT_IDENT"; fi
 }
 
 _fm_status_file_size() {  # <status-file>
@@ -1347,11 +1392,10 @@ status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>]
   # A stat/size-read failure is a genuine I/O error, not "the file is empty" -
   # report the already-trusted persisted set unchanged rather than risking a
   # silent invalidation that would wipe it.
-  cur_ident=$(_fm_open_decisions_file_ident "$f") || { printf '%s' "$trusted_open"; return 0; }
+  _fm_status_size_and_ident "$f" || { printf '%s' "$trusted_open"; return 0; }
+  cur_ident=$FM_STATUS_STAT_IDENT
   [ -n "$cur_ident" ] || { printf '%s' "$trusted_open"; return 0; }
-  actual_size=$(_fm_status_file_size "$f") \
-    || { printf '%s' "$trusted_open"; return 0; }
-  actual_size=${actual_size//[[:space:]]/}
+  actual_size=${FM_STATUS_STAT_SIZE//[[:space:]]/}
   case "$actual_size" in ''|*[!0-9]*) printf '%s' "$trusted_open"; return 0 ;; esac
   if [ -n "$captured_end" ]; then
     case "$captured_end" in
@@ -1419,7 +1463,7 @@ scan_open_decisions_incremental() {  # <state>
   for f in "$state"/*.status; do
     [ -e "$f" ] || continue
     [ "$f" = "$exclude" ] && continue
-    task=$(basename "$f"); task="${task%.status}"
+    task=${f##*/}; task=${task%.status}
     open=$(status_open_decisions_incremental "$f") || continue
     [ -n "$open" ] || continue
     while IFS= read -r line; do
@@ -1439,10 +1483,10 @@ status_presentation_snapshot() {  # <state>
     [ -e "$f" ] || continue
     [ "$f" = "$exclude" ] && continue
     [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || continue
-    task=$(basename "$f"); task="${task%.status}"
-    size=$(_fm_status_file_size "$f") || return 1
-    size=${size//[[:space:]]/}
-    ident=$(_fm_open_decisions_file_ident "$f") || return 1
+    task=${f##*/}; task=${task%.status}
+    _fm_status_size_and_ident "$f" || return 1
+    size=${FM_STATUS_STAT_SIZE//[[:space:]]/}
+    ident=$FM_STATUS_STAT_IDENT
     case "$size" in ''|*[!0-9]*) return 1 ;; esac
     [ -n "$ident" ] || return 1
     printf '%s\t%s\t%s\n' "$task" "$size" "$ident" || return 1
