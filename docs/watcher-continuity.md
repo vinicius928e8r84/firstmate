@@ -286,6 +286,13 @@ Heartbeat, stale, signal, and every other check wake are never eligible, because
 Process-event results with no news are already withheld at the source by the adapter `silent` seam in `bin/fm-procevent.sh`, and routine unchanged task outcomes by the supervision branch's `silent` outcomes, so neither needs a probe.
 `tests/fm-wake-drain-probe.test.sh` pins the verdicts, including that content probed as `NEWS` is still presented by the next drain.
 
+## Lane guard scan
+
+Every `FM_LANE_GUARD_INTERVAL` seconds (default 120) the watcher runs `bin/fm-lane-guard.sh scan` and turns any new alert it prints into a `check: lane-guard: ...` wake.
+The scan ends a `treehouse get` slot request that has held no slot for over an hour by its exact pid, warns about a worker creation that `bin/fm-spawn.sh` recorded as failed, and, when `config/pod-watch` exists, starts or warns about a stopped pod behind a queued pod job.
+The script header owns the guards, limits, and environment; it never creates or deletes a pod and never wakes an agent on its own.
+`tests/fm-lane-guard.test.sh` pins each guard against real processes, a real failed spawn, and a local stand-in for the pod API.
+
 ## Per-actor acknowledgement
 
 `bin/fm-wake-drain.sh` consumes the queue per actor, not per whole-queue cutoff.

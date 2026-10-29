@@ -1567,8 +1567,19 @@ spawn_orca_reclaim_launch_file() {
   return 1
 }
 
+# A failed creation must not stay silent: record it where bin/fm-lane-guard.sh
+# (run by the watcher and by cron) turns it into a warning within minutes. The
+# capacity deferral is a queue wait, not a failure.
+spawn_failure_record() {  # <status>
+  [ "$1" -ne 0 ] && [ "$1" -ne "${FM_PROJECT_CAPACITY_DEFER_EXIT:-75}" ] || return 0
+  [ -n "${ID:-}" ] && [ -n "${STATE:-}" ] || return 0
+  FM_HOME="${FM_HOME:-}" FM_STATE_OVERRIDE="$STATE" "$FM_ROOT/bin/fm-lane-guard.sh" record-spawn-failure \
+    "$ID" "$1" "${KIND:-}" "${PROJ_ABS:-}" "${BACKEND:-}" "${HARNESS:-}" </dev/null >/dev/null 2>&1 || true
+}
+
 spawn_abort_cleanup() {
   local status=$?
+  spawn_failure_record "$status"
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] &&
     [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] &&
     [ -n "$SPAWN_META_TMP" ] &&

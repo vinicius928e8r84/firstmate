@@ -315,6 +315,10 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
+LANE_GUARD_INTERVAL=${FM_LANE_GUARD_INTERVAL:-120}  # seconds between fm-lane-guard.sh scans (<< its 10 min failure-warning bound)
+case "$LANE_GUARD_INTERVAL" in
+  ''|*[!0-9]*|0) LANE_GUARD_INTERVAL=120 ;;
+esac
 HOME_SUMMARY_INTERVAL=${FM_HOME_SUMMARY_INTERVAL:-300}
 case "$HOME_SUMMARY_INTERVAL" in
   ''|*[!0-9]*|0) HOME_SUMMARY_INTERVAL=300 ;;
@@ -3617,6 +3621,22 @@ while :; do
     triage_log "inactive-outcome reconciliation unavailable"
   fi
   fm_watcher_beat_touch "$STATE"
+
+  # Worker-creation lane and pod job queue guards (bin/fm-lane-guard.sh owns
+  # them): end a slot request stuck over an hour by its exact pid, warn about a
+  # failed creation, and relaunch or warn about a queued pod job with no live
+  # pod. Mechanical and silent until it raised an alert; the script is bounded
+  # (curl -m 20) and takes its own lock, so a slow RunPod never stalls the beat.
+  if [ "$(age_of "$STATE/.lane-guard-last")" -ge "$LANE_GUARD_INTERVAL" ]; then
+    : > "$STATE/.lane-guard-last"
+    lane_guard_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+      timeout 90 "$SCRIPT_DIR/fm-lane-guard.sh" scan </dev/null 2>/dev/null) || true
+    if [ -n "$lane_guard_out" ]; then
+      reason="check: lane-guard: $(printf '%s' "$lane_guard_out" | tr '\n' ';')"
+      fm_wake_append check lane-guard "$reason" || exit 1
+      wake "$reason"
+    fi
+  fi
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
