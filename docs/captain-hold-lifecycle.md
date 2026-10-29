@@ -456,6 +456,15 @@ The comparison is refused unless the status directory is the active home's own.
 Because tasks-axi reads that home's backlog, a mismatch would report one home's logs against another's tasks.
 If tasks-axi is unavailable or its listing cannot be parsed, the guard cannot read the structured record and prints nothing.
 
+## Ghost decisions close by fact
+
+A decision whose task is gone can never be answered, so it would otherwise stay in OPEN DECISIONS forever.
+Before it presents status, `bin/fm-wake-drain.sh` runs `bin/fm-decision-autoclose.sh` for the main actor (`FM_DECISION_AUTOCLOSE=0` skips it).
+The script appends `resolved [key=...]: auto-closed by fact: ...` to the owning status log only when the task has no `state/<task>.meta` and its `data/<task>/` directory proves it once existed.
+A pending-reply escalation whose destination task has no `state/<task>.meta` and does have its `data/<task>/` directory closes through the guarded ghost close of `bin/fm-pending-reply-lib.sh`.
+A task that still has its `.meta` is never closed, even with a dead agent, because that is stuck-worker recovery.
+`bin/fm-decision-autoclose.sh --dry-run` lists what would close, and `tests/fm-decision-autoclose.test.sh` covers it.
+
 ## Compatibility with pre-collapse installs
 
 The collapse is the change that made a decision an ordinary captain-held task whose key is its task id.

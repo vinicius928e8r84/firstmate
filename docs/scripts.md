@@ -90,6 +90,8 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-task-inbox-lib.sh`   | Single owner of durable steering-inbox records, acknowledgement, doorbells, and the delivery-attempt ladder |
 | `fm-pending-reply-lib.sh` | Parent-owned secondmate pending-reply expectations, recovery, and keyed escalation lifecycle |
 | `fm-pending-reply-close-ghost.sh` | Close a pending reply whose endpoint is retired or unresolvable, with a required reason; refuses a live endpoint |
+| `fm-decision-autoclose.sh` | Close OPEN DECISIONS whose task is gone or whose pending-reply destination is retired; never a live task's |
+| `fm-actions.sh`          | Actions ledger with proof: add, prove, list, and report what each approved item's proof command says |
 | `fm-secondmate-report.sh` | Optional helper that resolves the parent channel itself and appends a correlated status or document-pointer report |
 | `fm-extension.mjs`       | Bind, inspect, verify, and strictly invoke trusted external process-event adapter packages |
 | `fm-extension-launch-barrier.mjs` | Publish one exact static core-owned invocation group before package code runs |

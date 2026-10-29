@@ -959,6 +959,12 @@ trap 'exit 143' TERM
 
 [ "$PROBE" != true ] || run_probe
 
+# Ghost decisions close by fact before presentation, so OPEN DECISIONS lists
+# only what can still be answered. Best effort: it never blocks a drain.
+if [ "$ACTOR" = main ] && [ "${FM_DECISION_AUTOCLOSE:-1}" != 0 ]; then
+  "$SCRIPT_DIR/fm-decision-autoclose.sh" >/dev/null 2>&1 || true
+fi
+
 if [ -n "$ACK_THROUGH" ]; then
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
 elif fm_lock_acquire_wait_bounded "$FM_WAKE_QUEUE_LOCK" "$PRESENTATION_LOCK_TIMEOUT"; then
