@@ -764,6 +764,47 @@ test_lock_paused_mid_acquire_claim_fails_during_steal() {
   pass "paused mid-acquire claimant backs off to active stealer"
 }
 
+test_beat_touch_only_serves_the_live_lock_holder() {
+  local dir state live beat beat_age lockdir
+  dir=$(make_case beat-touch)
+  state="$dir/state"
+  lockdir="$state/.watch.lock"
+  beat="$state/.last-watcher-beat"
+  sleep 300 &
+  live=$!
+  mkdir -p "$lockdir"
+  printf '%s\n' "$live" > "$lockdir/pid"
+  _beat_run() {  # <FM_WATCHER_BEAT_PID or empty>
+    touch -d '1 hour ago' "$beat"
+    FM_WATCHER_BEAT_PID=$1 FM_WATCHER_BEAT_MIN_SECS=0 bash -c '. "$1"; fm_watcher_beat_touch "$2"' _ "$LIB" "$state"
+    beat_age=$(( $(date +%s) - $(stat -c %Y "$beat") ))
+  }
+
+  _beat_run ''
+  [ "$beat_age" -ge 3000 ] || fail "a process outside any watcher refreshed the beacon"
+  _beat_run "$live"
+  [ "$beat_age" -lt 60 ] || fail "the live lock holder could not refresh the beacon"
+  _beat_run "$$"
+  [ "$beat_age" -ge 3000 ] || fail "a live pid that does not hold the lock refreshed the beacon"
+  # An ordinary pass is shorter than the refresh floor: a beacon the pass top
+  # touched moments ago stays exactly as it is, so one touch still marks one pass.
+  touch -d '5 seconds ago' "$beat"
+  FM_WATCHER_BEAT_PID=$live bash -c '. "$1"; fm_watcher_beat_touch "$2"' _ "$LIB" "$state"
+  [ $(( $(date +%s) - $(stat -c %Y "$beat") )) -ge 5 ] || fail "a young beacon was touched mid-pass"
+  # A recorded identity that no longer matches the pid (reuse) must not refresh.
+  printf 'not-this-process\n' > "$lockdir/pid-identity"
+  _beat_run "$live"
+  [ "$beat_age" -ge 3000 ] || fail "a pid whose identity differs from the lock's refreshed the beacon"
+  rm -f "$lockdir/pid-identity"
+  # The watcher is gone: a child that outlives it cannot keep the beacon fresh.
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  _beat_run "$live"
+  [ "$beat_age" -ge 3000 ] || fail "a child outliving the watcher kept the beacon fresh"
+  unset -f _beat_run
+  pass "the beacon is refreshed only from the live lock holder's process tree"
+}
+
 test_watch_restart_rejects_reused_pid() {
   local dir state fakebin out live pid i
   dir=$(make_case restart-reused-pid)
@@ -1592,6 +1633,7 @@ test_lock_does_not_steal_live_lock
 test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
+test_beat_touch_only_serves_the_live_lock_holder
 test_watch_restart_rejects_reused_pid
 test_watch_restart_attaches_to_healthy_peer
 test_watcher_self_evicts_on_lock_takeover

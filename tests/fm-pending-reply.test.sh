@@ -1435,6 +1435,157 @@ test_tick_skips_terminal_and_reuses_target_observation() {
 # tick selects the records it has work for in one pass and leaves every settled
 # record alone: it must not block on a settled record's per-record lock that a
 # live foreign process holds, and it still does the work the selected records need.
+# Seed <count> delivered, still-awaiting records for distinct tasks with no
+# endpoint metadata, so every one of them reaches the per-record path.
+seed_open_records() {  # <home> <state> <count>
+  local home=$1 state=$2 n=$3 i corr
+  for ((i = 1; i <= n; i++)); do
+    corr=$(fm_pending_reply_create "$home" "$state" "mate$i" "request $i")
+    fm_pending_reply_mark_delivered "$state" "$corr"
+  done
+}
+
+test_tick_pass_is_bounded_and_visits_every_record() (
+  local home state visits_log pass expected seen corr r
+  home=$(setup_parent bounded-pass)
+  state="$home/state"
+  visits_log="$home/visits.log"
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_NOW=11000
+  seed_open_records "$home" "$state" 7
+  # Settled records are never selected, so they never use up the batch.
+  corr=$(fm_pending_reply_create "$home" "$state" settled "settled request")
+  fm_pending_reply_mark_delivered "$state" "$corr"
+  printf 'done [corr=%s]: complete\n' "$corr" > "$state/settled.status"
+  fm_pending_reply_try_resolve "$state" "$corr" || fail "settled fixture should resolve"
+  expected=$(for r in "$state/pending-replies"/*; do
+    [ "$(fm_pending_reply_get "$r" phase)" = resolved ] || basename "$r"
+  done | LC_ALL=C sort)
+  # shellcheck disable=SC2329
+  fm_pending_reply_tick_one() { printf '%s\n' "$2" >> "$visits_log"; }
+  export FM_PENDING_REPLY_TICK_MAX=3
+
+  : > "$visits_log"
+  fm_pending_reply_tick "$state"
+  [ "$(wc -l < "$visits_log" | tr -d ' ')" = 3 ] || fail "first pass must stop at the batch size"
+  fm_pending_reply_tick "$state"
+  [ "$(wc -l < "$visits_log" | tr -d ' ')" = 6 ] || fail "second pass must visit the next batch"
+  fm_pending_reply_tick "$state"
+  # The third pass takes the one record not yet reached, then wraps to the
+  # oldest-visited ones; within the first seven visits each record appears once.
+  [ "$(wc -l < "$visits_log" | tr -d ' ')" = 9 ] || fail "third pass must fill its batch"
+  seen=$(head -7 "$visits_log")
+  [ "$seen" = "$expected" ] || fail "records must be visited once each, oldest-unvisited first (byte order)"
+  [ "$(sed -n 8,9p "$visits_log")" = "$(printf '%s\n' "$expected" | head -2)" ] \
+    || fail "the rotation must wrap to the oldest-visited records"
+  # A pass whose batch covers every selected record clears the cursor.
+  export FM_PENDING_REPLY_TICK_MAX=20
+  : > "$visits_log"
+  fm_pending_reply_tick "$state"
+  [ "$(wc -l < "$visits_log" | tr -d ' ')" = 7 ] || fail "an unbounded-enough pass visits every selected record"
+  [ ! -s "$state/pending-replies/.tick-cursor" ] || fail "a pass that visited everything must clear the cursor"
+  export FM_PENDING_REPLY_TICK_MAX=3
+  # Records are left exactly as they were: the cursor is not a record.
+  [ "$(find "$state/pending-replies" -maxdepth 1 -type f ! -name '.*' | wc -l | tr -d ' ')" = 8 ] \
+    || fail "a bounded pass must not add or remove a record"
+
+  # The wall-clock budget bounds a pass too, always after at least one record.
+  rm -f "$state/pending-replies/.tick-cursor"
+  : > "$visits_log"
+  export FM_PENDING_REPLY_TICK_MAX=100
+  export FM_PENDING_REPLY_TICK_BUDGET_SECS=5
+  # shellcheck disable=SC2329
+  fm_pending_reply_tick_one() { printf '%s\n' "$2" >> "$visits_log"; SECONDS=$((SECONDS + 10)); }
+  for pass in 1 2 3 4 5 6 7; do
+    fm_pending_reply_tick "$state"
+    [ "$(wc -l < "$visits_log" | tr -d ' ')" = "$pass" ] || fail "an exhausted budget must stop the pass after one record (pass $pass)"
+  done
+  [ "$(LC_ALL=C sort "$visits_log" | uniq | wc -l | tr -d ' ')" = 7 ] || fail "the budgeted rotation must still reach every record"
+  pass "a pending-reply pass is bounded by count and time, and every record is still visited"
+)
+
+test_tick_keeps_the_beacon_fresh_between_records() (
+  local home state beat age_log live
+  home=$(setup_parent beat-between)
+  state="$home/state"
+  beat="$state/.last-watcher-beat"
+  age_log="$home/ages.log"
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_NOW=11100
+  seed_open_records "$home" "$state" 4
+  sleep 300 &
+  live=$!
+  mkdir -p "$state/.watch.lock"
+  printf '%s\n' "$live" > "$state/.watch.lock/pid"
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$ROOT/bin/fm-wake-lib.sh"
+  export FM_WATCHER_BEAT_PID=$live FM_WATCHER_BEAT_MIN_SECS=0
+  # Every visit starts by reading how old the beacon is, then ages it again, so
+  # a fresh reading proves the beacon was refreshed just before that record.
+  # shellcheck disable=SC2329
+  fm_pending_reply_tick_one() {
+    printf '%s\n' "$(( $(date +%s) - $(stat -c %Y "$beat") ))" >> "$age_log"
+    touch -d '1 hour ago' "$beat"
+  }
+  touch -d '1 hour ago' "$beat"
+  : > "$age_log"
+  fm_pending_reply_tick "$state"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$(wc -l < "$age_log" | tr -d ' ')" = 4 ] || fail "every record must be visited"
+  [ "$(awk '$1 > 60' "$age_log" | wc -l | tr -d ' ')" = 0 ] \
+    || fail "the beacon was stale when a record was visited: $(tr '\n' ' ' < "$age_log")"
+  pass "the pending-reply pass refreshes the watcher beacon before every record"
+)
+
+test_tick_asks_an_unreachable_remote_host_once_per_pass() (
+  local home state bin_copy on_log visits_log task host corr
+  home=$(setup_parent unreachable-host)
+  state="$home/state"
+  bin_copy="$home/bin"
+  on_log="$home/on.log"
+  visits_log="$home/visits.log"
+  cp -R "$ROOT/bin" "$bin_copy"
+  # The stub stands in for the ssh route: any mate on the dead host answers 255.
+  cat > "$bin_copy/fm-on.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$1" >> "$on_log"
+case "\$1" in
+  ios|ios2) exit 255 ;;
+  *) printf 'idle\n'; exit 0 ;;
+esac
+EOF
+  chmod +x "$bin_copy/fm-on.sh"
+  # shellcheck source=bin/fm-pending-reply-lib.sh
+  . "$bin_copy/fm-pending-reply-lib.sh"
+  # shellcheck disable=SC2030,SC2031
+  export FM_PENDING_REPLY_NOW=11200
+  for task in ios ios2 mac; do
+    host=dead-host
+    [ "$task" != mac ] || host=live-host
+    fm_write_meta "$state/$task.meta" \
+      "window=fm-remote:w1:p1" "harness=claude" "kind=secondmate" "mode=secondmate" \
+      "remote_host=$host" "remote_root=/remote/root" "remote_backend=herdr"
+    corr=$(fm_pending_reply_create "$home" "$state" "$task" "request for $task")
+    fm_pending_reply_mark_delivered "$state" "$corr"
+  done
+  : > "$on_log"
+  : > "$visits_log"
+  # shellcheck disable=SC2329
+  fm_pending_reply_tick_one() {
+    printf '%s\t%s\n' "$(fm_pending_reply_get "$(fm_pending_reply_path "$1" "$2")" task_id)" "$3" >> "$visits_log"
+  }
+  fm_pending_reply_tick "$state"
+  [ "$(grep -c -x -e ios -e ios2 "$on_log")" = 1 ] \
+    || fail "a host whose read already failed was asked again this pass: $(tr '\n' ' ' < "$on_log")"
+  grep -qx mac "$on_log" || fail "a reachable host must still be read"
+  [ "$(grep -c . "$visits_log")" = 3 ] || fail "every record must still be decided"
+  grep -q "^ios2	unknown$" "$visits_log" && grep -q "^ios	unknown$" "$visits_log" \
+    || fail "a skipped read must leave the mate's busy state unknown, as a failed read does"
+  grep -q "^mac	idle$" "$visits_log" || fail "the reachable mate must keep its observed state"
+  pass "a remote host that already failed to answer is not asked again within the pass"
+)
+
 test_tick_leaves_settled_records_alone() {
   local home state settled closed open_esc awaiting rec i copy holder tick_pid ticked=0 open lib
   local sums_before sums_after holder_lock_pid
@@ -2235,6 +2386,9 @@ test_busy_idle_observation_via_backend_abstraction
 test_unknown_backend_state_uses_capture_fallback
 test_kimi_capture_fallback_uses_recorded_harness
 test_tick_skips_terminal_and_reuses_target_observation
+test_tick_pass_is_bounded_and_visits_every_record
+test_tick_keeps_the_beacon_fresh_between_records
+test_tick_asks_an_unreachable_remote_host_once_per_pass
 test_tick_leaves_settled_records_alone
 test_correlations_reuse_only_for_matching_open_task
 test_tick_end_to_end_missed_then_escalate

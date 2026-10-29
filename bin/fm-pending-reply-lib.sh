@@ -118,6 +118,12 @@
 #   FM_PENDING_REPLY_SEND_HOOK    optional command template for recovery delivery
 #                                 (tests); receives task_id and full message as args
 #   FM_PENDING_REPLY_NOW          optional fixed epoch for deterministic tests
+#   FM_PENDING_REPLY_TICK_MAX     default 20; most records one fm_pending_reply_tick
+#                                 pass visits (see the bounded pass note there)
+#   FM_PENDING_REPLY_TICK_BUDGET_SECS
+#                                 default 60; wall-clock seconds after which a pass
+#                                 stops starting new records (at least one is always
+#                                 visited)
 
 # This directive does double duty: it also binds _FM_PENDING_REPLY_LIB_DIR as
 # the bin/ source prefix so the deliberately undirected lazy sources below
@@ -1554,16 +1560,46 @@ _fm_pending_reply_select_needing_work() {  # <record-path>...
   '
 }
 
-# Scan every pending record for this parent state. Safe to call every poll.
+# Refresh the watcher liveness beacon between records and remote reads. Only
+# the watcher's own process tree has bin/fm-wake-lib.sh's fm_watcher_beat_touch
+# loaded and FM_WATCHER_BEAT_PID set, so every other caller of this library
+# (fm-send, the report helper, tests) skips this at the cost of one test.
+_fm_pending_reply_beat() {  # <state-dir>
+  [ -n "${FM_WATCHER_BEAT_PID:-}" ] || return 0
+  declare -F fm_watcher_beat_touch >/dev/null || return 0
+  fm_watcher_beat_touch "$1"
+}
+
+# True when record name <a> sorts after <b> in byte order, the order the tick's
+# selection is sorted in; scoped so the collation never leaks to the caller.
+_fm_pending_reply_name_after() {  # <a> <b>
+  local LC_COLLATE=C
+  [[ $1 > $2 ]]
+}
+
+# Scan the pending records for this parent state. Safe to call every poll.
 # Never scrapes secondmate conversation; uses only parent status, backend busy
 # state, and optional secondmate-home wrong-home path checks. Records are
 # selected in one pass first (_fm_pending_reply_select_needing_work), so a
 # settled record costs no lock and no fork, and the per-record path below runs,
 # unchanged, only for the records that selection returns.
+# One pass is bounded: it visits at most FM_PENDING_REPLY_TICK_MAX selected
+# records and starts no new one once FM_PENDING_REPLY_TICK_BUDGET_SECS have
+# elapsed, because a watcher pass that walks hundreds of records (each with
+# forks and possibly a remote read) would otherwise run past the liveness
+# beacon's window. Selected records are visited in byte order, oldest-unvisited
+# first: the dot-file cursor in the records directory (not a record, never read
+# as one) names the last record a truncated pass reached, and the next pass
+# resumes after it, wrapping around to the oldest-visited, so every record is
+# visited within ceil(selected / max) passes and no record is decided
+# differently, only later. A pass that visits every selected record clears it. The liveness beacon is refreshed before every record
+# (_fm_pending_reply_beat). A remote host whose observation already failed to
+# connect or timed out this pass is not asked again for another mate.
 fm_pending_reply_tick() {  # <state-dir>
   local state=$1 dir rec corr task_id phase delivered meta backend target label busy sm_home harness remote_host
-  local observation observation_task found i
-  local -a observation_tasks=() observation_values=() records=() selected=()
+  local observation observation_task found i obs_rc unreachable_hosts=' '
+  local cursor_file cursor='' tick_max tick_budget tick_start processed=0 truncated=0 last_rec=''
+  local -a observation_tasks=() observation_values=() records=() selected=() sorted=() reached=()
   dir=$(fm_pending_reply_dir "$state")
   [ -d "$dir" ] || return 0
   for rec in "$dir"/*; do
@@ -1579,9 +1615,43 @@ fm_pending_reply_tick() {  # <state-dir>
     esac
   done
   while IFS= read -r rec; do
-    selected+=("$rec")
-  done < <(_fm_pending_reply_select_needing_work ${records[@]+"${records[@]}"})
+    sorted+=("$rec")
+  done < <(_fm_pending_reply_select_needing_work ${records[@]+"${records[@]}"} | LC_ALL=C sort)
+  tick_max=${FM_PENDING_REPLY_TICK_MAX:-20}
+  case "$tick_max" in ''|*[!0-9]*|0) tick_max=20 ;; esac
+  tick_budget=${FM_PENDING_REPLY_TICK_BUDGET_SECS:-60}
+  case "$tick_budget" in ''|*[!0-9]*|0) tick_budget=60 ;; esac
+  cursor_file="$dir/.tick-cursor"
+  { IFS= read -r cursor < "$cursor_file"; } 2>/dev/null || cursor=''
+  # Records after the cursor first, then the ones the previous truncated pass
+  # already reached. Paths that cannot go through the sorted selection (a
+  # newline in the name) are already in selected, and stay first.
+  if [ -n "$cursor" ]; then
+    for rec in ${sorted[@]+"${sorted[@]}"}; do
+      if _fm_pending_reply_name_after "${rec##*/}" "$cursor"; then
+        selected+=("$rec")
+      else
+        reached+=("$rec")
+      fi
+    done
+    for rec in ${reached[@]+"${reached[@]}"}; do
+      selected+=("$rec")
+    done
+  else
+    for rec in ${sorted[@]+"${sorted[@]}"}; do
+      selected+=("$rec")
+    done
+  fi
+  tick_start=$SECONDS
   for rec in ${selected[@]+"${selected[@]}"}; do
+    if [ "$processed" -gt 0 ] \
+      && { [ "$processed" -ge "$tick_max" ] || [ $((SECONDS - tick_start)) -ge "$tick_budget" ]; }; then
+      truncated=1
+      break
+    fi
+    processed=$((processed + 1))
+    last_rec=$rec
+    _fm_pending_reply_beat "$state"
     corr=$(fm_pending_reply_get "$rec" corr_id)
     [ -n "$corr" ] || corr=$(basename "$rec")
     task_id=$(fm_pending_reply_get "$rec" task_id)
@@ -1667,8 +1737,18 @@ fm_pending_reply_tick() {  # <state-dir>
         done
         if [ "$found" = 0 ]; then
           if [ -n "$remote_host" ]; then
-            observation=$("$_FM_PENDING_REPLY_LIB_DIR/fm-on.sh" "$task_id" \
-              fm-remote-secondmate-control.sh observe "$task_id" < /dev/null 2>/dev/null || printf 'unknown')
+            if [ "${unreachable_hosts#* $remote_host }" != "$unreachable_hosts" ]; then
+              observation=unknown
+            else
+              obs_rc=0
+              observation=$("$_FM_PENDING_REPLY_LIB_DIR/fm-on.sh" "$task_id" \
+                fm-remote-secondmate-control.sh observe "$task_id" < /dev/null 2>/dev/null) || obs_rc=$?
+              # Exit 255 is the unavailable-transport verdict and 124 a timeout: no
+              # other mate on this host can answer a read either this pass.
+              case "$obs_rc" in 124|255) unreachable_hosts="$unreachable_hosts$remote_host " ;; esac
+              [ "$obs_rc" -eq 0 ] || observation=unknown
+              _fm_pending_reply_beat "$state"
+            fi
             case "$observation" in busy|idle|fallback-idle|unknown) ;; *) observation=unknown ;; esac
           else
             observation=$(fm_pending_reply_backend_observation "$backend" "$target" "$label" "$harness")
@@ -1681,6 +1761,14 @@ fm_pending_reply_tick() {  # <state-dir>
     fi
     fm_pending_reply_tick_one "$state" "$corr" "$busy" "$sm_home" || true
   done
+  # Persist where a truncated pass stopped; a complete pass restarts from the top.
+  # Best effort: a lost cursor only restarts the rotation.
+  if [ "$truncated" -eq 1 ]; then
+    printf '%s\n' "${last_rec##*/}" > "$cursor_file.$$" 2>/dev/null \
+      && mv -f "$cursor_file.$$" "$cursor_file" 2>/dev/null || rm -f "$cursor_file.$$" 2>/dev/null
+  elif [ -n "$cursor" ] || [ -e "$cursor_file" ]; then
+    : > "$cursor_file" 2>/dev/null || true
+  fi
   return 0
 }
 

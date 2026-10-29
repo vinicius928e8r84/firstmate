@@ -386,6 +386,28 @@ assert_contains "$(wake_payloads "$H2")" "procevent lavish src-cut 7" "the repea
 [ "$(count_results "$H2" src-cut)" = 1 ] || fail "repeat re-announcement created a second durable copy"
 mv "$H2/state/.wake-queue" "$H2/state/.wake-queue.drained-2"
 
+# A watcher pass that publishes many captured results keeps its beacon fresh
+# between them, from this child, only while its watcher is alive and holds the lock.
+beat="$H2/state/.last-watcher-beat"
+sleep 300 &
+beat_holder=$!
+mkdir -p "$H2/state/.watch.lock"
+printf '%s\n' "$beat_holder" > "$H2/state/.watch.lock/pid"
+touch -d '1 hour ago' "$beat"
+FM_WATCHER_BEAT_PID=$beat_holder FM_WATCHER_BEAT_MIN_SECS=0 pe "$H2" reconcile >/dev/null
+[ $(( $(date +%s) - $(stat -c %Y "$beat") )) -lt 120 ] || fail "reconcile publishing a result did not refresh its watcher's beacon"
+touch -d '1 hour ago' "$beat"
+pe "$H2" reconcile >/dev/null
+[ $(( $(date +%s) - $(stat -c %Y "$beat") )) -ge 3000 ] || fail "reconcile outside any watcher refreshed the beacon"
+kill "$beat_holder" 2>/dev/null || true
+wait "$beat_holder" 2>/dev/null || true
+touch -d '1 hour ago' "$beat"
+FM_WATCHER_BEAT_PID=$beat_holder FM_WATCHER_BEAT_MIN_SECS=0 pe "$H2" reconcile >/dev/null
+[ $(( $(date +%s) - $(stat -c %Y "$beat") )) -ge 3000 ] || fail "reconcile kept a dead watcher's beacon fresh"
+rm -rf "$H2/state/.watch.lock" "$beat"
+mv "$H2/state/.wake-queue" "$H2/state/.wake-queue.drained-beat" 2>/dev/null || true
+pass "reconcile refreshes the beacon only for a live watcher that holds the lock"
+
 ack_out=$(pe "$H2" handled src-cut 7)
 assert_contains "$ack_out" "handled: src-cut 7" "the owned handling interface newly authorizes the first acknowledgement"
 assert_present "$H2/state/procevent-inbox/src-cut.7.handled" "acknowledgement durably records handling"

@@ -902,6 +902,9 @@ publish_pending() {  # [result-file-to-skip]
   while IFS= read -r result; do
     [ -n "$result" ] || continue
     [ "$result" = "$skip" ] && continue
+    # One watcher pass can publish many captured results; keep its liveness
+    # beacon fresh between them (no-op outside a watcher's own process tree).
+    fm_watcher_beat_touch "$STATE"
     if publish_result "$result"; then
       published=$((published + 1))
     fi
@@ -1706,6 +1709,7 @@ cmd_reconcile() {
     [ -e "$claim" ] || continue
     id=${claim##*/}; id=${id%.claim}
     fm_procevent_source_id_valid "$id" || continue
+    fm_watcher_beat_touch "$STATE"
     fm_procevent_source_lock_acquire "$id" || continue
     if [ -f "$(source_file "$id")" ] && [ ! -L "$(source_file "$id")" ]; then
       fm_procevent_source_lock_release "$id"
@@ -1746,6 +1750,7 @@ cmd_reconcile() {
       [ -e "$rec" ] || continue
       id=${rec##*/}; id=${id%.source}
       fm_procevent_source_id_valid "$id" || continue
+      fm_watcher_beat_touch "$STATE"
       fm_procevent_source_lock_acquire "$id" || continue
       if [ -f "$(source_file "$id")" ] && [ ! -L "$(source_file "$id")" ]; then
         fm_procevent_claim_state_locked "$id"
@@ -1917,6 +1922,7 @@ confirm_launched_runners() {  # <source-id><TAB><registration-identity><TAB><lau
     pending=("${remaining[@]+"${remaining[@]}"}")
     [ "${#pending[@]}" -gt 0 ] || break
     [ "$SECONDS" -lt "$deadline" ] || break
+    fm_watcher_beat_touch "$STATE"
     sleep 0.05
   done
   [ "${#pending[@]}" -eq 0 ] || printf '%s\n' "${pending[@]}"

@@ -111,7 +111,7 @@ The stale-owner claim occurs only after the existing AFK and supervision-need ga
 ### Claude arm failures
 
 After each non-actionable arm close, the hook rechecks the identity-matched watcher lock and fresh beacon before retrying a bounded number of times.
-The beacon is `state/.last-watcher-beat`, which only the watcher process touches.
+The beacon is `state/.last-watcher-beat`, which only the watcher process tree touches (see [Grace, beacon, and stop signals](#grace-beacon-and-stop-signals)).
 
 - A cycle-end failure is benign when that live-watcher predicate is true.
   In that case the hook suppresses the arm output and continues silently.
@@ -451,8 +451,11 @@ The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYC
 ### Grace, beacon, and stop signals
 
 The default 300-second grace is unchanged.
-Only the watcher process touches `state/.last-watcher-beat`.
-No helper process can make a wedged watcher appear healthy.
+The watcher touches `state/.last-watcher-beat` at the top of each pass, and again between the records and probes inside its long stages once the beacon is 30 seconds old (`FM_WATCHER_BEAT_MIN_SECS`), so one slow pass cannot age the beacon while an ordinary pass still touches it once.
+A stage the watcher is blocked on, such as `bin/fm-procevent.sh reconcile`, may refresh it through `fm_watcher_beat_touch` in `bin/fm-wake-lib.sh`.
+That helper acts only while the exported `FM_WATCHER_BEAT_PID` is alive, still holds the singleton lock, and matches the identity recorded in it.
+No helper process can make a wedged or dead watcher appear healthy, and no child that outlives the watcher can keep the beacon fresh.
+The secondmate pending-reply tick visits at most `FM_PENDING_REPLY_TICK_MAX` records (default 20) and starts none after `FM_PENDING_REPLY_TICK_BUDGET_SECS` (default 60), resuming oldest-unvisited-first on the next pass, so one pass stays bounded without changing any decision.
 An arm whose own script path sits under a disposable no-mistakes validation checkout (`.no-mistakes/worktrees/`) refuses with the typed failure line before touching any state, because a watcher started there outlives the validation step and keeps writing the real home's state from a checkout about to be deleted.
 Once per poll the watcher checks that its home, its state directory, and its own code root still exist, and exits with a logged reason when one is gone, scoped to itself alone, so a torn-down temporary home or a discarded checkout never leaves an orphan watcher behind.
 The arm applies the same rule to its own ground: when its script, its state directory, or an `FM_HOME` that existed at start disappears, it fails with `watcher: FAILED - arm ground removed: <path> no longer exists` instead of polling on; the `bin/fm-watch-arm.sh` header owns the timing bound.
@@ -533,6 +536,7 @@ It checks that a newly appended keyed decision is classified without rereading e
 - The typed self-eviction failure.
 - Bounded and successor-linked lifecycle rows.
 - A SIGSTOP counterfactual that distinguishes a live PID from a stale beacon before classifying termination.
+- The beacon refresh helper acting only for the live lock holder, never for a child that outlives it.
 
 ### Claude auto-arm and turn-end guard
 

@@ -1029,6 +1029,7 @@ secondmate_wake_stall_tick() {
     [ -e "$meta" ] || continue
     kind=$(fm_meta_get "$meta" kind)
     [ "$kind" = secondmate ] || continue
+    fm_watcher_beat_touch "$STATE"
     remote_host=$(fm_meta_get "$meta" remote_host)
     [ -z "$remote_host" ] || continue
     task=${meta##*/}
@@ -1145,8 +1146,12 @@ secondmate_liveness_tick() {
     id=${meta##*/}
     id=${id%.meta}
     case "$id" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+    # The probe may spend its whole remote budget, so refresh the beacon on
+    # both sides of it.
+    fm_watcher_beat_touch "$STATE"
     fm_secondmate_liveness_lock "$id" || continue
     fm_secondmate_liveness_probe "$meta" "$id" poll
+    fm_watcher_beat_touch "$STATE"
     bound_marker="$STATE/.secondmate-relaunch-bound-$id"
     reason='' notify_key='' err=''
     case "$FM_SM_LIVE_STATUS" in
@@ -2782,6 +2787,7 @@ scan_signals() {
     if [ ! -e "$f" ]; then
       case "$f" in *.status) [ -L "$f" ] || continue ;; *) continue ;; esac
     fi
+    fm_watcher_beat_touch "$STATE"
     sig=$(fm_wake_signal_sig "$f") || continue
     [ -n "$sig" ] || continue
     sf=$(fm_wake_signal_seen_path "$STATE" "$f")
@@ -3031,6 +3037,7 @@ signal_files_actionable() {  # <status-file> ...
   for f in "$@"; do
     case "$f" in *.status) ;; *) continue ;; esac
     [ -e "$f" ] || [ -L "$f" ] || continue
+    fm_watcher_beat_touch "$STATE"
     task=$(basename "$f"); task="${task%.status}"
     record=''; needs_decision=0
     status_span_first_actionable_record "$f" \
@@ -3096,6 +3103,7 @@ heartbeat_scan_finds_actionable() {
   for f in "$STATE"/*.status; do
     [ -e "$f" ] || [ -L "$f" ] || continue
     [ "$f" = "$exclude" ] && continue
+    fm_watcher_beat_touch "$STATE"
     task=$(basename "$f"); task="${task%.status}"
     record=$(status_span_first_actionable_record "$f" "$(hb_surfaced_offset "$task")")
     rc=$?
@@ -3416,6 +3424,9 @@ printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 FM_WATCH_DELIVERY_PID=$WATCHER_PID
 FM_WATCH_DELIVERY_IDENTITY=$(fm_pid_identity "$WATCHER_PID" 2>/dev/null || true)
 printf '%s\n' "$FM_WATCH_DELIVERY_IDENTITY" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
+# Names this watcher as the one process tree allowed to refresh the liveness
+# beacon from inside a long stage (fm_watcher_beat_touch, bin/fm-wake-lib.sh).
+export FM_WATCHER_BEAT_PID=$WATCHER_PID
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 
@@ -3554,6 +3565,7 @@ while :; do
   # repost after grace, and escalate once if the recovery turn is also missed.
   # No conversation scraping; unresolved records are never silently expired.
   fm_pending_reply_tick "$STATE" || true
+  fm_watcher_beat_touch "$STATE"
 
   # Endpoint liveness runs before queue observation: a positively dead or
   # missing secondmate endpoint is relaunched here on a bounded cadence, which
@@ -3564,6 +3576,7 @@ while :; do
     echo "watcher: secondmate liveness check failed" >&2
     exit 1
   }
+  fm_watcher_beat_touch "$STATE"
 
   # A live secondmate endpoint does not prove that its own wake loop is alive.
   # Observe the foreign queue before the rest of this cycle so an aged row wakes
@@ -3572,6 +3585,7 @@ while :; do
     echo "watcher: secondmate wake-loop observation failed" >&2
     exit 1
   }
+  fm_watcher_beat_touch "$STATE"
 
   # Process-to-event liveness repair. This never discovers a result by polling:
   # each registered source has its own child blocking on that source, and this
@@ -3582,11 +3596,13 @@ while :; do
   fi
   # Then deliver any queued-but-unsurfaced result, including one a runner
   # published while this watcher was between cycles.
+  fm_watcher_beat_touch "$STATE"
   procevent_surface_queued
 
   # A process-event result carries richer adapter-owned wake context than the
   # generic recovery reason, so give that owner first refusal.
   resurface_after_downtime
+  fm_watcher_beat_touch "$STATE"
 
   # The existing poll loop also owns the bounded inactive-outcome cadence.
   # This is mechanical and silent unless a durable terminal-outcome obligation
@@ -3600,6 +3616,7 @@ while :; do
   else
     triage_log "inactive-outcome reconciliation unavailable"
   fi
+  fm_watcher_beat_touch "$STATE"
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
@@ -3613,6 +3630,7 @@ while :; do
     contribution_check_output=
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
+      fm_watcher_beat_touch "$STATE"
       is_pr_poll=0
       if [ "$(basename "$c")" = x-watch.check.sh ]; then
         if fmx_poll_shim_valid "$c" "$FM_HOME" "$FM_ROOT" \
@@ -3867,6 +3885,7 @@ EOF
   # remembers the hash already classified, or the declaration a busy pane's
   # crossed turn bound already handed to the away-mode daemon).
   while IFS= read -r w; do
+    fm_watcher_beat_touch "$STATE"
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
     # Steering-inbox loss detection runs before the secondmate stale
@@ -4136,6 +4155,7 @@ EOF
   hb=$(( HEARTBEAT * (1 << streak) ))
   [ "$hb" -gt "$HEARTBEAT_MAX" ] && hb=$HEARTBEAT_MAX
   if [ "$(age_of "$STATE/.last-heartbeat")" -ge "$hb" ]; then
+    fm_watcher_beat_touch "$STATE"
     # Triage: in always-on mode a heartbeat is benign unless the cheap fleet-scan
     # turns up a captain-relevant status the per-wake path missed. Absorb the
     # no-change case (advance the schedule and back off exactly as wake() would,

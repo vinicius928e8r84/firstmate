@@ -131,6 +131,38 @@ fm_path_age() {
   echo $(( now - m ))
 }
 
+# fm_watcher_beat_touch <state-dir>
+# Refresh the watcher liveness beacon (state/.last-watcher-beat, same file and
+# mtime-only semantics as the touch at the top of bin/fm-watch.sh's poll loop)
+# from inside a long stage of one pass. The watcher exports its own pid as
+# FM_WATCHER_BEAT_PID; every caller that is not that watcher's process tree
+# (unset variable) is a no-op. A caller that outlives the watcher must never
+# keep the beacon fresh, so the touch also requires that pid to be alive, to
+# still be the singleton lock's holder, and to match the identity the watcher
+# recorded in that lock. The touch is also withheld while the beacon is younger
+# than FM_WATCHER_BEAT_MIN_SECS (default 30, far under any guard grace): an
+# ordinary pass finishes inside that and keeps today's one-touch-per-pass
+# beacon, which callers and tests read as the start of a pass, and only a pass
+# that outlasts it gets mid-stage refreshes. Call sites may be per record or
+# per probe: between checks the cost is one clock read.
+_FM_WATCHER_BEAT_LAST=0
+fm_watcher_beat_touch() {
+  local state=$1 pid=${FM_WATCHER_BEAT_PID:-} held='' recorded='' now min=${FM_WATCHER_BEAT_MIN_SECS:-30}
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  fm_epoch_seconds_to now
+  [ $((now - _FM_WATCHER_BEAT_LAST)) -ge "$min" ] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  _FM_WATCHER_BEAT_LAST=$now
+  [ "$(fm_path_age "$state/.last-watcher-beat")" -ge "$min" ] || return 0
+  { IFS= read -r held < "$state/.watch.lock/pid"; } 2>/dev/null || true
+  [ "$held" = "$pid" ] || return 0
+  { IFS= read -r recorded < "$state/.watch.lock/pid-identity"; } 2>/dev/null || true
+  if [ -n "$recorded" ] && [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" != "$recorded" ]; then
+    return 0
+  fi
+  : > "$state/.last-watcher-beat" 2>/dev/null || return 0
+}
+
 # fm_poll_derived_grace [poll-seconds]
 # Default guard-grace derivation: max(300, poll + 60). A watcher touches its
 # liveness beacon once per poll cycle, so a fixed 300s grace stops correctly
