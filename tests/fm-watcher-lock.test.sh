@@ -172,6 +172,63 @@ test_stale_watch_lock_reclaimed() {
   pass "killed watcher stale lock is reclaimed"
 }
 
+# The guard reads a lock whose pid is live but whose identity is not yet recorded
+# as held and unhealthy ("no live watcher process holds this home lock"). A new
+# watcher does recovery-marker work after it takes the lock, and that work waits
+# on the wake-queue lock, which a drain can hold for a minute on a loaded host.
+# The identity must therefore be on record the moment the lock is held.
+test_watcher_records_identity_before_queue_lock_work() {
+  local dir state fakebin out holder pid i lock_pid ok
+  dir=$(make_case identity-before-queue-lock)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$FM_WAKE_QUEUE_LOCK" || exit 1
+    : > "$2"
+    exec sleep 120
+  ' _ "$LIB" "$dir/queue-lock.held" &
+  holder=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$dir/queue-lock.held" ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -e "$dir/queue-lock.held" ] || { kill "$holder" 2>/dev/null || true; fail "could not hold the wake-queue lock"; }
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  lock_pid=
+  while [ "$i" -lt 100 ]; do
+    lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    [ "$lock_pid" = "$pid" ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  ok=1
+  [ "$lock_pid" = "$pid" ] || ok=0
+  if [ "$ok" -eq 1 ]; then
+    # The watcher holds the lock and is parked on the queue lock: no beat yet.
+    i=0
+    while [ "$i" -lt 100 ]; do
+      [ -s "$state/.watch.lock/pid-identity" ] && break
+      sleep 0.05
+      i=$((i + 1))
+    done
+    [ ! -e "$state/.last-watcher-beat" ] || ok=0
+    is_live_non_zombie "$pid" || ok=0
+    FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_watcher_lock_matches_pid "$2" "$3" "$4" "$5"' \
+      _ "$LIB" "$state" "$ROOT/bin/fm-watch.sh" "$pid" "$dir" || ok=0
+  fi
+  kill "$pid" "$holder" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  [ "$lock_pid" = "$pid" ] || fail "watcher did not take the lock while the queue lock was held"
+  [ "$ok" -eq 1 ] || fail "a watcher that holds the lock but waits on the wake-queue lock had no identity on record"
+  pass "watcher records its identity before it waits on the wake-queue lock"
+}
+
 test_live_stale_watch_lock_is_actionable() {
   local dir state fakebin out err status
   dir=$(make_case live-stale-lock)
@@ -1617,6 +1674,7 @@ test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_msys_pid_identity_uses_proc
 test_stale_watch_lock_reclaimed
 test_stale_watch_reclaim_publishes_before_clear
+test_watcher_records_identity_before_queue_lock_work
 test_live_stale_watch_lock_is_actionable
 test_live_stalled_watch_lock_is_replaced_past_hard_bound
 test_guard_warnings

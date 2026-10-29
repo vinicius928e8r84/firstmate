@@ -3283,6 +3283,22 @@ done
 if [ -n "$EVICTED_PID" ]; then
   echo "watcher: replaced stalled pid $EVICTED_PID (beacon ${EVICTED_BEAT_AGE}s past hard bound ${WATCHER_STALL_BOUND}s)"
 fi
+# Record this watcher's identity the moment it holds the lock, before any of the
+# recovery-marker work below. The guard (fm_watcher_healthy) treats a lock whose
+# pid is live but whose home, path, and identity are not yet recorded as held and
+# unhealthy, and alarms "no live watcher process holds this home lock"; the work
+# below is a long run of short-lived processes, seconds on a loaded host, so
+# recording late kept that alarm window open for all of it.
+# This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
+# ${BASHPID:-$$} from this same main shell). Read directly, never via a command
+# substitution, so it matches the stored holder pid for the self-eviction check.
+WATCHER_PID=${BASHPID:-$$}
+printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
+printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
+# shellcheck disable=SC2034 # Consumed by wake() in the separately linted transition owner.
+FM_WATCH_DELIVERY_PID=$WATCHER_PID
+FM_WATCH_DELIVERY_IDENTITY=$(fm_pid_identity "$WATCHER_PID" 2>/dev/null || true)
+printf '%s\n' "$FM_WATCH_DELIVERY_IDENTITY" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 handling_successor_has_queued_row() {
   local queued=1
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 1
@@ -3422,16 +3438,6 @@ watcher_cleanup() {
 }
 trap watcher_cleanup EXIT
 watcher_stop_signals
-# This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
-# ${BASHPID:-$$} from this same main shell). Read directly, never via a command
-# substitution, so it matches the stored holder pid for the self-eviction check.
-WATCHER_PID=${BASHPID:-$$}
-printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
-printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
-# shellcheck disable=SC2034 # Consumed by wake() in the separately linted transition owner.
-FM_WATCH_DELIVERY_PID=$WATCHER_PID
-FM_WATCH_DELIVERY_IDENTITY=$(fm_pid_identity "$WATCHER_PID" 2>/dev/null || true)
-printf '%s\n' "$FM_WATCH_DELIVERY_IDENTITY" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 # Names this watcher as the one process tree allowed to refresh the liveness
 # beacon from inside a long stage (fm_watcher_beat_touch, bin/fm-wake-lib.sh).
 export FM_WATCHER_BEAT_PID=$WATCHER_PID
