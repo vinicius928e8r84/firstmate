@@ -1672,6 +1672,11 @@ When the recorded flag is `above_budget` and less than two hours old, the resolv
 The line is advice only.
 It never changes the status, the candidates, or the `profile:` line, and an explicit captain model choice always wins.
 
+**Upstream sync**
+
+`bin/fm-upstream-sync.sh` keeps this home's checkout in step with `upstream` and the operator's `fork` without force-pushing or rewriting history: it fast-forwards `fork/main` to local main, merges a new `upstream/main` on a temporary `sync/upstream-YYYYMMDD` branch outside the primary checkout, and opens one pull request against the fork, or, on a conflict, writes `data/upstream-sync/YYYYMMDD.md` and sends one `upstream-sync-conflict` webhook notice.
+The home installs a daily cron line: `17 6 * * * nice -n 19 FM_HOME=/home/factory/firstmate /home/factory/firstmate/bin/fm-upstream-sync.sh`; the script header owns the guards, environment (including `FM_UPSTREAM_SYNC_DRY=1`), and the `state/.upstream-sync.log` and `.seen` records.
+
 **Missing or invalid rules**
 
 An absent rules file, a default-only file, or `rules: []` returns the non-clear reason `no rules to match` without a model or quota request, leaving firstmate's existing routing in control; an existing but unreadable or malformed rules file, including a broken symlink, remains an actionable exit 2 configuration error.
