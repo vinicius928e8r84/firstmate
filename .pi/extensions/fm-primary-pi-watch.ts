@@ -1365,6 +1365,16 @@ export default function (pi: ExtensionAPI) {
         enqueuePendingActionable(owner, pending);
         if (!generationIsLive(owner)) return;
         owner.retryFailures = 0;
+        // The pipeline restores and delivers one close at a time, and a
+        // delivery runs the inline drain, which takes a minute or more on a
+        // loaded host (see inlineDrainTimeoutMs). A close that lands while an
+        // earlier one is still being delivered would leave the home with no
+        // watcher for all of that time, so the successor starts now; the
+        // pipeline's own restore then finds it live and only verifies it.
+        if (owner.restoring) {
+          const early = startArm(owner, predecessor);
+          appendExtensionLog(`restore early predecessor=${predecessor || "none"} start=${early.ok ? `ok pid=${owner.child?.pid ?? "none"}` : "failed"}`);
+        }
         void processPendingActionables(owner);
         return;
       }

@@ -904,6 +904,96 @@ EOF
   pass "Pi actionable close starts one successor before wake delivery settles"
 }
 
+# A delivery runs the inline drain, a minute or more on a loaded host. A second
+# actionable close that lands meanwhile must still get its successor at once:
+# restoring it only after the first delivery settled left the home with no
+# watcher process for the whole of that drain.
+test_pi_actionable_close_during_delivery_starts_its_successor_at_once() {
+  local repo home plugin log stop out status
+  repo="$TMP_ROOT/pi-close-during-delivery-root"
+  home="$TMP_ROOT/pi-close-during-delivery-home"
+  log="$TMP_ROOT/pi-close-during-delivery.log"
+  stop="$TMP_ROOT/pi-close-during-delivery.stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --handling-delivered ]; then
+  printf 'confirmed generation=%s\n' "$2" >> "${FM_ARM_LOG:?}"
+  exit 0
+fi
+printf 'arm=%s predecessor=%s\n' "$$" "${FM_WATCH_PREDECESSOR_ARM_PID:-none}" >> "${FM_ARM_LOG:?}"
+count=$(grep -c '^arm=' "$FM_ARM_LOG")
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=during-%s\n' "$$" "$count"
+trap 'exit 0' TERM INT
+if [ "$count" -eq 1 ]; then
+  printf 'signal: first close\n'
+  exit 0
+fi
+if [ "$count" -eq 2 ]; then
+  while [ ! -e "$FM_STOP_FILE.second" ] && [ -e "$0" ]; do sleep 0.02; done
+  printf 'signal: second close\n'
+  exit 0
+fi
+while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const prompts = [];
+let releaseFirstDelivery = () => {};
+const firstDeliveryBlocked = new Promise((resolve) => {
+  releaseFirstDelivery = resolve;
+});
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async (message) => {
+    prompts.push(message);
+    if (prompts.length === 1) await firstDeliveryBlocked;
+  },
+};
+const arms = () => existsSync(process.env.FM_ARM_LOG)
+  ? readFileSync(process.env.FM_ARM_LOG, "utf8").split("\n").filter((row) => row.startsWith("arm=")).length
+  : 0;
+async function waitFor(pred, label) {
+  for (let i = 0; i < 500; i += 1) {
+    if (pred()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timeout waiting for ${label}`);
+}
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("tool-call-close-during-delivery", {}, undefined, undefined, {});
+await waitFor(() => arms() === 2 && prompts.length === 1, "first successor and the first delivery");
+// The first delivery is still in flight; the successor closes on a second wake.
+writeFileSync(`${process.env.FM_STOP_FILE}.second`, "close\n");
+await waitFor(() => arms() === 3, "the second close's successor while the first delivery is in flight");
+if (prompts.length !== 1) throw new Error(`the second wake was delivered before the first settled: ${prompts.join(" | ")}`);
+releaseFirstDelivery();
+await waitFor(() => prompts.length === 2, "the second wake after the first delivery");
+if (!prompts[1].includes("signal: second close")) throw new Error(`wrong second wake: ${prompts[1]}`);
+await new Promise((resolve) => setTimeout(resolve, 150));
+if (arms() !== 3) throw new Error(`the pipeline started an extra arm after the early successor: ${arms()}`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "Pi actionable close during a delivery must start its successor at once"
+  [ -z "$out" ] || fail "Pi close-during-delivery test printed output: $out"
+  pass "Pi actionable close during a delivery starts its successor at once"
+}
+
 # The arm child can publish its complete actionable line before its process
 # closes while the watcher finishes durable cleanup. The still-open predecessor
 # must never be mistaken for the successor merely because its readiness promise
@@ -6173,6 +6263,7 @@ test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop
 test_pi_scheduled_retry_call_is_owned_noop
 test_pi_actionable_close_starts_single_successor_before_delivery
+test_pi_actionable_close_during_delivery_starts_its_successor_at_once
 test_pi_actionable_output_waits_for_predecessor_close
 test_pi_branch_offer_owns_actionable_wake
 test_pi_branch_offer_flags_heartbeat
