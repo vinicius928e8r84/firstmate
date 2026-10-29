@@ -2378,6 +2378,58 @@ RECORD
   pass "ghost close: needs a reason, refuses a live endpoint, closes retired and unreachable ones with the owned note"
 }
 
+# Settled records older than FM_PENDING_REPLY_ARCHIVE_DAYS move to the sibling archive directory,
+# with their delivery marker; younger settled records, open work and escalations still waiting for
+# their decision to close stay in the live directory, and the tick performs the move once an hour.
+test_archive_moves_only_old_settled_records() {
+  local home state old young open esc rec archive moved out
+  home=$(setup_parent archive-settled)
+  state="$home/state"
+  archive="$state/pending-replies-archive"
+  # shellcheck disable=SC2031
+  export FM_PENDING_REPLY_NOW=1000
+  old=$(fm_pending_reply_create "$home" "$state" hibit "old settled")
+  fm_pending_reply_mark_delivered "$state" "$old"
+  printf 'done [corr=%s]: old reply\n' "$old" >> "$state/hibit.status"
+  fm_pending_reply_try_resolve "$state" "$old" || fail "old fixture should resolve"
+  export FM_PENDING_REPLY_NOW=$((1000 + 10 * 86400))
+  young=$(fm_pending_reply_create "$home" "$state" hibit "young settled")
+  fm_pending_reply_mark_delivered "$state" "$young"
+  printf 'done [corr=%s]: young reply\n' "$young" >> "$state/hibit.status"
+  fm_pending_reply_try_resolve "$state" "$young" || fail "young fixture should resolve"
+  open=$(fm_pending_reply_create "$home" "$state" hibit "still waiting")
+  esc=$(fm_pending_reply_create "$home" "$state" hibit "escalation never closed")
+  rec=$(fm_pending_reply_path "$state" "$esc")
+  fm_pending_reply_set "$rec" phase resolved
+  fm_pending_reply_set "$rec" resolved_epoch 1000
+  fm_pending_reply_set "$rec" escalated_epoch 900
+  printf 'old\n' > "$state/pending-replies/.delivery-confirmed-$old"
+  moved=$(fm_pending_reply_archive_settled "$state")
+  assert_equals 1 "$moved" "only the old settled record moves"
+  [ ! -e "$(fm_pending_reply_path "$state" "$old")" ] || fail "the old settled record left the live directory"
+  [ -f "$archive/$old" ] || fail "the old settled record is in the archive, not deleted"
+  [ -f "$archive/.delivery-confirmed-$old" ] || fail "its delivery marker moved with it"
+  for rec in "$young" "$open" "$esc"; do
+    [ -f "$(fm_pending_reply_path "$state" "$rec")" ] || fail "record $rec stays live"
+  done
+  assert_equals 0 "$(fm_pending_reply_archive_settled "$state")" "a second run finds nothing more"
+  # The tick runs the move itself, at most once per interval.
+  mv "$archive/$old" "$(fm_pending_reply_path "$state" "$old")"
+  rm -f "$state/pending-replies/.archive-last"
+  FM_PENDING_REPLY_TICK_MAX=1 fm_pending_reply_tick "$state" >/dev/null 2>&1
+  [ -f "$archive/$old" ] || fail "the tick archives a due settled record"
+  mv "$archive/$old" "$(fm_pending_reply_path "$state" "$old")"
+  FM_PENDING_REPLY_TICK_MAX=1 fm_pending_reply_tick "$state" >/dev/null 2>&1
+  [ -f "$(fm_pending_reply_path "$state" "$old")" ] || fail "a second tick inside the interval does not archive again"
+  # The tick may also have closed the escalation, which settles that record too; either way only
+  # settled records move and the one still waiting for its report stays live.
+  out=$(FM_PENDING_REPLY_ARCHIVE_DAYS=0 fm_pending_reply_archive_settled "$state")
+  [ "$out" -ge 2 ] || fail "a zero-day threshold archives every settled record (moved $out)"
+  [ -f "$(fm_pending_reply_path "$state" "$open")" ] || fail "the record still waiting for its report stays live"
+  assert_equals 4 "$(find "$state/pending-replies" "$archive" -maxdepth 1 -type f ! -name '.*' | wc -l | tr -d ' ')" "live plus archived still add up to every record: nothing deleted"
+  pass "archive: only old settled records move, with their marker, never deleted; the tick does it hourly"
+}
+
 test_unmarked_captain_input_creates_no_expectation
 test_fm_send_marked_secondmate_creates_pending_and_embeds_corr
 test_document_pointer_resolves
@@ -2405,5 +2457,6 @@ test_escalated_undelivered_correlation_stays_retryable
 test_same_kind_escalation_reopens_after_operator_close
 test_summary_keeps_accents_and_caps_by_character
 test_ghost_close_guards_and_closes
+test_archive_moves_only_old_settled_records
 
 printf 'ok - all pending-reply tests passed\n'

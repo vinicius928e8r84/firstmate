@@ -1560,6 +1560,75 @@ _fm_pending_reply_select_needing_work() {  # <record-path>...
   '
 }
 
+# Move settled records out of the live directory once they are old enough that
+# nothing reads them again: phase=resolved, resolved_epoch at least
+# FM_PENDING_REPLY_ARCHIVE_DAYS (default 7) old, and no escalation still open.
+# The tick already skips a settled record without a fork, but its selection still
+# opens every file, so the store (788 records, 667 settled, on 29/10) kept
+# growing the pass. Records move, never delete, to <dir>-archive beside the live
+# directory (a sibling, so the retirement scan of the live directory never meets
+# it), together with their .delivery-confirmed-<corr> marker; an existing
+# archived name is left where it is. The tick runs this at most once every
+# FM_PENDING_REPLY_ARCHIVE_INTERVAL seconds (default 3600) via the dot-file
+# .archive-last. Prints the number moved.
+fm_pending_reply_archive_settled() {  # <state-dir>
+  local state=$1 dir archive days cutoff rec name moved=0
+  local -a candidates=()
+  dir=$(fm_pending_reply_dir "$state")
+  [ -d "$dir" ] || { printf '0\n'; return 0; }
+  days=${FM_PENDING_REPLY_ARCHIVE_DAYS:-7}
+  case "$days" in ''|*[!0-9]*) days=7 ;; esac
+  cutoff=$(( $(fm_pending_reply_now) - days * 86400 ))
+  archive="$dir-archive"
+  for rec in "$dir"/*; do
+    [ -f "$rec" ] || continue
+    case "${rec##*/}" in .*) continue ;; esac
+    case "$rec" in *$'\n'*) continue ;; esac
+    candidates+=("$rec")
+  done
+  [ "${#candidates[@]}" -gt 0 ] || { printf '0\n'; return 0; }
+  mkdir -p "$archive" 2>/dev/null || { printf '0\n'; return 0; }
+  while IFS= read -r rec; do
+    name=${rec##*/}
+    [ ! -e "$archive/$name" ] || continue
+    mv -n "$rec" "$archive/$name" 2>/dev/null || continue
+    if [ -e "$dir/.delivery-confirmed-$name" ]; then
+      mv -n "$dir/.delivery-confirmed-$name" "$archive/.delivery-confirmed-$name" 2>/dev/null || true
+    fi
+    moved=$((moved + 1))
+  done < <(printf '%s\n' "${candidates[@]}" | LC_ALL=C awk -v cutoff="$cutoff" '
+    {
+      path = $0
+      phase = ""; resolved = ""; escalated = ""; closed = ""
+      while ((rc = (getline line < path)) > 0) {
+        if (index(line, "phase=") == 1) phase = substr(line, 7)
+        else if (index(line, "resolved_epoch=") == 1) resolved = substr(line, 16)
+        else if (index(line, "escalated_epoch=") == 1) escalated = substr(line, 17)
+        else if (index(line, "escalation_closed_epoch=") == 1) closed = substr(line, 25)
+      }
+      close(path)
+      if (rc < 0 || phase != "resolved" || resolved !~ /^[0-9]+$/ || resolved + 0 > cutoff) next
+      if (escalated != "" && closed == "") next
+      print path
+    }')
+  printf '%s\n' "$moved"
+}
+
+# fm_pending_reply_archive_if_due <state-dir>: the tick's throttled call.
+_fm_pending_reply_archive_if_due() {  # <state-dir>
+  local dir stamp interval last now
+  dir=$(fm_pending_reply_dir "$1")
+  stamp="$dir/.archive-last"
+  interval=${FM_PENDING_REPLY_ARCHIVE_INTERVAL:-3600}
+  case "$interval" in ''|*[!0-9]*) interval=3600 ;; esac
+  now=$(fm_pending_reply_now)
+  { IFS= read -r last < "$stamp"; } 2>/dev/null || last=0
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $((now - last)) -ge "$interval" ] || return 0
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || return 0
+  fm_pending_reply_archive_settled "$1" >/dev/null 2>&1 || true
+}
+
 # Refresh the watcher liveness beacon between records and remote reads. Only
 # the watcher's own process tree has bin/fm-wake-lib.sh's fm_watcher_beat_touch
 # loaded and FM_WATCHER_BEAT_PID set, so every other caller of this library
@@ -1602,6 +1671,7 @@ fm_pending_reply_tick() {  # <state-dir>
   local -a observation_tasks=() observation_values=() records=() selected=() sorted=() reached=()
   dir=$(fm_pending_reply_dir "$state")
   [ -d "$dir" ] || return 0
+  _fm_pending_reply_archive_if_due "$state"
   for rec in "$dir"/*; do
     [ -f "$rec" ] || continue
     case "${rec##*/}" in
