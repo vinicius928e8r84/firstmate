@@ -457,6 +457,7 @@ The Claude Stop auto-arm budget includes the stretched window and any pending wa
 The Pi, omp, and OpenCode adapters enforce their own fixed ready timeout, so each asks `bin/fm-arm-budget.sh` (a read-only wrapper over `bin/fm-watch-arm.sh --budget`) for the extra seconds the load stretch and any pending back-off allow, adds them to that timeout, and only then terminates an unready arm.
 The extra is 0 on an unloaded host, so their timeouts are unchanged there.
 An arm terminated mid-start leaves within `FM_ARM_TERM_WAIT_MS` and counts as a failed start, so an adapter that kills slow arms still drives the back-off.
+`bin/fm-adapter-limits.tsv` is the one table of the limits these waits must stay inside (the Claude hook timeout, the adapters' ready timeout and retire allowance) and of the arm defaults measured against them; add a row there before adding a wait, and `bin/fm-adapter-limits.sh check` (run by `tests/fm-adapter-limits.test.sh`) refuses a knob past its limit.
 
 The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYCLE_LOG_KEEP_LINES`.
 `state/.watch-triage.log` remains only the watcher's bounded absorbed-wake debug log and carries no lifecycle semantics.

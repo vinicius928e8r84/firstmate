@@ -65,6 +65,10 @@
 # environment so the watcher's descendants never see it. FM_ARM_QUICK_EXIT_SECONDS=0
 # turns the retry off. It stacks on any retry the harness adapter itself makes.
 #
+# The defaults of the confirmation window, its load-stretched cap, the back-off cap
+# and the TERM wait come from bin/fm-adapter-limits.tsv, which also holds the
+# adapter limits they must stay inside (bin/fm-adapter-limits.sh check).
+#
 # Load back-off: on a host whose 1-minute load average per CPU is at least 1, the
 # confirmation window above is stretched by that ratio (cap FM_ARM_CONFIRM_CAP,
 # default 120s), and an arm that follows unconfirmed starts waits before it
@@ -166,6 +170,8 @@ if [ "${FM_GATE_REFUSE_BYPASS:-}" != 1 ]; then
 fi
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-adapter-limits-lib.sh
+. "$SCRIPT_DIR/fm-adapter-limits-lib.sh"
 
 # Home-local watcher tuning is independent of Relay's generated cadence
 # artifact. Relay, when active, is sourced second so its required 30s cadence
@@ -189,7 +195,7 @@ GRACE=${FM_GUARD_GRACE:-300}
 # required pre-lock migration, so its bounded default covers that cold start.
 case "${OSTYPE:-}" in
   msys*|mingw*|cygwin*) ARM_CONFIRM_DEFAULT=30 ;;
-  *) ARM_CONFIRM_DEFAULT=10 ;;
+  *) ARM_CONFIRM_DEFAULT=$(fm_adapter_limit arm_confirm_base) ;;
 esac
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-$ARM_CONFIRM_DEFAULT}
 # A loaded host stretches the window in proportion to its load per CPU (header,
@@ -202,8 +208,8 @@ CONFIRM_TIMEOUT=$(fm_arm_confirm_window "$CONFIRM_TIMEOUT")
 # a few seconds to exit after they terminate it (FM_WATCH_ARM_RETIRE_TIMEOUT_MS),
 # and the rest of the handler costs a second or less on a busy host. Wall-clock,
 # not a poll count, because each poll forks and a loaded host makes polls slow.
-TERM_WAIT_MS=${FM_ARM_TERM_WAIT_MS:-200}
-case "$TERM_WAIT_MS" in ''|*[!0-9]*) TERM_WAIT_MS=200 ;; esac
+TERM_WAIT_MS=${FM_ARM_TERM_WAIT_MS:-}
+case "$TERM_WAIT_MS" in ''|*[!0-9]*) TERM_WAIT_MS=$(fm_adapter_limit arm_term_wait) ;; esac
 # shellcheck disable=SC2329 # Invoked indirectly by the signal handler below.
 now_ms() {
   if [ -n "${EPOCHREALTIME:-}" ]; then

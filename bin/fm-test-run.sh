@@ -429,7 +429,7 @@ family_for_basename() {
     fm-backend-orca.test.sh)
       printf '%s\n' orca
       ;;
-    fm-branch-supervision.test.sh|fm-busy-adapter-wiring.test.sh|\
+    fm-adapter-limits.test.sh|fm-branch-supervision.test.sh|fm-busy-adapter-wiring.test.sh|\
     fm-busy-state.test.sh|fm-capacity.test.sh|fm-overflow.test.sh|fm-classify-corr-token.test.sh|\
     fm-close-finished-lanes.test.sh|\
     fm-claude-stop-autoarm.test.sh|fm-cursor-harness.test.sh|\
@@ -702,6 +702,7 @@ list_portable_serial() {
 # balance rather than coverage. That doc owns the refresh procedure.
 portable_serial_weight_hints() {
   cat <<'EOF'
+tests/fm-adapter-limits.test.sh 200
 tests/fm-afk-contract.test.sh 11101
 tests/fm-afk-inject-e2e.test.sh 41958
 tests/fm-afk-pi-herdr-return-e2e.test.sh 52

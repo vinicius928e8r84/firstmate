@@ -225,14 +225,23 @@ fm_load_scaled() {
     'BEGIN { v = b * m * l / 1000; if (v > c) v = c; printf "%d\n", (v == int(v)) ? v : int(v) + 1 }'
 }
 
+# Load the adapter limits table reader only where an arm default needs it, so the
+# minimal fixtures and remote installations that copy this library for its queue
+# primitives alone keep working without the table.
+_fm_limits_require() {
+  command -v fm_adapter_limit >/dev/null 2>&1 && return 0
+  # shellcheck source=bin/fm-adapter-limits-lib.sh
+  . "$FM_WAKE_LIB_DIR/fm-adapter-limits-lib.sh"
+}
+
 # fm_arm_confirm_window <base-seconds>
 # The watcher-arm confirmation window: the configured base, stretched in
-# proportion to the load per CPU and capped at FM_ARM_CONFIRM_CAP (default 120,
-# never below the base). A fresh watcher that needs longer than a fixed window to
-# start on a loaded host is slow, not dead.
+# proportion to the load per CPU and capped at FM_ARM_CONFIRM_CAP (default from
+# bin/fm-adapter-limits.tsv, never below the base). A fresh watcher that needs
+# longer than a fixed window to start on a loaded host is slow, not dead.
 fm_arm_confirm_window() {
-  local base=$1 cap=${FM_ARM_CONFIRM_CAP:-120} window
-  case "$cap" in ''|*[!0-9]*) cap=120 ;; esac
+  local base=$1 cap=${FM_ARM_CONFIRM_CAP:-} window
+  case "$cap" in ''|*[!0-9]*) _fm_limits_require; cap=$(fm_adapter_limit arm_confirm_cap) ;; esac
   [ "$cap" -ge "$base" ] || cap=$base
   window=$(fm_load_scaled "$base" "$cap")
   printf '%s\n' "$window"
@@ -242,9 +251,9 @@ fm_arm_confirm_window() {
 # failure in <state>/.watch-arm-backoff ("<failures> <epoch>"); a confirmed
 # watcher clears it. While the host is loaded (load per CPU of at least 1) the
 # next arm waits base * 2^(failures-1) * (load per CPU) seconds since the last
-# failure, capped at FM_ARM_BACKOFF_CAP (default 30: with the 120s confirmation
-# cap it stays inside the Claude Stop hook's 180s timeout). FM_ARM_BACKOFF_BASE
-# defaults to 5. On an unloaded host there is no wait, so the existing
+# failure, capped at FM_ARM_BACKOFF_CAP (default from bin/fm-adapter-limits.tsv,
+# which keeps it and the confirmation cap inside the Claude hook timeout).
+# FM_ARM_BACKOFF_BASE defaults to 5. On an unloaded host there is no wait, so the existing
 # retry-once behavior is unchanged. A record older than FM_ARM_BACKOFF_RESET
 # (default 600) is ignored so an old streak cannot penalise a fresh failure.
 fm_arm_backoff_failures() {  # <state>
@@ -259,9 +268,9 @@ fm_arm_backoff_failures() {  # <state>
 
 # fm_arm_backoff_seconds <failures>
 fm_arm_backoff_seconds() {
-  local failures=$1 base=${FM_ARM_BACKOFF_BASE:-5} cap=${FM_ARM_BACKOFF_CAP:-30} milli exp
+  local failures=$1 base=${FM_ARM_BACKOFF_BASE:-5} cap=${FM_ARM_BACKOFF_CAP:-} milli exp
   case "$base" in ''|*[!0-9]*) base=5 ;; esac
-  case "$cap" in ''|*[!0-9]*) cap=30 ;; esac
+  case "$cap" in ''|*[!0-9]*) _fm_limits_require; cap=$(fm_adapter_limit arm_backoff_cap) ;; esac
   [ "$failures" -ge 1 ] 2>/dev/null || { printf '0\n'; return 0; }
   milli=$(fm_load_milli)
   [ "$milli" -ge 1000 ] || { printf '0\n'; return 0; }

@@ -1,0 +1,12 @@
+# Adapter time limits, one row per limit or knob: name, value, unit, kind, owner and meaning.
+# Single owner of these numbers (bin/fm-adapter-limits.sh owns reading and checking them).
+# kind "limit" is a ceiling a supervisor adapter imposes; kind "knob" is a default the arm picks.
+# Tab-separated. Add a row here before adding a wait, then run bin/fm-adapter-limits.sh check.
+claude_hook_timeout	180	s	limit	.claude/settings.json: the Claude hook that runs the arm is killed after this long
+adapter_ready_timeout	12000	ms	limit	Pi, omp, OpenCode adapters: base time an arm may take to report started before the adapter terminates it (the adapter adds bin/fm-arm-budget.sh seconds on a loaded host)
+adapter_retire_allowance	3000	ms	limit	Pi, omp, OpenCode adapters: how long a terminated unready arm may take to exit (FM_WATCH_ARM_RETIRE_TIMEOUT_MS)
+arm_confirm_base	10	s	knob	bin/fm-watch-arm.sh: unloaded confirmation window (FM_ARM_CONFIRM_TIMEOUT)
+arm_confirm_cap	120	s	knob	bin/fm-wake-lib.sh: ceiling of the load-stretched confirmation window (FM_ARM_CONFIRM_CAP)
+arm_backoff_cap	30	s	knob	bin/fm-wake-lib.sh: ceiling of the wait before re-arming after a failed start (FM_ARM_BACKOFF_CAP)
+arm_term_wait	200	ms	knob	bin/fm-watch-arm.sh: wait for a starting watcher to reach cleanup before the TERM is forwarded (FM_ARM_TERM_WAIT_MS)
+arm_term_cleanup	1000	ms	knob	measured upper bound of the rest of the arm's TERM handler on a busy host
