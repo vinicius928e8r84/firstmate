@@ -57,9 +57,14 @@ set -uo pipefail
 FM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
+# shellcheck source=bin/fm-usage-ledger-lib.sh
+. "$FM_ROOT/bin/fm-usage-ledger-lib.sh"
+
 usage() { sed -n 2,53p "$0"; }
 
-wt= remote=origin base=main slug= pr= verify_only=0 allow_unpinned=0
+wt= remote=origin base=main slug= pr= verify_only=0 allow_unpinned=0 usage_outcome=
+# One usage line per run (bin/fm-usage-ledger-lib.sh): the result line, or the exit status of a refused run.
+trap 'fm_usage_record fm-pr-merge-main "${usage_outcome:-exit-$?}" "$pr" merge' EXIT
 checks=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -128,11 +133,14 @@ if [ "$verify_only" = 0 ]; then
   target=$(git -C "$wt" rev-parse "FETCH_HEAD^{commit}") || exit 3
   old=$(git -C "$wt" rev-parse HEAD) || exit 3
   if git -C "$wt" merge-base --is-ancestor "$target" "$old"; then
+    usage_outcome=ALREADY-CURRENT
     echo "ALREADY-CURRENT $remote/$base"
   elif merge_out=$(env "${merge_env[@]+"${merge_env[@]}"}" git -C "$wt" merge --no-edit "$target" 2>&1); then
+    usage_outcome=MERGE-CLEAN
     echo "MERGE-CLEAN ${old:0:8} -> $(git -C "$wt" rev-parse --short=8 HEAD)"
   else
     if [ -e "$git_dir/MERGE_HEAD" ]; then
+      usage_outcome=MERGE-CONFLICT
       echo "MERGE-CONFLICT"
       git -C "$wt" diff --name-only --diff-filter=U | sed 's/^/  conflicted: /'
       exit 10
@@ -143,8 +151,10 @@ if [ "$verify_only" = 0 ]; then
   fi
 fi
 
+[ "$verify_only" = 0 ] || usage_outcome=VERIFY-ONLY
 for cmd in "${checks[@]+"${checks[@]}"}"; do
   if ! ( cd "$wt" && bash -c "$cmd" ); then
+    usage_outcome=CHECK-FAILED
     echo "CHECK-FAILED $cmd"
     exit 11
   fi

@@ -31,6 +31,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 F=${FM_HOME:-$(cd "$HERE/.." && pwd)}
 S=${FM_STATE_OVERRIDE:-$F/state}
+FM_USAGE_HOME=$F
 C=${FM_CONFIG_OVERRIDE:-$F/config}
 now() { echo "${FM_LG_NOW:-$(date +%s)}"; }
 LOG=$S/.lane-guard.log; OUT=$S/.lane-guard-alerts
@@ -38,6 +39,12 @@ SLOT_MAX=${FM_SLOT_REQUEST_MAX_SEC:-3600}; SLOT_GRACE=${FM_SLOT_REQUEST_GRACE_SE
 ASKS=${FM_LG_ASKS:-$F/data/tools/fm-asks.sh}
 FAILDIR=$S/spawn-failures
 ALERTED=0
+ALERT_N=0
+USAGE_KIND=
+# shellcheck source=bin/fm-usage-ledger-lib.sh
+. "$HERE/fm-usage-ledger-lib.sh"
+# One usage line per run (bin/fm-usage-ledger-lib.sh): how many new alerts the scan printed, or the exit status.
+trap 'fm_usage_record fm-lane-guard "${USAGE_OUTCOME:-exit-$?}" - "${USAGE_KIND:-run}"' EXIT
 
 log() { mkdir -p "$S"; echo "$(date -u -d "@$(now)" +%FT%TZ) $*" >> "$LOG"; }
 notify() { # <event> <message>; same webhook and opt-out as bin/fm-silent-watcher.sh
@@ -57,6 +64,7 @@ alert() { # <key> <ask:0|1> <message>
   [ "$ask" = 1 ] && [ -x "$ASKS" ] && FM_HOME=$F "$ASKS" add --key "lane-guard-$key" "$msg" >/dev/null 2>&1
   printf '%s\n' "$msg"
   ALERTED=1
+  ALERT_N=$((ALERT_N + 1))
 }
 
 # ------------------------------------------------------------------ slot requests
@@ -198,14 +206,17 @@ scan_pod() {
 
 case "${1:-}" in
   record-spawn-failure) shift; [ $# -ge 2 ] || { echo "usage: fm-lane-guard.sh record-spawn-failure <task-id> <exit-code> [kind project backend harness]" >&2; exit 64; }
+    USAGE_KIND=record-spawn-failure; USAGE_OUTCOME=recorded
     record_spawn_failure "$@"; exit $? ;;
   scan)
-    mkdir -p "$S"; exec 9>"$S/.lane-guard.lock"; flock -n 9 || exit 0
+    USAGE_KIND=scan-${2:-all}
+    mkdir -p "$S"; exec 9>"$S/.lane-guard.lock"; flock -n 9 || { USAGE_OUTCOME=busy; exit 0; }
     case "${2:-all}" in
       slot) scan_slot ;; spawn) scan_spawn ;; pod) scan_pod ;;
       all) scan_slot; scan_spawn; scan_pod ;;
       *) echo "usage: fm-lane-guard.sh scan [slot|spawn|pod]" >&2; exit 64 ;;
     esac
+    USAGE_OUTCOME=alerts-$ALERT_N
     [ "$ALERTED" = 0 ] ;;
   *) echo "usage: fm-lane-guard.sh scan [slot|spawn|pod] | record-spawn-failure <task-id> <exit-code> [kind project backend harness]" >&2; exit 64 ;;
 esac

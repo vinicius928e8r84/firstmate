@@ -42,9 +42,14 @@ set -uo pipefail
 FM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
+# shellcheck source=bin/fm-usage-ledger-lib.sh
+. "$FM_ROOT/bin/fm-usage-ledger-lib.sh"
+
 usage() { sed -n 2,39p "$0"; }
 
-repo= reviewed= pin_slug= pin_pr= head=HEAD base=origin/main max=400
+repo= reviewed= pin_slug= pin_pr= head=HEAD base=origin/main max=400 verdict=
+# One usage line per run (bin/fm-usage-ledger-lib.sh): the verdict, or the exit status of a refused run.
+trap 'fm_usage_record fm-review-delta "${verdict:-exit-$?}" "$pin_pr" delta' EXIT
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo|--reviewed|--head|--base|--max-lines) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;

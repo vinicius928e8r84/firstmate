@@ -18,10 +18,16 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 F=${FM_HOME:-$(cd "$HERE/.." && pwd)}
 S=${FM_STATE_OVERRIDE:-$F/state}
+FM_USAGE_HOME=$F
 D=$F/data
 SEEN=$S/.clean-pr-guard.seen
 GH_TIMEOUT=${FM_CPG_GH_TIMEOUT:-20}
 ALERTED=0
+ALERT_N=0
+# shellcheck source=bin/fm-usage-ledger-lib.sh
+. "$HERE/fm-usage-ledger-lib.sh"
+# One usage line per run (bin/fm-usage-ledger-lib.sh): how many new alerts it printed.
+trap 'fm_usage_record fm-clean-pr-guard "alerts-$ALERT_N" - scan' EXIT
 
 meta_get() { sed -n "s/^$2=//p" "$1" | head -1; }
 
@@ -53,5 +59,6 @@ for meta in "$S"/*.meta; do
   printf '%s %s\n' "$url" "$head" >> "$SEEN"
   echo "clean-pr-guard: $url head ${head:0:7} is CLEAN with no review record (task $id)"
   ALERTED=1
+  ALERT_N=$((ALERT_N + 1))
 done
 exit "$ALERTED"

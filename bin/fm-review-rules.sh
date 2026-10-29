@@ -16,6 +16,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+# shellcheck source=bin/fm-usage-ledger-lib.sh
+. "$SCRIPT_DIR/fm-usage-ledger-lib.sh"
 
 cat <<RULES
 Reviewer standing rules:
@@ -23,3 +27,4 @@ Reviewer standing rules:
 - Run only focused tests of the paths this change touches, and only when reading the code leaves a question a test can answer.
 - If an earlier clean review exists and the head moved, read the packet from $SCRIPT_DIR/fm-review-delta.sh (the changed part only) instead of reading the whole PR again; a DELTA-OWN-CHANGED packet is the one case that calls for a fresh read of the own change.
 RULES
+fm_usage_record fm-review-rules printed - rules

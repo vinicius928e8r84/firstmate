@@ -18,6 +18,7 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 F=${FM_HOME:-$(cd "$HERE/.." && pwd)}
+FM_USAGE_HOME=$F
 CRED=${FM_PREAWAY_CREDENTIALS:-$HOME/.claude/.credentials.json}
 NOW=${FM_PREAWAY_NOW:-$(date +%s)}
 LOGIN_MIN_H=${FM_PREAWAY_LOGIN_MIN_HOURS:-6}
@@ -26,12 +27,16 @@ SSH_T=${FM_PREAWAY_SSH_TIMEOUT:-10}
 POD=${FM_PREAWAY_POD_BUDGET:-$F/data/tools/fm-pod-budget.sh}
 CAP=${FM_PREAWAY_CAPACITY:-$HERE/fm-capacity.sh}
 BUD=${FM_PREAWAY_CLAUDE_BUDGET:-$HERE/fm-claude-budget.sh}
-N=0; MISSING=0; STEPS=()
+N=0; MISSING=0; MISSING_N=0; STEPS=()
+# shellcheck source=bin/fm-usage-ledger-lib.sh
+. "$HERE/fm-usage-ledger-lib.sh"
+# One usage line per run (bin/fm-usage-ledger-lib.sh): how many checks were MISSING.
+trap 'fm_usage_record fm-preaway-check "MISSING-$MISSING_N" - checklist' EXIT
 clock() { TZ=America/Fortaleza date -d "@$1" +%H:%M; }
 DEADLINE=$(clock $((NOW + GRACE * 60)))
 line() { # status what detail [step]
   N=$((N + 1)); printf '%d. %s %s: %s\n' "$N" "$1" "$2" "$3"
-  if [ "$1" = MISSING ]; then MISSING=1; [ -z "${4:-}" ] || STEPS+=("$4"); fi
+  if [ "$1" = MISSING ]; then MISSING=1; MISSING_N=$((MISSING_N + 1)); [ -z "${4:-}" ] || STEPS+=("$4"); fi
 }
 ssh_check() { # label target step-text
   local label=$1 target=$2
