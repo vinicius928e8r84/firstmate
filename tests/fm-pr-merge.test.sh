@@ -263,6 +263,14 @@ case "${1:-} ${2:-}" in
         cat "$FM_TEST_GH_RUNS"
         exit $?
         ;;
+      *" repos/"*"/compare/"*)
+        # The base...head relation: "<status> <behind_by>" as --jq prints it.
+        if [ -f "${FM_TEST_GH_COMPARE_FAIL:-}" ]; then
+          exit 1
+        fi
+        cat "${FM_TEST_GH_COMPARE:-/dev/null}" 2>/dev/null || printf 'ahead 0\n'
+        exit 0
+        ;;
       *" repos/"*"/rules/branches/"*merge_queue*) ;;
       *" repos/"*"/rules/branches/"*)
         if [ -f "${FM_TEST_GH_REQUIRED_RULES_FAIL:-}" ]; then
@@ -678,6 +686,8 @@ run_pr_merge() {
   FM_TEST_GH_RULES_FAIL_BODY="$case_dir/github-rules-fail-body" \
   FM_TEST_GH_BRANCH="$case_dir/github-branch.json" \
   FM_TEST_GH_BRANCH_FAIL="$case_dir/github-branch-fail" \
+  FM_TEST_GH_COMPARE="$case_dir/github-compare" \
+  FM_TEST_GH_COMPARE_FAIL="$case_dir/github-compare-fail" \
   FM_TEST_GH_REQUIRED_RULES="$case_dir/github-required-rules.json" \
   FM_TEST_GH_REQUIRED_RULES_FAIL="$case_dir/github-required-rules-fail" \
   FM_TEST_META_AT_MERGE="$case_dir/meta-at-merge" \
@@ -3266,6 +3276,76 @@ test_github_red_checks_refuse_and_allow_red_waives_named() {
   pass "fm-pr-merge refuses red GitHub checks and waives only a named --allow-red check"
 }
 
+# The head must contain the base tip: a PR that is behind or diverged was tested on a base
+# that has moved, so it refuses naming the distance and the join script; --allow-behind waives
+# only that, an unreadable comparison refuses, and the waiver is attended-only.
+test_github_head_behind_base_refuses_and_allow_behind_waives() {
+  local case_dir rc head
+  head=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+  case_dir=$(make_case github-behind)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" "$head"
+  printf 'behind 3\n' > "$case_dir/github-compare"
+  set +e
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/90 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "github-behind: a head behind its base must refuse"
+  assert_grep 'the head is behind main by 3 commit' "$case_dir/stderr" "github-behind: distance was not named"
+  assert_grep 'bin/fm-pr-merge-main.sh' "$case_dir/stderr" "github-behind: the join script was not named"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "github-behind: gh pr merge ran on a behind head"
+
+  case_dir=$(make_case github-diverged)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" "$head"
+  printf 'diverged 2\n' > "$case_dir/github-compare"
+  set +e
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/91 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "github-diverged: a diverged head must refuse"
+  assert_grep 'diverged from main and is behind it by 2 commit' "$case_dir/stderr" "github-diverged: distance was not named"
+
+  case_dir=$(make_case github-compare-unreadable)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" "$head"
+  : > "$case_dir/github-compare-fail"
+  set +e
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/92 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "github-compare-unreadable: an unreadable comparison must refuse"
+  assert_grep 'could not be read' "$case_dir/stderr" "github-compare-unreadable: the failed read was not named"
+
+  case_dir=$(make_case github-allow-behind)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" "$head"
+  printf 'behind 3\n' > "$case_dir/github-compare"
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/93 \
+    --allow-behind \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "github-allow-behind: the waiver should merge"
+  assert_logged_gh_merge "$case_dir" 93 example/repo --squash
+
+  case_dir=$(make_case github-allow-behind-away)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" "$head"
+  printf 'behind 3\n' > "$case_dir/github-compare"
+  write_away_record "$case_dir" --words 'merge task-x1 when green'
+  set +e
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/94 \
+    --allow-behind \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "github-allow-behind-away: --allow-behind must be refused while away"
+  assert_grep '--allow-behind is attended-only' "$case_dir/stderr" "github-allow-behind-away: refusal did not name attended-only"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "github-allow-behind-away: gh pr merge ran"
+  pass "fm-pr-merge refuses a head behind its base, names the join, and waives only with an attended --allow-behind"
+}
+
 # A draft cannot be merged, and neither can a pull request whose draft state the
 # forge did not report as a boolean; both refuse before any merge call.
 test_github_draft_or_unreadable_draft_state_refuses() {
@@ -4693,4 +4773,5 @@ test_required_partial_reads_report_all_failures
 test_allow_red_refused_on_forgejo
 test_allow_missing_refused_on_forgejo
 test_allow_no_pipeline_merges_only_a_null_head_pipeline
+test_github_head_behind_base_refuses_and_allow_behind_waives
 test_allow_no_pipeline_is_attended_only_and_gitlab_only

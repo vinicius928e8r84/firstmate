@@ -42,6 +42,14 @@
 # github_branch_rules_unavailable_on_plan owns the narrow plan-unavailable
 # exception; every other unreadable required source refuses.
 # Every failing condition is reported, not just the first.
+# The head must also contain the current tip of the base branch (GitHub's compare
+# of base...head reads ahead or identical): a PR that is behind or has diverged
+# was tested on a base that has since moved, and every earlier merge in a serial
+# run moves it, so the refusal names how far behind it is and points at
+# bin/fm-pr-merge-main.sh, which joins it without a model so only the delta needs
+# a re-test. An unreadable comparison refuses too. An attended --allow-behind
+# waives only this condition for one merge; it applies to GitHub only and is
+# refused while the away-posture record exists.
 # The verified head is then passed to gh as
 # --match-head-commit, so a push that lands between that read and the merge
 # fails the merge instead of landing commits nothing verified. Reading that
@@ -180,7 +188,7 @@
 # between the caller's check and this read is never merged on the caller's word.
 # An unusable value is a usage error (exit 2) before any state is recorded.
 #
-# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [--expected-head <commit-id>] [-- <extra forge merge args>]
+# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [--allow-behind] [--expected-head <commit-id>] [-- <extra forge merge args>]
 #
 # On GitLab, this script confirms the MR is actually merged before reporting it;
 # an auto-merge-queued or unconfirmed request leaves the poll armed and records
@@ -240,6 +248,7 @@ fi
 shift 2
 ATTENDED_OVERRIDE=false
 ALLOW_NO_PIPELINE=false
+ALLOW_BEHIND=false
 EXPECTED_HEAD=
 ALLOW_RED=()
 ALLOW_MISSING=()
@@ -281,6 +290,14 @@ while [ "$#" -gt 0 ]; do
       echo "error: --allow-no-pipeline takes no value" >&2
       exit 2
       ;;
+    --allow-behind)
+      ALLOW_BEHIND=true
+      shift
+      ;;
+    --allow-behind=*)
+      echo "error: --allow-behind takes no value" >&2
+      exit 2
+      ;;
     --expected-head)
       [ -z "$EXPECTED_HEAD" ] || { echo "error: --expected-head may be specified only once" >&2; exit 2; }
       EXPECTED_HEAD=${2:-}
@@ -317,6 +334,10 @@ fi
 # --allow-no-pipeline waives only GitLab's own reading of a merge request that
 # has no head pipeline at all. GitHub's per-check waivers and Forgejo's
 # combined status have no such state to waive, so it is refused there too.
+if [ "$ALLOW_BEHIND" = true ] && [ "$PROVIDER" != github ]; then
+  echo "error: --allow-behind applies only to GitHub, the only provider whose merge checks that the head contains the base" >&2
+  exit 2
+fi
 if [ "$ALLOW_NO_PIPELINE" = true ] && [ "$PROVIDER" != gitlab ]; then
   echo "error: --allow-no-pipeline applies only to GitLab, where it waives a merge request that has no head pipeline at all" >&2
   exit 2
@@ -1035,7 +1056,7 @@ github_required_checks_missing() {
 # caller can retry a still-computing mergeability read instead of refusing.
 github_verify_mergeable() {
   local json fields line red name covered missing unreported producers runs
-  local total=0 named=0 refusals='' mergeable_refusal=''
+  local total=0 named=0 refusals='' mergeable_refusal='' relation=''
   local state='' draft='' mergeable='' merge_state='' live_head='' base=''
 
   if ! json=$(gh pr view "$URL" --json state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup 2>/dev/null) \
@@ -1155,6 +1176,30 @@ EOF
     done <<EOF
 $missing
 EOF
+  fi
+
+  if relation=$(gh api "repos/$PR_OWNER/$PR_REPO/compare/$base...$live_head" \
+      --jq '"\(.status) \(.behind_by)"' 2>/dev/null) && [ -n "$relation" ]; then
+    case "$relation" in
+      "ahead "*|"identical "*) ;;
+      "behind "*|"diverged "*)
+        if [ "$ALLOW_BEHIND" != true ]; then
+          case "$relation" in
+            behind\ *) relation="behind $base by ${relation#* }" ;;
+            *) relation="diverged from $base and is behind it by ${relation#* }" ;;
+          esac
+          refusals="$refusals  - the head is $relation commit(s), so it was tested on a base that has moved; join it with bin/fm-pr-merge-main.sh and re-test the delta (or pass --allow-behind, attended only)
+"
+        fi
+        ;;
+      *)
+        refusals="$refusals  - the comparison of $base with head $live_head returned \"$relation\", not ahead, identical, behind or diverged
+"
+        ;;
+    esac
+  else
+    refusals="$refusals  - the comparison of $base with head $live_head could not be read
+"
   fi
 
   if [ -n "$mergeable_refusal" ]; then
@@ -1454,6 +1499,10 @@ require_current_away_authority() {
   fi
   if [ "$FM_PR_AWAY_POSTURE" = true ] && [ "${#ALLOW_MISSING[@]}" -gt 0 ]; then
     echo "error: --allow-missing is attended-only; while the away-posture record exists every required check must report" >&2
+    return 2
+  fi
+  if [ "$FM_PR_AWAY_POSTURE" = true ] && [ "$ALLOW_BEHIND" = true ]; then
+    echo "error: --allow-behind is attended-only; while the away-posture record exists the head must contain the base tip" >&2
     return 2
   fi
   if [ "$FM_PR_AWAY_POSTURE" = true ] && [ "$ALLOW_NO_PIPELINE" = true ]; then
