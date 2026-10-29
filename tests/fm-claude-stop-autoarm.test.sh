@@ -729,7 +729,7 @@ test_owner_mutex_contention_preserves_failure_episode_reset() {
   : > "$dir/state/.claude-autoarm-failure-notified"
   : > "$dir/state/.claude-autoarm-failure-alarmed"
   write_arm_fixture "$dir" reset-boundary
-  sleep 60 &
+  sleep 600 &
   watcher=$!
   watcher_id=$(watcher_identity "$dir" "$watcher") || fail "could not identify reset-contention watcher"
   record_watcher_lock "$dir" "$watcher" "$watcher_id"
@@ -737,13 +737,17 @@ test_owner_mutex_contention_preserves_failure_episode_reset() {
   out="$dir/state/hook.out"
   run_autoarm_bg "$dir" "$out"
   hook_pid=$RUN_AUTOARM_BG_PID
+  # Wait on the condition, not a tuned delay: under host load the hook can take
+  # many seconds to reach the boundary. Fail early only if the hook died first,
+  # and otherwise give up at a deadline far beyond any loaded start-up.
   i=0
   while [ ! -e "$dir/state/arm-waiting" ]; do
-    [ "$i" -lt 50 ] || fail "healthy owner never reached the reset boundary"
+    kill -0 "$hook_pid" 2>/dev/null || fail "hook exited before the owner reached the reset boundary: $(cat "$out")"
+    [ "$i" -lt 6000 ] || fail "healthy owner never reached the reset boundary"
     sleep 0.05
     i=$((i + 1))
   done
-  sleep 60 &
+  sleep 600 &
   holder=$!
   mkdir -p "$dir/state/.claude-autoarm.lock"
   printf '%s\n' "$holder" > "$dir/state/.claude-autoarm.lock/pid"
