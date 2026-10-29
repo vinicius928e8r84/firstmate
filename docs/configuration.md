@@ -746,9 +746,12 @@ A pressure file is any producer of the `lookout.beat` 1.x shape, read by its own
 `quota-provider` is the only key that makes the script reach the network, through `quota-axi`, bounded to five seconds.
 
 While the file exists, the watcher runs `bin/fm-capacity.sh --publish` detached at most every 30 seconds, writing this home's lane facts to `state/lane-capacity.json`: its lanes, its cap and limits, its machine's pressure and boots, its watcher's freshness, and its own admission verdict.
-Publishing is best-effort and never changes what the watcher does; no spawn reads the verdict.
+Publishing is best-effort and never changes what the watcher does.
 `bin/fm-capacity.sh --admit` is an advisory check of the same verdict: it exits 0 when the verdict admits or the file is absent, and reports the reasons on stderr with exit 75 when it does not.
 No Firstmate script calls it.
+The cap itself is a real ceiling: while the file exists, `bin/fm-spawn.sh` defers a fresh ship or scout with one `deferred:` line and exit 75 once `bin/fm-capacity.sh` counts as many lanes as the cap, before creating anything, so its backlog item stays queued.
+There is no override flag: clean up a lane or raise the number.
+Work that is CPU-heavy and needs none of this home's data can instead go to a remote secondmate with room: `bin/fm-overflow.sh pick` reads each candidate's published `state/lane-capacity.json` (creative-aux and pc-aux2 by default, so those homes need their own `config/lane-capacity`), skips any host without a free lane, with load per core at or over 3, under critical pressure, reserved, or with stale facts, and prints the pick with its reason or `none free`; `bin/fm-overflow.sh send <text...>` hands the text to the pick as a marked routed request through `bin/fm-send.sh` ([remote second mates](remote-secondmates.md)).
 The script's header owns the report line, the published document's fields, the verdict, the beat freshness rules, the host-constraint thresholds, and the probe fallbacks.
 
 ## PR-ready line after green (config/ready-after-green)

@@ -218,6 +218,10 @@
 #   A batch reports such a pair as `batch: DEFERRED` and exits 75 when nothing
 #   else failed. A relaunch and a --secondmate spawn are never counted against
 #   capacity.
+#   Lane cap: when config/lane-capacity exists, a fresh ship or scout spawn
+#   also defers the same way (one `deferred:` line, exit 75, nothing created,
+#   item stays queued) once bin/fm-capacity.sh counts as many lanes as the cap;
+#   an unreadable cap refuses with exit 1. There is no override: raise the cap.
 #   Memory floor: every launch kind, a relaunch and a --secondmate spawn
 #   included, refuses with exit 76 and one `error: spawn refused:` line before
 #   anything is created when the host has less than 2048 MB of available memory
@@ -1929,7 +1933,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
       echo "batch: DEFERRED ${pair%%=*} (${pair#*=}) - the host is below its free-memory floor, so it stays queued" >&2
       [ "$rc" -ne 0 ] || rc=$FM_MEMORY_FLOOR_EXIT
     elif [ "$pair_rc" -eq "$FM_PROJECT_CAPACITY_DEFER_EXIT" ]; then
-      echo "batch: DEFERRED ${pair%%=*} (${pair#*=}) - its project is at capacity, so it stays queued" >&2
+      echo "batch: DEFERRED ${pair%%=*} (${pair#*=}) - a capacity limit holds it, so it stays queued" >&2
       [ "$rc" -ne 0 ] || rc=$FM_PROJECT_CAPACITY_DEFER_EXIT
     elif [ "$pair_rc" -ne 0 ]; then
       echo "batch: FAILED to spawn ${pair%%=*} (${pair#*=})" >&2
@@ -3660,6 +3664,25 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] &&
   ! git -C "$PROJ_ABS" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
   echo "error: spawn refused: project $PROJ_ABS has no commit yet (unborn HEAD), so there is nothing to branch a worktree from; make one commit in the project, for example 'git -C $PROJ_ABS commit --allow-empty -m \"chore: initial commit\"', then spawn again" >&2
   exit 1
+fi
+# Lane ceiling (bin/fm-capacity.sh owns the count and the config/lane-capacity
+# cap): a fresh ship or scout is deferred, with the same exit and the same
+# nothing-created guarantee as the project capacity below, once this home
+# already runs as many lanes as the cap allows. A relaunch replaces a lane that
+# is already counted, and a secondmate holds none.
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ -e "$CONFIG/lane-capacity" ]; then
+  LANE_CAP_REPORT=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$SCRIPT_DIR/fm-capacity.sh" 2>/dev/null | head -1) || LANE_CAP_REPORT=
+  LANE_CAP_LANES=$(printf '%s\n' "$LANE_CAP_REPORT" | sed -n 's/.* lanes=\([0-9][0-9]*\) .*/\1/p')
+  LANE_CAP_TARGET=$(printf '%s\n' "$LANE_CAP_REPORT" | sed -n 's/.* target=\([0-9][0-9]*\) .*/\1/p')
+  if [ -z "$LANE_CAP_LANES" ] || [ -z "$LANE_CAP_TARGET" ]; then
+    echo "error: spawn refused: the lane cap ($CONFIG/lane-capacity) is unreadable; fix it so the captain's worker limit is known (docs/configuration.md \"Lane capacity\")" >&2
+    exit 1
+  fi
+  if [ "$LANE_CAP_LANES" -ge "$LANE_CAP_TARGET" ]; then
+    echo "deferred: this machine already runs $LANE_CAP_LANES lanes against a cap of $LANE_CAP_TARGET ($CONFIG/lane-capacity); task $ID was not launched and its backlog item stays queued - dispatch it again once a lane is cleaned up, route CPU-heavy work to another host with bin/fm-overflow.sh, or raise the cap" >&2
+    exit "$FM_PROJECT_CAPACITY_DEFER_EXIT"
+  fi
 fi
 # Project capacity admission (bin/fm-project-capacity-lib.sh owns the
 # declaration, what holds a place, and why this is race-safe). A fresh worker

@@ -575,10 +575,52 @@ test_batch_reports_a_deferred_pair() {
   write_live "$home" live-a "$case_dir/project"
   out=$(run_spawn "$case_dir" "$home" "$case_dir/unused" "task-c=$case_dir/project" --mode no-mistakes --yolo off) || rc=$?
   expect_code "$DEFER_EXIT" "$rc" "a batch whose only pair was deferred did not exit with the deferral status: $out"
-  assert_contains "$out" "batch: DEFERRED task-c ($case_dir/project) - its project is at capacity, so it stays queued" \
+  assert_contains "$out" "batch: DEFERRED task-c ($case_dir/project) - a capacity limit holds it, so it stays queued" \
     "the batch did not report the deferral"
   assert_not_contains "$out" "batch: FAILED" "the batch reported a deferral as a failure"
   pass "a batch reports a capacity deferral as deferred, not failed"
+}
+
+# The home-wide lane ceiling: config/lane-capacity caps ship and scout lanes,
+# counted by bin/fm-capacity.sh, and a spawn at the cap defers like a project
+# capacity refusal. Secondmates hold no lane, and there is no way around it
+# from the spawn command line.
+test_lane_cap_defers_a_fresh_spawn_at_the_ceiling() {
+  local case_dir home out rc=0 before worktrees
+  case_dir=$(make_case lane-cap task-c)
+  home="$case_dir/home"
+  printf '%s\n' "2  # lanes this home runs at once" > "$home/config/lane-capacity"
+  write_live "$home" live-a "$case_dir/project"
+  write_live "$home" live-b "$case_dir/other-project"
+  fm_write_meta "$home/state/sm-a.meta" "kind=secondmate" "mode=secondmate"
+  before=$(call_count "$case_dir")
+  worktrees=$(worktree_list "$case_dir")
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "a spawn at the lane cap was not deferred: $out"
+  assert_contains "$out" "deferred: this machine already runs 2 lanes against a cap of 2"     "the deferral did not name the lane count and the cap"
+  assert_contains "$out" "task task-c was not launched and its backlog item stays queued" \
+    "the lane deferral did not say the task stays queued"
+  assert_not_contains "$out" "--ignore-lane-cap" "the lane deferral offered a bypass"
+  assert_nothing_created "$case_dir" "$home" task-c "$before" "$worktrees"
+
+  printf '%s\n' 3 > "$home/config/lane-capacity"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-c) || rc=$?
+  expect_code 0 "$rc" "a spawn under the lane cap was refused (secondmates must hold no lane): $out"
+  assert_contains "$out" "spawned task-c" "a spawn under the lane cap did not launch"
+  pass "a fresh spawn defers at the lane cap, leaves nothing behind, and counts no secondmate"
+}
+
+test_unreadable_lane_cap_refuses_every_spawn() {
+  local case_dir home out rc=0
+  case_dir=$(make_case lane-cap-bad task-c)
+  home="$case_dir/home"
+  printf '%s\n' "many" > "$home/config/lane-capacity"
+  out=$(spawn_ship "$case_dir" task-c) || rc=$?
+  expect_code 1 "$rc" "an unreadable lane cap did not refuse the spawn: $out"
+  assert_contains "$out" "the lane cap" "the refusal did not name the lane cap"
+  assert_absent "$home/state/task-c.meta" "a refused spawn published a record"
+  pass "an unreadable lane cap refuses the spawn rather than guessing a limit"
 }
 
 # Orca owns its own worktrees and never takes the Treehouse allocation lock, so
@@ -665,3 +707,5 @@ test_failed_spawn_after_admission_holds_no_place
 test_unreadable_declaration_refuses_every_spawn
 test_batch_reports_a_deferred_pair
 test_orca_spawn_is_admitted_under_the_shared_project_lock
+test_lane_cap_defers_a_fresh_spawn_at_the_ceiling
+test_unreadable_lane_cap_refuses_every_spawn
