@@ -159,6 +159,15 @@ The worktree and the task's records are unaffected either way.
 - If the launch owner already published the new record but no running agent can be confirmed, the new record is kept: the task is recorded on the new harness with no agent confirmed, which is exactly what recovery reconciles.
   Rewriting it back to the old harness would be a second, worse inaccuracy.
 
+### Launch proof
+
+A fresh spawn or a relaunch only reports success after `bin/fm-spawn.sh` has proved, through [`bin/fm-spawn-verify-lib.sh`](../bin/fm-spawn-verify-lib.sh), that the worker process is alive, is processing the brief, and shows the requested model.
+The spawn seeds its own busy record, so without this proof a worker that exited on an unknown model name still reads as busy.
+The wait is bounded (`FM_SPAWN_VERIFY_SECS`, default 90; `FM_SPAWN_VERIFY=0` turns it off), and a pane printing a model-not-found error fails at once.
+A failed proof exits non-zero with a plain diagnostic, records `failed:` in the task's status log, and leaves the worktree and the worker window untouched; the ordinary abort path then rolls back a fresh spawn's provisional task record.
+Raw launch commands and the harnesses with their own start gate (kimi, rovo, agy, polytoken, OpenCode 2) are not asked twice.
+`tests/fm-spawn-verify.test.sh` pins each outcome.
+
 ## Fail-closed boundaries
 
 - Targeting is exact.

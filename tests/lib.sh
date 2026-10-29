@@ -57,6 +57,11 @@ export FM_TEST_SEAM=1
 # tests/fm-memory-floor.test.sh sets its own floor to cover the refusal.
 export FM_SPAWN_MIN_FREE_MB=0
 
+# The post-launch proof (bin/fm-spawn-verify-lib.sh) waits on a real agent's
+# pane; the suite's fake panes never show one, so it is off here and the cases
+# in tests/fm-spawn-verify.test.sh switch it on.
+export FM_SPAWN_VERIFY=0
+
 # Clear the task-worker marker bin/fm-spawn.sh exports into ship and scout
 # panes. This suite builds git-init fixture repositories whose primary checkout
 # it runs a copied bin/fm-test-run.sh in, and that runner refuses the primary

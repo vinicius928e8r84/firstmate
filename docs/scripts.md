@@ -194,3 +194,8 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-voice-client.py`     | The laptop end of the spoken interface: capture, playback, and turn timing over SSH; audio devices unverified |
 | `fm_voice_frame.py`      | The wire format both machines share, copied to the laptop beside the client          |
 | `fm_voice_records.py`    | What a spoken answer may read, and the handover that queues real work                |
+| `fm-spawn-verify-lib.sh` | Post-launch proof for `fm-spawn.sh`: the worker is alive, processing the brief, and showing the requested model ([agent-control.md](agent-control.md#launch-proof)) |
+| `fm-page-check.sh`       | Offline check of a Lavish decision page before the captain sees it (see below) |
+
+`fm-page-check.sh <page.html>` prints a PASS/FAIL line per check and exits non-zero on any FAIL: the HTML parses with balanced tags and visible text, `<html lang="pt-BR">`, every `data-lavish-question` form has a markable input, a submit control, and a `queuePrompt` call, each recommended option is preselected with `checked`, and no local link or fragment is broken.
+It reads the file only and never fetches a URL, so run it on a generated page before `lavish-axi` shows it; `tests/fm-page-check.test.sh` pins each failure.

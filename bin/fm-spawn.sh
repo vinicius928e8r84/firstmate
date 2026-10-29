@@ -96,6 +96,11 @@
 #   only a shell that will not go refuses.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
+#   After launch, a generic proof (bin/fm-spawn-verify-lib.sh, docs/agent-control.md
+#   "Launch proof") requires the worker to be alive, processing the brief, and
+#   showing the requested --model within FM_SPAWN_VERIFY_SECS (default 90); a
+#   failure exits 1 and leaves the worktree and window alone. FM_SPAWN_VERIFY=0
+#   skips it.
 #   --model <name> and --effort <low|medium|high|xhigh|max|ultra> are concrete profile
 #   axes chosen by firstmate at intake. They are only threaded into harnesses whose
 #   installed CLIs were verified to support that axis; unsupported axes are omitted
@@ -858,6 +863,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-busy-lib.sh
 . "$SCRIPT_DIR/fm-busy-lib.sh"
+# shellcheck source=bin/fm-spawn-verify-lib.sh
+. "$SCRIPT_DIR/fm-spawn-verify-lib.sh"
 # shellcheck source=bin/fm-polytoken-lib.sh
 . "$SCRIPT_DIR/fm-polytoken-lib.sh"
 # shellcheck source=bin/fm-cursor-lib.sh
@@ -6998,6 +7005,23 @@ if [ "$HARNESS" = polytoken ] && [ "$RAW_LAUNCH" -eq 0 ]; then
     exit 1
   fi
 fi
+# Generic launch proof (bin/fm-spawn-verify-lib.sh): the worker is alive, is
+# processing the brief, and shows the requested model. The harnesses above
+# already gated on their own start signal, and a raw launch command names no
+# model to compare. A failure leaves the endpoint and the worktree exactly as
+# they are for the operator (no teardown) and exits non-zero; the ordinary abort
+# trap still rolls back a fresh spawn's provisional task record.
+case "$HARNESS" in
+  kimi | rovo | agy | polytoken) ;;
+  *)
+    if [ "$RAW_LAUNCH" -eq 0 ] && { [ "$HARNESS" != opencode ] || [ "$OPENCODE_MAJOR" -lt 2 ]; } &&
+      ! fm_spawn_verify_launch "$BACKEND" "$T" "$ID" "$STATE_REAL" "$MODEL" "$W"; then
+      printf '%s\n' "$(status_stamp_line "failed: launch not verified - $FM_SPAWN_VERIFY_REASON")" >>"$STATE/$ID.status"
+      echo "error: spawn of $ID was not verified: $FM_SPAWN_VERIFY_REASON; the worktree and window $T are left untouched and the provisional task record is rolled back - inspect the window, fix the cause, close the window by hand, and re-run the spawn" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 if [ "$KIND" = secondmate ] && [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ]; then
   if ! fm_config_reread_discard_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then
