@@ -734,7 +734,7 @@ not ok - Pi did not render the initial watcher ownership result
 ```
 
 The guard pins `openai-codex/gpt-5.6-sol`, and this host's Codex login is a ChatGPT account that the provider refuses for that model, so Pi never ran a turn.
-The same guard with `openai-codex/gpt-5.5` substituted failed identically on the account, and with `claude-bridge/claude-sonnet-5` substituted it stopped at `Pi did not reach its ready composer`.
+The same guard with `openai-codex/gpt-5.5` substituted failed identically on the account, and with `claude-bridge/claude-sonnet-5` substituted the watcher-only run stopped at `Pi did not reach its ready composer` and the full run failed with the model asking for a shell tool it did not have.
 Those substituted runs used a copy of the guard outside the tracked file and are not evidence for the pinned model, so they are not claimed as passes or as Pi regressions.
 The Pi rows above (Pi 0.86.1, 2026-09-22, and earlier) are therefore unchanged and still scoped to the versions named there, not to Pi 0.84.4 on this host.
 The Pi extension unit coverage that those rows depend on was not re-run in this pass.

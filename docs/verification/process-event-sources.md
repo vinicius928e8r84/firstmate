@@ -166,6 +166,80 @@ FM_BEARINGS_LAVISH_LIVE=1 bin/fm-test-run.sh tests/fm-bearings-board-lavish-live
 bin/fm-doc-audience-check.sh
 ```
 
+## Re-verification on Linux with lavish-axi 0.1.85, 2026-10-29
+
+This section re-checks the Lavish surface this record depends on at the installed `lavish-axi` 0.1.85, on Linux 6.8.0 x86_64 with bash 5.2.21, tmux 3.4, and a host load average between 25 and 40.
+It supersedes the 0.1.80 observation of the published command surface above and nothing else; the macOS dates and measurements elsewhere in this record were not repeated.
+
+### Published command surface, 0.1.85
+
+```sh
+lavish-axi --version
+lavish-axi reply --help | head -1
+lavish-axi poll --help | head -1
+lavish-axi reply --help | tr '.' '\n' | grep -iE "exits 0|10 seconds|Working"
+lavish-axi poll --help | tr '.' '\n' | grep -E "Send & End|polling stops"
+```
+
+Observed output:
+
+```text
+0.1.85
+Usage: lavish-axi reply <html-file> (--agent-reply "..." | --agent-reply-file <path>)
+Usage: lavish-axi poll <html-file> [--owner <label>] [--takeover] [--agent-reply "..."] [--agent-reply-file <path>]
+ Exit 0 only when the server answers that the reply was sent, which is when the board stops showing Working
+ If that answer does not arrive within 10 seconds, exit non-zero with a timeout error
+`Send & End` ends the session
+ After that response, polling stops, and the agent must not reopen the session uninvited
+```
+
+The synchronous `reply` contract, the poll signature, and the `Send & End` lifecycle quoted in the sections above are unchanged at 0.1.85.
+
+### Live drift guard
+
+```sh
+FM_PROCEVENT_LAUNCH_CONFIRM_SECONDS=25 FM_BEARINGS_LAVISH_LIVE=1 bash tests/fm-bearings-board-lavish-live-e2e.test.sh
+```
+
+```text
+# lavish-axi 0.1.85
+ok - lavish-axi 0.1.85 reports a captain-ended session without reopening it and without failing
+ok - the board build reopens a captain-ended session against real lavish-axi instead of arming a dead one
+```
+
+With the default confirm window the same guard stopped at `not ok - the guard board did not build`, and a rerun with the build's output shown ended in `error: listener is not running: lavish-<id>` from the arm step.
+The arm waits `FM_PROCEVENT_LAUNCH_CONFIRM_SECONDS` for its runner to claim the source, and at a load average above 30 the default was not enough, so the guard's pass depends on widening that window on a loaded host.
+
+### List-form results
+
+Commit `fc8972cd` (2026-10-15) made the adapter's `read` parse the list form that Lavish emits when queued items stop being uniform, and refuse a block it cannot account for.
+The segment of `tests/fm-procevent.test.sh` that covers it was extracted into a throwaway script together with the file's setup lines and run on its own:
+
+```text
+ok - read distinguishes a feedback capture from an ended-with-nothing close
+ok - read presents list-form items with nested targets, attachments, and multi-line prompts
+ok - read never certifies malformed list-form items as complete
+ok - read never reports a declared-but-unparsed block as complete
+ok - answers reads list-form choices and refuses a block it cannot account for
+```
+
+Those cases read fixture text shaped like Lavish's encoder output; no live Lavish server produced the list-form shape, so the claim is that the reader handles that shape, not that 0.1.85 emits exactly it.
+
+### Whole suite: not completed on this host
+
+`bash tests/fm-procevent.test.sh` was not brought to a green run here.
+Three attempts each stopped at a case that waits on a detached runner:
+
+| Attempt | First failure |
+| --- | --- |
+| default environment | `not ok - completion publishes the committed result sequence`, the wake being the launch-confirm failure notice |
+| `FM_PROCEVENT_LAUNCH_CONFIRM_SECONDS=20` | `not ok - the firstmate fixture capture never landed` after 20 passing cases |
+| the same, with the file's two wait helpers widened from 10 to 150 seconds in a throwaway copy | the same case, again after 20 passing cases |
+
+The last case (the orphaned-capture case that arms a stub `lavish-axi` returning feedback at once) reproducibly printed `error: listener is not running: lavish-<id>` from its arm step even with the widened waits, so a longer wait did not cure it.
+Whether that is load, a race between a stub that returns immediately and the arm's liveness check, or a real defect was not determined, and the cases after it in the file (including the rebind-all, extension-binding, and owner-guard rows) were not run in this pass.
+The guarantees in the table above are therefore not refreshed by this pass beyond the cases that passed before the failure and the list-form segment.
+
 ## Harness and session-provider review
 
 The external host runs in the home that owns the process-event source and publishes the same bounded `check` record as an ordinary built-in adapter.

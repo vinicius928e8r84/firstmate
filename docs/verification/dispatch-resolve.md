@@ -122,3 +122,38 @@ $ bash tests/fm-dispatch-resolve.test.sh | tail -1
 ```
 
 A live run needs a key and is not part of the suite; rerun the table above by pointing the tool at a brief with the key injected for that one command.
+
+## Claude daily budget advice
+
+Added by commit `49ae7f22` (2026-10-27) and re-proven on 2026-10-29 on Linux 6.8.0 x86_64 with bash 5.2.21 and jq 1.7.
+[`bin/fm-claude-budget.sh`](../../bin/fm-claude-budget.sh) records an `above_budget` flag in `state/claude-budget.state`, and the resolver relays it as one `advice:` line (see [configuration](../configuration.md#crew-dispatch-profiles-configcrew-dispatchjson)).
+The contract worth keeping true is that the line is advice: it is printed only for a flag that is `above_budget` and less than two hours old, and it never changes the status, the exit code, or the `profile:` line.
+
+The case is the last one in `tests/fm-dispatch-resolve.test.sh`, driven through the public resolver with a fake `curl` and a fake `quota-axi` whose all-models Claude remaining percent the test sets, and with `FM_CLAUDE_BUDGET_NOW` pinning the clock to 2026-10-27:
+
+| Recorded budget state | What the resolver printed |
+| --- | --- |
+| no record | no `advice:` line |
+| 52 percent remaining at the first run of the day, 50 percent an hour later (within the allowance) | no `advice:` line |
+| 40 percent remaining two hours later (12.00 percent spent of an 8.85 percent allowance) | `status: clear` unchanged, exit 0, an `advice:` line with those numbers, the proof and review split (non-HIGH-risk proofs on Sonnet 5.5, HIGH-risk reviews on Opus 5.5), and the phrase `an explicit captain model choice wins` |
+| the same record, a scout brief | the scout-only advice line (`this scout runs on Sonnet 5.5 (claude-sonnet-5-5)`) and no reviews clause |
+| the same record, a clock more than two hourly runs later | no `advice:` line |
+
+In both advised cases the `profile:` line was byte-identical to the one printed with no record.
+
+```console
+$ bash tests/fm-dispatch-resolve.test.sh | tail -3
+ok - configuration errors exit 2 before any network call
+ok - budget advice: printed only when the recorded flag is above budget, never changes the resolved profile
+# all fm-dispatch-resolve tests passed
+```
+
+The producing script's own suite was run in the same pass:
+
+```console
+$ bash tests/fm-claude-budget.test.sh | tail -1
+# all fm-claude-budget tests passed
+```
+
+Nothing here is a live run: it is the offline suite, the same boundary the "Offline behavior" section above describes, and it reads no real quota.
+The 2026-09-16 and 2026-09-23 live measurements above were not repeated.
