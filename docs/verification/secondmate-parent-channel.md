@@ -93,3 +93,32 @@ $ # Every line above beginning 'done [key=child-' or carrying 'captain-hold-' wa
 - Each line produced one `signal:` wake in the real parent watcher, which is the event that starts the parent firstmate's turn and therefore the captain-facing report.
 - The mate watcher's own `signal:` on `child.status` shows the mate was woken as before; whatever the mate model would have said in its chat afterward is irrelevant to delivery.
 - The trailing `stale:` line in the mate watcher log is the idle real pane after the child's final line, ordinary liveness escalation unrelated to delivery.
+
+## Re-run on Linux, 2026-10-29
+
+The same four steps were re-run on 2026-10-29 on Linux 6.8.0 x86_64 with tmux 3.4, bash 5.2.21 as `bash`, git 2.43.0, and this repository's scripts at the commit that added this section.
+The fixture matches the one above with three differences.
+Both homes use `config/backend` `tmux` on a private tmux server (`TMUX_TMPDIR` in the scratch directory).
+The child task has a real git worktree with an `origin/main` ref, so its done line passes the named-head check.
+Each home's real watcher (`bin/fm-watch.sh`) runs in a loop that acknowledges through `bin/fm-wake-drain.sh --ack-through` and re-arms.
+No agent harness and no model ran, and the host was heavily loaded (load average above 25), which only lengthened the waits.
+
+The final parent channel in the saved run was:
+
+```text
+working: delegated scope
+done [key=child-outcome-child-done-7d1065d2] [at=1793269105]: child child done: PR https://github.com/kunchenguid/firstmate/pull/9999 checks green pr=https://github.com/kunchenguid/firstmate/pull/9999 mode=no-mistakes yolo=off
+done [key=child-pr-child] [at=1793269134]: child child PR ready: https://github.com/kunchenguid/firstmate/pull/9999 mode=no-mistakes yolo=off
+needs-decision [key=captain-hold-child-call-1] [at=1793269165]: captain hold child-call: rollout window choice pending
+resolved [key=captain-hold-child-call-1] [at=1793269192]: captain hold child-call: answered
+```
+
+What this run proves on Linux: all four captain-facing lines reached the parent channel with no model writing any of them.
+Each came from the script that recorded the fact: `bin/fm-inactive-reconcile.sh` on the mate watcher's poll, `bin/fm-pr-check.sh`, and `bin/fm-captain-hold.sh` for the hold and for the answer.
+Each now carries the `[at=<epoch>]` stamp the opening paragraph predicts.
+The real parent watcher woke on `mate.status`: it printed a `signal:` reason once, and two further wake rows with the reason `needs-decision:` were queued for the hold and its answer.
+
+What this run does not claim: the macOS run recorded one parent wake per delivered line (four signals), and this run did not.
+The parent watcher produced three wake events for four lines, so one wake per line is not re-proven on Linux and the macOS count remains the only evidence for it.
+Whether the missing wake is coalescing by the watcher or a gap in this run's simple re-arm loop was not determined.
+`bin/fm-pr-check.sh` also printed `fm-guard.sh: No such file or directory` because the fixture's code-root override is an empty directory, and it still armed the poll and published the ready line.

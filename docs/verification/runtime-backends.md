@@ -1896,6 +1896,59 @@ ok - agent get distinguishes leftover-shell (dead/no-agent) from live idle Pi
 ok - pane get agent_status lag cannot keep an exited occupant classified alive
 ```
 
+### 2026-10-29 close-done, memory floor, and HOLD against Herdr 0.9.1
+
+`bin/fm-close-done.sh` (2026-10-28), the free-memory floor in `bin/fm-memory-floor-lib.sh`, and the `state/HOLD` refusal of `bin/fm-hold.sh` were added after the sections above, and their own suites (`tests/fm-close-done.test.sh`, `tests/fm-memory-floor.test.sh`, `tests/fm-hold.test.sh`) use stubs.
+This section is the live pass of the three against the real binary.
+
+Run on 2026-10-29 on Linux 6.8.0 x86_64 with herdr 0.9.1, Pi 0.84.4, and tmux 3.4, in one named non-default lab created with `bin/fm-herdr-lab.sh` through the guarded helpers that `tests/herdr-test-safety.sh` sources (`fm_herdr_lab_prepare` to create the session, `herdr_safe_stop_and_delete` to tear it down).
+The lab was `fm-lab-decv1029-<pid>-<random>`.
+A running default session and two other sessions were present on the host throughout and were never addressed; the default session count read 1 before and 1 after, and `herdr session list` after the run showed only the three sessions that existed before it.
+
+Construction: a scratch firstmate home with a scout task `hdone` whose `state/hdone.meta` points at a real lab pane (`backend=herdr`, `herdr_session`, `herdr_pane_id`, a `spawn_gen` two minutes old), a `data/hdone/report.md`, and `state/hdone.status` holding `done [at=<now>]: report ready`.
+A real, idle Pi was typed into that pane (`pi --no-session --no-extensions --no-context-files --offline`); no prompt was submitted, so no model call was made.
+Pi's per-task busy extension is what `bin/fm-spawn.sh` wires to write the idle record, and a bare Pi does not load it, so the same single writer recorded the idle turn the extension would have written: `bin/fm-busy-event.sh arm <state> hdone --state idle --source pi-ext --event agent_end`.
+Without that record `bin/fm-crew-state.sh` read the task as `unknown` and `bin/fm-close-done.sh` correctly skipped it, which was observed first.
+
+Observed output of the passing run:
+
+```text
+lab session: fm-lab-decv1029-1756691-12795 (herdr herdr 0.9.1)
+pane process state: agent
+agent state: alive
+crew-state: state: done · source: status-log · report ready|
+== close-done (list)
+candidate hdone: done with an open agent on herdr
+ok - close-done lists the finished worker holding a live Pi
+== HOLD refuses relaunch with the pane untouched
+spawn --relaunch rc=75: error: spawn refused: <home>/state/HOLD is present (decv1029 lab). Run bin/fm-hold.sh clear (or wait for its until= time) to resume.
+ok - fm-spawn --relaunch refused with 75 under state/HOLD
+control relaunch rc=75: error: relaunch of hdone refused: <home>/state/HOLD is present (decv1029 lab). Run bin/fm-hold.sh clear (or wait for its until= time) to resume.
+ok - fm-control relaunch refused with 75 under state/HOLD
+ok - the live Pi was untouched by the refused relaunches
+== memory floor refuses before anything is created
+spawn rc=76: error: spawn refused: only 4644 MB of memory is available and a new agent session needs at least 999999999 MB free, so task hdone was not launched; close finished workers (bin/fm-close-done.sh) or wait for memory to free, then dispatch again (override: FM_SPAWN_MIN_FREE_MB)
+ok - fm-spawn refused with 76 below the free-memory floor
+ok - no tab or pane was created by the refused spawn
+ok - the live Pi survived the refused spawn
+== close-done --close
+rc=0
+closed hdone (log <home>/data/hdone/session-log-1793268242.txt)
+agent state after close: dead
+ok - close-done --close stopped the Pi (dead)
+ok - the endpoint (pane) survived the close
+ok - the local copy survived the close
+ok - scrollback saved to data/hdone/session-log-<epoch>.txt (600)
+ok - default session untouched (count 1 -> 1)
+lab torn down: fm-lab-decv1029-1756691-12795
+```
+
+What this proves on Herdr 0.9.1: `bin/fm-close-done.sh` lists a finished worker only while its real agent is alive, `--close` saves the scrollback at mode 0600, stops the real Pi through the control plane's `exit`, and leaves the pane and the local copy in place.
+`state/HOLD` stops both `bin/fm-spawn.sh --relaunch` and `bin/fm-control.sh relaunch` with exit 75 and leaves the live agent running.
+The memory floor stops `bin/fm-spawn.sh --relaunch` with exit 76, forced with `FM_SPAWN_MIN_FREE_MB=999999999`, before any tab or pane exists to create; the tab listing was byte-count identical across the refusal.
+
+What it does not prove: the idle record was written by the lab rather than by Pi's own extension, so the Pi busy wiring is not re-proven here; only the refusal paths of the floor and HOLD were driven, not a launch that proceeds after `fm-hold.sh clear`; a `done` that predates the agent's spawn (the relaunch guard) and a held or undecided task were not driven on the real binary.
+
 ### Endpoint recovery classification
 
 Measured 2026-09-10 on macOS aarch64 against Herdr 0.9.0 (protocol 22) in an isolated `fm-lab-` session.

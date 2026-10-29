@@ -687,6 +687,77 @@ tests/fm-claude-stop-autoarm.test.sh
 tests/fm-turnend-guard.test.sh
 ```
 
+## Re-record on a Linux host, 2026-10-29
+
+This section re-ran the live supervision rows on one Linux host after the arm-retry, host-load back-off, and handling-successor changes that landed since the dated evidence above.
+Host: Linux 6.8.0 x86_64, tmux 3.4, Pi 0.84.4, Claude Code 2.1.304, under a sustained load average of 25 to 40.
+It records what was re-proven, what failed, and what could not be run, and it supersedes no earlier row that it did not re-run.
+`bin/fm-verification-stale.sh` lists the cited `bin/` files that changed after this record's date once any of them does.
+
+### Claude Stop-owned auto-arm, live: not re-proven, the guard fails on its own count
+
+```sh
+claude --version
+FM_CLAUDE_LIVE_E2E=1 tests/fm-claude-stop-autoarm-live-e2e.test.sh
+```
+
+Observed output, identical in two runs:
+
+```text
+2.1.304 (Claude Code)
+not ok - expected exactly 2 hook-owned arm cycles, got 4: arm-run=1 pid=1758873
+arm-run=2 pid=1761852
+arm-run=3 pid=1780248
+arm-run=4 pid=1782528
+```
+
+The credentialed session itself completed, and the guard fails at its final count after the session returns, so the session-start and rewake checks that run before it were not the cause.
+This does not show that the hook misbehaves: the guard still counts one arm per cycle, while a handling successor that arms after each actionable close has existed since commit `31c47af5` (2026-09-24), three days after the 2026-09-21 pass recorded above and after the guard was last edited (`aec043c7`, 2026-09-21).
+Two cycles plus two successors is four, which is consistent with the observed count, but that explanation was not proven by this run and the guard was not changed.
+Until the guard's expected count is reconciled with the successor, the Claude `2.1.278` row above stands as the last passing live run and has not been refreshed for Claude Code 2.1.304.
+
+### Pi primary and watcher-only live guards: not re-proven on this host
+
+```sh
+pi --version
+FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh
+FM_PI_LIVE_E2E=1 FM_PI_LIVE_WATCH_ONLY=1 tests/fm-pi-primary-live-e2e.test.sh
+```
+
+Observed output:
+
+```text
+0.84.4
+Codex error: The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.
+not ok - Pi Ahoy legacy-start case exited 1:
+not ok - Pi did not render the initial watcher ownership result
+```
+
+The guard pins `openai-codex/gpt-5.6-sol`, and this host's Codex login is a ChatGPT account that the provider refuses for that model, so Pi never ran a turn.
+The same guard with `openai-codex/gpt-5.5` substituted failed identically on the account, and with `claude-bridge/claude-sonnet-5` substituted it stopped at `Pi did not reach its ready composer`.
+Those substituted runs used a copy of the guard outside the tracked file and are not evidence for the pinned model, so they are not claimed as passes or as Pi regressions.
+The Pi rows above (Pi 0.86.1, 2026-09-22, and earlier) are therefore unchanged and still scoped to the versions named there, not to Pi 0.84.4 on this host.
+The Pi extension unit coverage that those rows depend on was not re-run in this pass.
+
+### Auto-arm owner-mutex test under load
+
+`test_owner_mutex_contention_preserves_failure_episode_reset` in `tests/fm-claude-stop-autoarm.test.sh` waited for the fixture arm to reach its boundary with a poll that gave up after 2.5 seconds.
+On this host, at load above 25, that poll failed (`not ok - healthy owner never reached the reset boundary`), reproducing the flake the 2026-10-28 reviews reported.
+The test now waits on the boundary file with a deadline of 300 seconds, fails at once if the hook exits before reaching it, and keeps its fixture watcher and lock holder alive for 600 seconds instead of 60, so a slow start cannot expire them.
+Every assertion on what the contended reset preserves is unchanged.
+With the change the single test passed under the same load:
+
+```text
+ok - auto-arm: owner-mutex contention preserves successor episode state
+```
+
+Only that test was run after the change; the rest of the file was started once and did not finish within 15 minutes at this load, so no pass of the whole file is claimed.
+
+### Not re-measured
+
+The Claude hook-timeout measurement ("Claude drops the exit 2 of a hook it timed out") is the premise of the host-load back-off cap and was not re-measured here.
+The omp, Codex, OpenCode, and Grok rows were not run because those harnesses are not installed on this host.
+
 ## Supervision host
 
 This pre-flip evidence supports [supervision-host.md](../supervision-host.md)'s Claude engine, away-wake path, and failure direction; its no-file baseline describes the earlier opt-in release, not the current Claude default.
