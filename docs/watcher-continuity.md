@@ -293,6 +293,12 @@ The scan ends a `treehouse get` slot request that has held no slot for over an h
 The script header owns the guards, limits, and environment; it never creates or deletes a pod and never wakes an agent on its own.
 `tests/fm-lane-guard.test.sh` pins each guard against real processes, a real failed spawn, and a local stand-in for the pod API.
 
+## Clean PR guard
+
+Every `FM_CLEAN_PR_GUARD_INTERVAL` seconds (default 600) the watcher runs `bin/fm-clean-pr-guard.sh` and turns any new alert it prints into a `check: clean-pr-guard: ...` wake, so a PR that is CLEAN with no review record for its current head gets a reviewer in the same cycle.
+The script reports each (PR, head) pair once, never merges and never spawns; its header owns the review-record rules and environment.
+`tests/fm-clean-pr-guard.test.sh` pins the verdicts against a stand-in `gh`.
+
 ## Per-actor acknowledgement
 
 `bin/fm-wake-drain.sh` consumes the queue per actor, not per whole-queue cutoff.

@@ -319,6 +319,10 @@ LANE_GUARD_INTERVAL=${FM_LANE_GUARD_INTERVAL:-120}  # seconds between fm-lane-gu
 case "$LANE_GUARD_INTERVAL" in
   ''|*[!0-9]*|0) LANE_GUARD_INTERVAL=120 ;;
 esac
+CLEAN_PR_GUARD_INTERVAL=${FM_CLEAN_PR_GUARD_INTERVAL:-600}  # seconds between fm-clean-pr-guard.sh scans
+case "$CLEAN_PR_GUARD_INTERVAL" in
+  ''|*[!0-9]*|0) CLEAN_PR_GUARD_INTERVAL=600 ;;
+esac
 HOME_SUMMARY_INTERVAL=${FM_HOME_SUMMARY_INTERVAL:-300}
 case "$HOME_SUMMARY_INTERVAL" in
   ''|*[!0-9]*|0) HOME_SUMMARY_INTERVAL=300 ;;
@@ -3634,6 +3638,20 @@ while :; do
     if [ -n "$lane_guard_out" ]; then
       reason="check: lane-guard: $(printf '%s' "$lane_guard_out" | tr '\n' ';')"
       fm_wake_append check lane-guard "$reason" || exit 1
+      wake "$reason"
+    fi
+  fi
+
+  # Clean PR without a review record (bin/fm-clean-pr-guard.sh owns it): wake
+  # once per (pr, head) so firstmate raises a reviewer in the same cycle. It
+  # only reports: it never merges and never spawns. Bounded by gh timeouts.
+  if [ "$(age_of "$STATE/.clean-pr-guard-last")" -ge "$CLEAN_PR_GUARD_INTERVAL" ]; then
+    : > "$STATE/.clean-pr-guard-last"
+    clean_pr_guard_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      timeout 120 "$SCRIPT_DIR/fm-clean-pr-guard.sh" </dev/null 2>/dev/null) || true
+    if [ -n "$clean_pr_guard_out" ]; then
+      reason="check: clean-pr-guard: $(printf '%s' "$clean_pr_guard_out" | tr '\n' ';')"
+      fm_wake_append check clean-pr-guard "$reason" || exit 1
       wake "$reason"
     fi
   fi
