@@ -2507,6 +2507,7 @@ bin/fm-procevent.sh reconcile
 
 The source waits outside the conversational turn, and its completed result arrives through the existing process-event `check` path.
 Classify the captured result through its immutable package identity with `bin/fm-procevent.sh classify <result-file>`, acknowledge it with the existing `handled` command only after it is handled, and use the printed `retire --if-owner` command when explicit retirement is needed.
+The [host-error capture and retry contract](extension-bindings.md#compatibility-and-failure-semantics) defines how repeated external host failures retain inspectable evidence while polling continues.
 
 **Keep blocking sources out of the turn**
 
