@@ -13,6 +13,12 @@ fm_git_identity
 TMP_ROOT=$(fm_test_tmproot fm-pr-merge-main)
 MERGE_MAIN="$ROOT/bin/fm-pr-merge-main.sh"
 
+# Every merge needs a registered commit identity; the default home registers one
+# for the worlds' shared repo name "origin". Individual tests build their own homes.
+export FM_HOME="$TMP_ROOT/home"
+mkdir -p "$FM_HOME/config"
+printf '%s\n' '# project identity' 'origin pinned@example.com Pinned Author' > "$FM_HOME/config/commit-identity"
+
 # make_world <name>: origin with a three-file main, a clone "pr" on branch feat
 # carrying one own commit to a.txt. Prints the world directory.
 make_world() {
@@ -198,7 +204,46 @@ test_pin_report_sees_unpushed_merge() {
   pass "pin report: unpushed merge head reaches the pin check"
 }
 
+# test_identity_pinned: the merge commit carries the registered identity even
+# when the ambient git environment names someone else, and a project with no
+# registration is refused untouched unless --allow-unpinned is given.
+test_identity_pinned() {
+  local w out rc head
+  w=$(make_world pinned)
+  advance_main "$w" b.txt $'b1\nB-main\nb3\n'
+  out=$(GIT_AUTHOR_EMAIL=stray@example.com GIT_COMMITTER_EMAIL=stray@example.com "$MERGE_MAIN" --worktree "$w/pr" 2>&1); rc=$?
+  expect_code 0 "$rc" "pinned merge exit"
+  assert_contains "$out" "MERGE-CLEAN" "pinned merge happened"
+  assert_equals "pinned@example.com" "$(git -C "$w/pr" log -1 --format=%ae)" "author email is the registered one"
+  assert_equals "pinned@example.com" "$(git -C "$w/pr" log -1 --format=%ce)" "committer email is the registered one"
+  assert_equals "Pinned Author" "$(git -C "$w/pr" log -1 --format=%an)" "author name is the registered one"
+  pass "identity: the merge commit carries the registered identity over ambient git settings"
+
+  w=$(make_world slug-key)
+  advance_main "$w" b.txt $'b1\nB-main\nb3\n'
+  printf 'o/r slug@example.com\n' > "$FM_HOME/config/commit-identity"
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --slug o/r --pr 3 2>&1); rc=$?
+  expect_code 0 "$rc" "slug-keyed merge exit"
+  assert_equals "slug@example.com" "$(git -C "$w/pr" log -1 --format=%ae)" "--slug selects the entry"
+  assert_equals "$(git -C "$w/pr" config user.name 2>/dev/null || printf slug)" "$(git -C "$w/pr" log -1 --format=%an | sed 's/^fmtest$/slug/')" "an entry without a name keeps the ambient name"
+  printf '# project identity\norigin pinned@example.com Pinned Author\n' > "$FM_HOME/config/commit-identity"
+  pass "identity: --slug selects the entry"
+
+  w=$(make_world unregistered)
+  advance_main "$w" b.txt $'b1\nB-main\nb3\n'
+  head=$(git -C "$w/pr" rev-parse HEAD)
+  out=$(FM_HOME="$TMP_ROOT/empty-home" "$MERGE_MAIN" --worktree "$w/pr" 2>&1); rc=$?
+  expect_code 3 "$rc" "unregistered project is refused"
+  assert_contains "$out" "config/commit-identity" "the refusal says where to register"
+  assert_equals "$head" "$(git -C "$w/pr" rev-parse HEAD)" "refused merge leaves the head alone"
+  out=$(FM_HOME="$TMP_ROOT/empty-home" "$MERGE_MAIN" --worktree "$w/pr" --allow-unpinned 2>&1); rc=$?
+  expect_code 0 "$rc" "--allow-unpinned merges without a registration"
+  assert_contains "$out" "MERGE-CLEAN" "unpinned merge happened"
+  pass "identity: unregistered project refused, --allow-unpinned opts out"
+}
+
 test_clean_merge
+test_identity_pinned
 test_already_current
 test_conflict_stops_with_files
 test_checks

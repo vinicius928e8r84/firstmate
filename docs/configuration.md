@@ -141,6 +141,14 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md).
 Edit it like any prompt when the fleet is empty.
 While tasks are in flight, dispatch shared-repo edits to a crewmate.
 
+## Commit identity (config/commit-identity)
+
+Gitignored `config/commit-identity` registers the commit identity that `bin/fm-pr-merge-main.sh` pins on the merge commit it creates, for projects whose CI rejects any other author.
+One entry per line: `<owner/repo | repo-name> <email> [<author name>]`; blank lines and `#` comments are ignored.
+The key is the script's `--slug`, else the `owner/repo` of the worktree's remote URL, else that URL's repository name.
+Without an entry the script refuses and names this file; `--allow-unpinned` opts a project with no authorship rule out for that run.
+The script header owns the lookup order and the environment it sets for the merge.
+
 ## Calm preference (config/calm)
 
 The Pi Calm extension and the Claude Code Calm mod share the local, gitignored `config/calm` preference under the effective Firstmate home.
