@@ -293,6 +293,12 @@ The scan ends a `treehouse get` slot request that has held no slot for over an h
 The script header owns the guards, limits, and environment; it never creates or deletes a pod and never wakes an agent on its own.
 `tests/fm-lane-guard.test.sh` pins each guard against real processes, a real failed spawn, and a local stand-in for the pod API.
 
+## Runner watch
+
+`bin/fm-runner-watch.sh <owner/repo>` prints one warning line and exits 3 when a workflow job has been queued for more than 10 minutes (`FM_RW_QUEUE_SEC`) and the repository has no self-hosted runner online; it exits 0 otherwise, and 2 when `gh` fails, so an unreadable runner list is never reported as a missing runner.
+It issues `gh api` GET requests only and is run by hand or by a caller's own schedule; the watcher does not run it.
+`tests/fm-runner-watch.test.sh` pins the no-job, under-threshold, runner-online, and no-runner cases against a stand-in `gh`.
+
 ## Clean PR guard
 
 Every `FM_CLEAN_PR_GUARD_INTERVAL` seconds (default 600) the watcher runs `bin/fm-clean-pr-guard.sh` and turns any new alert it prints into a `check: clean-pr-guard: ...` wake, so a PR that is CLEAN with no review record for its current head gets a reviewer in the same cycle.
