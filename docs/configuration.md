@@ -1693,6 +1693,11 @@ The home installs a daily cron line: `17 6 * * * nice -n 19 FM_HOME=/home/factor
 
 `bin/fm-prewindow-check.sh <pc|mac>` is a read-only checklist for the minutes before a rehearsal window: it exits 0 only when the host answers over ssh (with retries, since the PC link is intermittent), the process that keeps WSL up is running (PC), the Claude login has hours left, a named `--repo` has its labels and a pnpm project, and the Mac has no forgotten test processes (listed, never killed); the script header owns the environment and it never touches the browser or Anki profile 'Samilly Ribeiro' or the main Anki.
 Every rehearsal closes the test Anki it started, by that Anki's own PID, and never by process name or by closing the main Anki, so the stray-process check stays empty.
+**Daily decision page**
+
+`bin/fm-daily-page.sh` builds or refreshes `.lavish/diaria-YYYY-MM-DD.html` in this home from the open captain decisions, one pt-BR card per decision with the recorded recommendation preselected, and prints the page path and its `http://100.96.168.50:4387/session/<id>` URL.
+It reads the decisions from `bin/fm-bearings-snapshot.sh --json` (no new store), gives the same date the same file and URL, and opens a Lavish session only when none is listed for that file.
+It is run on demand and installs no cron line; the script header owns the card markup, the optional `options` and `recommend` fields, and its environment.
 
 **Missing or invalid rules**
 
