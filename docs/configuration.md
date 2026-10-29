@@ -1671,9 +1671,10 @@ That one diagnostic names the list line number at most and never prints the list
 Run it hourly from cron: `7 * * * * FM_HOME=<home> <code-root>/bin/fm-claude-budget.sh >> <home>/state/.claude-budget.cron.log 2>&1`.
 The end date defaults to `2026-11-01T22:00:00Z` and is set by `--end`, `FM_CLAUDE_BUDGET_END`, or the first non-comment line of an optional `config/claude-budget-end`, in that order.
 The day's allowance is fixed at the first run of each UTC day, so the flag means the quota spent since then exceeds that allowance; the script header owns the exact record fields.
+The daily budget, and so the day's allowance, is capped at a fixed ceiling of 10 points a day; a larger remainder never licenses a larger day.
 When the recorded flag is `above_budget` and less than two hours old, the resolver appends one `advice:` line to its output: non-HIGH-risk proofs and all scouts should run on Sonnet 5.5, HIGH-risk reviews stay on Opus 5.5.
-The line is advice only.
-It never changes the status, the candidates, or the `profile:` line, and an explicit captain model choice always wins.
+The same flag also refuses a Claude candidate whose effort is `max` or `ultra`: it is listed as not eligible, every other candidate continues, and the status is `escalate` when no candidate remains.
+An explicit captain model or effort choice bypasses the resolver and always wins.
 
 **Upstream sync**
 

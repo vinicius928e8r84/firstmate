@@ -1121,7 +1121,7 @@ expect_code 0 "$code" "advice never changes the exit code"
 assert_contains "$out" '  status: clear' "advice never changes the status"
 assert_contains "$out" 'advice: Claude daily budget exceeded (spent 12.00% of today'"'"'s 8.85% allowance' "an exceeded budget prints the advice with the numbers"
 assert_contains "$out" 'non-HIGH-risk proofs run on Sonnet 5.5 (claude-sonnet-5-5) and HIGH-risk reviews stay on Opus 5.5 (claude-opus-5-5)' "ship briefs get the proof and review split"
-assert_contains "$out" 'an explicit captain model choice wins' "the advice defers to an explicit captain model choice"
+assert_contains "$out" 'an explicit captain model or effort choice wins' "the advice defers to an explicit captain model or effort choice"
 assert_equals "$PROFILE_BASE" "$(printf '%s\n' "$out" | grep -F '  profile:')" "the profile line is byte-identical with and without the advice"
 TYPESAFE_API_KEY=$KEY run code out err "$SCOUT_BRIEF"
 assert_contains "$out" 'this scout runs on Sonnet 5.5 (claude-sonnet-5-5)' "a scout brief is advised onto Sonnet 5.5"
@@ -1133,5 +1133,36 @@ assert_not_contains "$out" 'advice:' "a record older than two hourly runs is not
 unset FM_CLAUDE_BUDGET_NOW
 rm -f "$HOME_DIR/state/claude-budget.state"
 pass "budget advice: printed only when the recorded flag is above budget, never changes the resolved profile"
+
+# --- Claude daily-budget refusal: effort max/ultra only, others continue ----
+jq '.rules[3].use = [{"harness":"claude","model":"sonnet","effort":"max"},{"harness":"cursor","model":"cursor-grok-4.6-medium"}]' "$BASE_RULES" > "$RULES"
+run_budget_at "$B1" 52
+run_budget_at "$((B1 + 3600))" 50
+export FM_CLAUDE_BUDGET_NOW=$((B1 + 3600))
+reset_log
+write_response "$RESPONSE" rule_4 0.9
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF"
+assert_contains "$out" 'claude:sonnet' "within budget the max-effort Claude candidate is listed"
+assert_not_contains "$out" 'effort max is refused' "within budget nothing is refused"
+run_budget_at "$((B1 + 7200))" 40
+export FM_CLAUDE_BUDGET_NOW=$((B1 + 7200))
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF"
+expect_code 0 "$code" "a budget refusal still exits 0"
+assert_contains "$out" 'not eligible: Claude daily budget exceeded: effort max is refused' "above budget the max-effort Claude candidate is refused"
+assert_contains "$out" "  profile: --harness 'cursor' --model 'cursor-grok-4.6-medium'" "the other candidate continues"
+jq '.rules[3].use = {"harness":"claude","model":"sonnet","effort":"max"}' "$BASE_RULES" > "$RULES"
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF"
+assert_contains "$out" '  status: escalate' "a sole max-effort Claude candidate leaves nothing to dispatch"
+assert_not_contains "$out" '  profile:' "no profile line is printed when the only candidate is refused"
+jq '.rules[3].use = {"harness":"claude","model":"sonnet","effort":"high"}' "$BASE_RULES" > "$RULES"
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF"
+assert_contains "$out" "  profile: --harness 'claude' --model 'sonnet' --effort 'high'" "a lower-effort Claude candidate is not refused"
+unset FM_CLAUDE_BUDGET_NOW
+rm -f "$HOME_DIR/state/claude-budget.state"
+cp "$BASE_RULES" "$RULES"
+pass "budget refusal: above_budget refuses Claude max/ultra effort only, other candidates continue"
 
 printf '# all fm-dispatch-resolve tests passed\n'

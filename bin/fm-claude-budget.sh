@@ -8,7 +8,9 @@
 #
 # Daily budget = the Claude all_models quota still remaining (percent, from
 # `quota-axi --json`) divided by the days left until the end date, so the
-# remaining quota lasts to the renewal. The end date is, in order: --end,
+# remaining quota lasts to the renewal, capped at a fixed ceiling of 10 points
+# a day (CEILING below), so a large remainder never licenses a large day. The
+# end date is, in order: --end,
 # $FM_CLAUDE_BUDGET_END, the first non-comment line of config/claude-budget-end,
 # else 2026-11-01T22:00:00Z.
 #
@@ -29,10 +31,11 @@
 # a missing one is `unknown`, so a dead cron never pins a stale verdict.
 # --advice [scout] prints nothing unless the flag is above_budget, then the one
 # advice line bin/fm-dispatch-resolve.sh relays (this script owns its text).
-# bin/fm-dispatch-resolve.sh reads it as ADVICE only: when above budget,
-# non-HIGH-risk proofs and all scouts should run on Sonnet 5.5 while HIGH-risk
-# reviews stay on Opus 5.5. It never changes the resolved profile and an
-# explicit captain model choice always wins.
+# bin/fm-dispatch-resolve.sh reads the flag two ways: as ADVICE (when above
+# budget, non-HIGH-risk proofs and all scouts should run on Sonnet 5.5 while
+# HIGH-risk reviews stay on Opus 5.5), and as a refusal of Claude candidates
+# whose effort is max or ultra; every other candidate continues. An explicit
+# captain model or effort choice bypasses the resolver and always wins.
 #
 # Hourly from cron, with the PATH the quota-axi binary needs:
 #   7 * * * * FM_HOME=<home> <code-root>/bin/fm-claude-budget.sh >> <home>/state/.claude-budget.cron.log 2>&1
@@ -52,6 +55,7 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 STATE_FILE="$STATE/claude-budget.state"
 LOG_FILE="$DATA/claude-budget.log"
 DEFAULT_END=2026-11-01T22:00:00Z
+CEILING=10   # points a day: the most any day's budget or allowance may be
 MAX_AGE=${FM_CLAUDE_BUDGET_MAX_AGE:-7200}
 case "$MAX_AGE" in ''|*[!0-9]*) MAX_AGE=7200 ;; esac
 
@@ -88,7 +92,7 @@ print_advice() {  # [scout]
   local what='non-HIGH-risk proofs run on Sonnet 5.5 (claude-sonnet-5-5) and HIGH-risk reviews stay on Opus 5.5 (claude-opus-5-5)'
   [ "$(print_flag)" = above_budget ] || return 0
   [ "${1:-}" != scout ] || what='this scout runs on Sonnet 5.5 (claude-sonnet-5-5)'
-  printf 'advice: Claude daily budget exceeded (spent %s%% of today'"'"'s %s%% allowance, %s%% left for %s days): %s. Advice only: an explicit captain model choice wins and the profile above is unchanged.\n' \
+  printf 'advice: Claude daily budget exceeded (spent %s%% of today'"'"'s %s%% allowance, %s%% left for %s days): %s. Claude candidates at effort max or ultra are refused; an explicit captain model or effort choice wins.\n' \
     "$(state_get spent_today_pct)" "$(state_get day_budget_pct)" "$(state_get remaining_pct)" "$(state_get days_left)" "$what"
 }
 
@@ -193,9 +197,9 @@ if [ "$BASE_DAY" != "$TODAY" ] || [ -z "$BASE_REMAINING" ] || [ -z "$BASE_DAYS" 
 fi
 
 read -r BUDGET DAY_BUDGET SPENT ABOVE <<EOF
-$(awk -v r="$REMAINING" -v d="$DAYS" -v br="$BASE_REMAINING" -v bd="$BASE_DAYS" 'BEGIN {
-  budget = r / d
-  day_budget = (bd > 0) ? br / bd : budget
+$(awk -v r="$REMAINING" -v d="$DAYS" -v br="$BASE_REMAINING" -v bd="$BASE_DAYS" -v c="$CEILING" 'BEGIN {
+  budget = r / d; if (budget > c) budget = c
+  day_budget = (bd > 0) ? br / bd : budget; if (day_budget > c) day_budget = c
   spent = br - r; if (spent < 0) spent = 0
   printf "%.2f %.2f %.2f %d\n", budget, day_budget, spent, (spent > day_budget) ? 1 : 0
 }')

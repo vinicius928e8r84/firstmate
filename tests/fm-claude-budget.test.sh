@@ -5,8 +5,8 @@
 # PATH serving a canned `--json` snapshot, and a fixed clock
 # (FM_CLAUDE_BUDGET_NOW), so no case touches the network, a credential, or the
 # real quota. Pins:
-#   1. budget = remaining percent / days to the end date, with the sample
-#      numbers worked by hand;
+#   1. budget = remaining percent / days to the end date, capped at 10 points
+#      a day, with the sample numbers worked by hand;
 #   2. the end date is configurable by flag, environment, and config file, and
 #      a malformed one exits 2;
 #   3. the day's allowance is fixed at the first run of the UTC day, the flag
@@ -72,16 +72,17 @@ expect_code 0 "$CODE" "a run with a readable quota exits 0"
 assert_equals ok "$(state_val status)" "status ok"
 assert_equals 52 "$(state_val remaining_pct)" "remaining percent is read from the Claude all_models row"
 assert_equals 5.0000 "$(state_val days_left)" "five days to 2026-11-01T22:00:00Z"
-assert_equals 10.40 "$(state_val budget_pct_per_day)" "52% over 5 days is 10.40% a day"
+assert_equals 10.00 "$(state_val budget_pct_per_day)" "52% over 5 days is 10.40% a day, capped at the 10-point ceiling"
+assert_equals 10.00 "$(state_val day_budget_pct)" "the day's allowance is capped at the ceiling too"
 assert_equals 0 "$(state_val above_budget)" "nothing spent yet: within budget"
-assert_contains "$OUT" 'budget=10.40%/day' "the summary prints the budget"
+assert_contains "$OUT" 'budget=10.00%/day' "the summary prints the budget"
 [ "$(wc -l < "$HOME_DIR/data/claude-budget.log")" = 1 ] || fail "one log row per run"
-pass "budget: 52% remaining over 5 days is 10.40% a day, recorded in the state and the log"
+pass "budget: 52% remaining over 5 days is capped at 10% a day, recorded in the state and the log"
 
 # 2. The end date is configurable; a malformed one exits 2.
 run_budget "$T0" 52 --end 2026-10-30T22:00:00Z
 assert_equals 3.0000 "$(state_val days_left)" "--end moves the end date"
-assert_equals 17.33 "$(state_val budget_pct_per_day)" "52% over 3 days is 17.33% a day"
+assert_equals 10.00 "$(state_val budget_pct_per_day)" "52% over 3 days is 17.33% a day, capped at the 10-point ceiling"
 rm -f "$STATE/claude-budget.state"
 printf '# renewal\n2026-10-28T22:00:00Z\n' > "$HOME_DIR/config/claude-budget-end"
 run_budget "$T0" 52
@@ -151,7 +152,7 @@ write_quota "$TMP_ROOT/quota.json" 52
 OUT=$(env -i PATH="$FAKEBIN:$BASE_PATH" FM_HOME="$HOME_DIR" FM_CLAUDE_BUDGET_NOW="$T0" QUOTA_AXI_FIXTURE="$TMP_ROOT/quota.json" "$TOOL" </dev/null 2>&1); CODE=$?
 expect_code 0 "$CODE" "a cron-style run succeeds with a minimal environment"
 [ "$(wc -l < "$HOME_DIR/data/claude-budget.log")" = 1 ] || fail "one log row per run"
-assert_equals "$T0	52	5.0000	10.40	0.00	0" "$(cat "$HOME_DIR/data/claude-budget.log")" "the log row carries the numbers"
+assert_equals "$T0	52	5.0000	10.00	0.00	0" "$(cat "$HOME_DIR/data/claude-budget.log")" "the log row carries the numbers"
 pass "budget: runs from a minimal cron environment and appends one log row"
 
 printf '# all fm-claude-budget tests passed\n'

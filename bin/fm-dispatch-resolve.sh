@@ -54,9 +54,12 @@
 #     advice: <text>      only when bin/fm-claude-budget.sh has recorded the Claude
 #                         daily budget as exceeded: non-HIGH-risk proofs and all
 #                         scouts should run on Sonnet 5.5, HIGH-risk reviews stay
-#                         on Opus 5.5. Advice only - it never changes the status,
-#                         the candidates, or the profile line, and an explicit
-#                         captain model choice always wins.
+#                         on Opus 5.5. The text itself changes nothing.
+#   Budget refusal: while that flag is above_budget, a Claude candidate whose
+#   effort is max or ultra is "not eligible" (every other candidate continues,
+#   so the profile line names the best remaining one, or the status is escalate
+#   when none remains). An explicit captain model or effort choice bypasses this
+#   resolver and always wins.
 #   clear     -> pass the profile line to fm-spawn.sh unless you state a reason to override
 #   ambiguous -> confidence below the floor; decide as today from the probabilities
 #   escalate  -> the rule requires captain approval, no candidate is rankable, or a genuine tie
@@ -409,7 +412,9 @@ quota-axi --json > "$QUOTA" 2>/dev/null || emit_error "quota-axi --json failed"
 fm_quota_json_valid < "$QUOTA" || emit_error "quota-axi --json returned an invalid snapshot"
 
 # ---- resolution: declared gates + quota evidence + argmax, all in jq ------------
-RESULT=$(jq -n --arg floor "$CONFIDENCE_FLOOR" --argjson lat "$LAT_MS" --arg none_criterion "$DEFAULT_WHEN" --argjson pmap "$PMAP" \
+BUDGET_FLAG=unknown
+[ ! -x "$SCRIPT_DIR/fm-claude-budget.sh" ] || BUDGET_FLAG=$("$SCRIPT_DIR/fm-claude-budget.sh" --flag 2>/dev/null) || BUDGET_FLAG=unknown
+RESULT=$(jq -n --arg floor "$CONFIDENCE_FLOOR" --arg budget_flag "$BUDGET_FLAG" --argjson lat "$LAT_MS" --arg none_criterion "$DEFAULT_WHEN" --argjson pmap "$PMAP" \
   --slurpfile resp "$RESP_FILE" --slurpfile rules "$RULES" --slurpfile quota "$QUOTA" "$FM_QUOTA_ROW_JQ"'
   ($resp[0]) as $r | ($rules[0]) as $cfg | ($quota[0]) as $q | ($r.answers.rule) as $a |
   def profiles($v): if ($v | type) == "array" then $v elif ($v | type) == "object" then [$v] else [] end;
@@ -437,7 +442,7 @@ RESULT=$(jq -n --arg floor "$CONFIDENCE_FLOOR" --argjson lat "$LAT_MS" --arg non
     end;
   def evidence($rows):
     $rows | map({scope, status, pct: (.effectivePercentRemaining // null), runway: (.runway.status // null), spendPriority: (.selection.spendPriority // null)});
-  def evaluate($c):
+  def evaluate0($c):
     (provider_of($c)) as $p | (lane_of($c)) as $lane |
     if $p == null then {profile: $c, eligible: false, reason: "no provider family for harness \($c.harness); declare provider on the profile"}
     elif prov($p; $lane) == null then
@@ -481,6 +486,13 @@ RESULT=$(jq -n --arg floor "$CONFIDENCE_FLOOR" --argjson lat "$LAT_MS" --arg non
          spendPriority: $limiting.selection.spendPriority, runway: $limiting.runway.status, eligible: true, reason: "ok"}
       end
     end;
+  # The Claude daily budget is above its allowance: a Claude candidate at effort
+  # max or ultra is refused; every other candidate is evaluated as before.
+  def evaluate($c):
+    evaluate0($c) as $e |
+    if $budget_flag == "above_budget" and $e.provider == "claude" and (["max", "ultra"] | index($c.effort // "")) != null
+    then $e + {eligible: false, unranked: false, reason: "Claude daily budget exceeded: effort \($c.effort) is refused"}
+    else $e end;
   def rule_at($c):
     if ($c | test("^rule_[1-9][0-9]*$")) then
       ($c | ltrimstr("rule_") | tonumber) as $n |
