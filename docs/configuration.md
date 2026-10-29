@@ -1677,6 +1677,11 @@ It never changes the status, the candidates, or the `profile:` line, and an expl
 `bin/fm-upstream-sync.sh` keeps this home's checkout in step with `upstream` and the operator's `fork` without force-pushing or rewriting history: it fast-forwards `fork/main` to local main, merges a new `upstream/main` on a temporary `sync/upstream-YYYYMMDD` branch outside the primary checkout, and opens one pull request against the fork, or, on a conflict, writes `data/upstream-sync/YYYYMMDD.md` and sends one `upstream-sync-conflict` webhook notice.
 The home installs a daily cron line: `17 6 * * * nice -n 19 FM_HOME=/home/factory/firstmate /home/factory/firstmate/bin/fm-upstream-sync.sh`; the script header owns the guards, environment (including `FM_UPSTREAM_SYNC_DRY=1`), and the `state/.upstream-sync.log` and `.seen` records.
 
+**Rehearsal window preflight**
+
+`bin/fm-prewindow-check.sh <pc|mac>` is a read-only checklist for the minutes before a rehearsal window: it exits 0 only when the host answers over ssh (with retries, since the PC link is intermittent), the process that keeps WSL up is running (PC), the Claude login has hours left, a named `--repo` has its labels and a pnpm project, and the Mac has no forgotten test processes (listed, never killed); the script header owns the environment and it never touches the browser or Anki profile 'Samilly Ribeiro' or the main Anki.
+Every rehearsal closes the test Anki it started, by that Anki's own PID, and never by process name or by closing the main Anki, so the stray-process check stays empty.
+
 **Missing or invalid rules**
 
 An absent rules file, a default-only file, or `rules: []` returns the non-clear reason `no rules to match` without a model or quota request, leaving firstmate's existing routing in control; an existing but unreadable or malformed rules file, including a broken symlink, remains an actionable exit 2 configuration error.
