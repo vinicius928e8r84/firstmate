@@ -29,8 +29,27 @@
 # free-text `note`, and a submit that calls window.lavish.queuePrompt with the
 # selection and note under schema fm-daily-answer.v1.
 #
+# One page for everything that waits for the captain. Besides the reader's
+# decisions it lists the cards of the resilience loops (bin/fm-resil-lib.sh:
+# a worker creation that failed for good, a worker that stayed stopped, a steer
+# whose delivery stayed unconfirmed) from state/resil/cards/, each with the
+# options Tentar de novo, Desistir and Adiar. Before it renders, it closes
+# ghost holds by fact: a main-home captain hold whose text names a GitHub PR
+# that is already merged or closed, and asks to merge or land it, is released
+# through bin/fm-captain-hold.sh with the decision "closed by fact: PR <url>
+# is <state>". Those closed holds are listed in the page footer ("Fechadas por
+# fato") for the rest of the day. A hold that names a finished PR but does not
+# ask for a merge, or lives in another home, stays and shows "talvez já
+# resolvida". The page is rebuilt at most FM_DAILY_PAGE_MAX_RUNS (2) times a
+# day; later runs reuse the page and its session unless FM_DAILY_PAGE_FORCE=1.
+#
 # Environment:
 #   FM_HOME                 firstmate home (default: the code root)
+#   FM_DAILY_PAGE_MAX_RUNS  rebuilds per day (default 2)
+#   FM_DAILY_PAGE_FORCE     1 rebuilds regardless of the daily limit
+#   FM_DAILY_PAGE_PR_CMD    command printing merged|closed|open|unknown for a PR url
+#   FM_DAILY_PAGE_HOLD_CMD  command taking the fm-captain-hold.sh arguments (default: the sibling script)
+#   FM_DAILY_PAGE_CARDS_DIR directory of cards (default: state/resil/cards)
 #   FM_DAILY_PAGE_DIR       directory for the page (default: $FM_HOME/.lavish)
 #   FM_DAILY_PAGE_DATE      YYYY-MM-DD to build (default: today)
 #   FM_DAILY_PAGE_READER    shell command printing the reader's JSON (an object
@@ -52,6 +71,14 @@ HOST="${FM_DAILY_PAGE_HOST:-100.96.168.50:4387}"
 DEFAULT_READER="FM_BEARINGS_DECISIONS=500 '$SCRIPT_DIR/fm-bearings-snapshot.sh' --json"
 READER="${FM_DAILY_PAGE_READER:-$DEFAULT_READER}"
 
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+CARDS_DIR="${FM_DAILY_PAGE_CARDS_DIR:-$STATE/resil/cards}"
+HOLD_CMD="${FM_DAILY_PAGE_HOLD_CMD:-$SCRIPT_DIR/fm-captain-hold.sh}"
+MAX_RUNS="${FM_DAILY_PAGE_MAX_RUNS:-2}"
+# shellcheck source=bin/fm-resil-lib.sh
+. "$SCRIPT_DIR/fm-resil-lib.sh"
+pr_state() { if [ -n "${FM_DAILY_PAGE_PR_CMD:-}" ]; then "$FM_DAILY_PAGE_PR_CMD" "$1"; else fm_resil_pr_state "$1"; fi; }
+
 fail() { printf 'fm-daily-page: %s\n' "$*" >&2; exit 1; }
 
 case "$DAY" in
@@ -62,6 +89,62 @@ command -v jq >/dev/null 2>&1 || fail "jq is not installed"
 
 PAGE="$DIR/diaria-$DAY.html"
 
+RUNS_FILE="$STATE/.daily-page-runs-$DAY"
+CLOSED_FILE="$STATE/.daily-page-closed-$DAY"
+
+# Close the ghost holds among $decisions by fact; leaves the rest in $decisions, marking the doubtful ones.
+close_ghosts() {
+  local row id owner verb text url st maybe note kept=() n
+  note=$(mktemp "${TMPDIR:-/tmp}/fm-daily-ghost.XXXXXX") || return 0
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    id=$(printf '%s' "$row" | jq -r '.id // .key')
+    owner=$(printf '%s' "$row" | jq -r '.owner // "(main)"')
+    verb=$(printf '%s' "$row" | jq -r '.verb // ""')
+    text=$(printf '%s' "$row" | jq -r '[.summary, .key, .id] | map(select(. != null)) | join(" ")')
+    maybe=false
+    url=$(printf '%s' "$text" | grep -oE 'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+' | head -n 1)
+    if [ "$verb" = captain-hold ] && [ -n "$url" ]; then
+      st=$(pr_state "$url" 2>/dev/null | head -n 1)
+      case "$st" in
+        merged|closed)
+          if [ "$owner" = "(main)" ] && [[ $id != */* ]] && printf '%s' "$text" | grep -qiE 'merg|land|mescl|integr|aprovar'; then
+            printf 'closed by fact: PR %s is %s (checked %s)\n' "$url" "$st" "$(date +%F)" > "$note"
+            if "$HOLD_CMD" answer "$id" --decision-file "$note" --release >/dev/null 2>&1; then
+              mkdir -p "$STATE" && printf '%s\t%s\t%s\n' "$id" "$url" "$st" >> "$CLOSED_FILE"
+              fm_resil_log "$STATE" "$id" ghost-hold close-by-fact "PR $url is $st"
+              continue
+            fi
+          fi
+          maybe=true ;;
+      esac
+    fi
+    kept+=("$(printf '%s' "$row" | jq -c --argjson m "$maybe" '. + {maybe_resolved: $m}')")
+  done < <(printf '%s' "$decisions" | jq -c '.[]')
+  rm -f "$note"
+  n=${#kept[@]}
+  if [ "$n" -gt 0 ]; then decisions=$(printf '%s\n' "${kept[@]}" | jq -cs '.'); else decisions='[]'; fi
+}
+
+# The cards of the resilience loops, after the decisions that share a key with none of them.
+add_cards() {
+  local f cards_json
+  cards_json=$(for f in "$CARDS_DIR"/*.card; do
+    [ -f "$f" ] || continue
+    jq -nc --arg key "$(sed -n 's/^key=//p' "$f" | head -n 1)" --arg owner "$(sed -n 's/^owner=//p' "$f" | head -n 1)" \
+      --arg summary "$(sed -n 's/^summary=//p' "$f" | head -n 1)" \
+      '{id:$key, key:$key, verb:"captain-hold", owner:(if $owner == "" then "(main)" else $owner end), summary:$summary,
+        recommend:"retry",
+        options:[{value:"retry",label:"Tentar de novo",hint:"Repetir a ação que falhou"},
+                 {value:"drop",label:"Desistir",hint:"Dar a tarefa por encerrada"},
+                 {value:"defer",label:"Adiar",hint:"Voltar a isto mais tarde"}]}'
+  done | jq -cs '.') || return 0
+  [ -n "$cards_json" ] || return 0
+  decisions=$(printf '%s' "$decisions" | jq -c --argjson c "$cards_json" \
+    '. as $d | $d + [ $c[] | select(.key as $k | any($d[]; (.key // .id) == $k) | not) ]') || return 0
+}
+
+build_page() {
 # --- read the open decisions -------------------------------------------------
 raw=$(bash -c "$READER") || fail "the decision reader failed"
 decisions=$(printf '%s' "$raw" | jq -c '
@@ -70,6 +153,8 @@ decisions=$(printf '%s' "$raw" | jq -c '
           | select((.key // .id // "") != "") ]
   | reduce .[] as $d ([]; if any(.[]; (.key // .id) == ($d.key // $d.id)) then . else . + [$d] end)
 ') || fail "the decision reader did not print the expected JSON"
+close_ghosts
+add_cards
 
 # --- render the cards ----------------------------------------------------------
 cards=$(printf '%s' "$decisions" | jq -r '
@@ -89,6 +174,7 @@ cards=$(printf '%s' "$decisions" | jq -r '
       + "  <div class=\"card-top\"><span class=\"badge\">decisão</span><span class=\"owner\">" + ((.owner // "(main)") | @html) + "</span></div>\n"
       + "  <h2>" + ($title | @html) + "</h2>\n"
       + "  <p class=\"key\">" + ($key | @html) + "</p>\n"
+      + (if (.maybe_resolved // false) then "  <p class=\"maybe\">talvez já resolvida: a PR citada já foi encerrada. Confirme ou feche.</p>\n" else "" end)
       + "  <form data-lavish-question=\"" + ($key | @html) + "\" data-title=\"" + ($title | @html) + "\">\n"
       + "    <div class=\"opts\">\n"
       + ([ $opts[] | "      <label class=\"opt\"><input type=\"radio\" name=\"answer\" value=\"" + (.value | tostring | @html) + "\""
@@ -117,6 +203,14 @@ fi
 
 day_br="${DAY:8:2}/${DAY:5:2}/${DAY:0:4}"
 
+footer=
+if [ -s "$CLOSED_FILE" ]; then
+  footer=$(jq -Rrs 'split("\n") | map(select(length > 0) | split("\t"))
+    | "<footer class=\"closed\"><h3>Fechadas por fato</h3><ul>\n"
+      + (map("<li>" + (.[0] | @html) + " - PR " + (.[1] | @html) + " (" + (.[2] | @html) + ")</li>") | join("\n"))
+      + "\n</ul></footer>"' < "$CLOSED_FILE") || footer=
+fi
+
 html=$(cat <<EOF
 <!doctype html>
 <html lang="pt-BR">
@@ -138,6 +232,9 @@ html=$(cat <<EOF
   .badge { background:var(--accent); color:#fff; border-radius:999px; padding:.1rem .6rem; font-size:.75rem; text-transform:uppercase; letter-spacing:.04em; }
   .owner { color:var(--muted); font-size:.85rem; overflow-wrap:anywhere; }
   .card h2 { margin:.6rem 0 .2rem; font-size:1.15rem; overflow-wrap:anywhere; }
+  .maybe { margin:0 0 .8rem; color:var(--gold); font-size:.85rem; }
+  footer.closed { margin-top:1.5rem; color:var(--muted); font-size:.85rem; }
+  footer.closed h3 { margin:0 0 .3rem; font-size:.9rem; }
   .key { margin:0 0 1rem; color:var(--muted); font:.8rem ui-monospace, monospace; overflow-wrap:anywhere; }
   .opts { display:grid; gap:.5rem; }
   .opt { display:flex; gap:.6rem; align-items:flex-start; border:1px solid var(--line); border-radius:.5rem; padding:.6rem .75rem; cursor:pointer; min-width:0; }
@@ -162,6 +259,7 @@ html=$(cat <<EOF
     <p>$day_br · $sub</p>
   </header>
 $cards
+$footer
 </main>
 <script>
 (function () {
@@ -203,7 +301,6 @@ EOF
 
 # --- write the page (only when it changed) ---------------------------------------
 mkdir -p "$DIR" || fail "cannot create $DIR"
-PAGE_REAL="$(cd "$DIR" && pwd -P)/diaria-$DAY.html"
 if [ ! -f "$PAGE" ] || [ "$(cat "$PAGE")" != "$html" ]; then
   tmp=$(mktemp "$DIR/.diaria-$DAY.XXXXXX") || fail "cannot write in $DIR"
   if ! printf '%s\n' "$html" > "$tmp" || ! mv -f "$tmp" "$PAGE"; then
@@ -211,6 +308,18 @@ if [ ! -f "$PAGE" ] || [ "$(cat "$PAGE")" != "$html" ]; then
     fail "cannot write $PAGE"
   fi
 fi
+mkdir -p "$STATE" 2>/dev/null && printf '%s\n' "$(date +%s)" >> "$RUNS_FILE" 2>/dev/null || true
+}
+
+runs=0
+[ -f "$RUNS_FILE" ] && runs=$(wc -l < "$RUNS_FILE" | tr -d ' ')
+if [ -f "$PAGE" ] && [ "${runs:-0}" -ge "$MAX_RUNS" ] && [ "${FM_DAILY_PAGE_FORCE:-0}" != 1 ]; then
+  printf 'fm-daily-page: already rebuilt %s times today; reusing the page (FM_DAILY_PAGE_FORCE=1 rebuilds)\n' "$runs" >&2
+else
+  build_page
+fi
+mkdir -p "$DIR" || fail "cannot create $DIR"
+PAGE_REAL="$(cd "$DIR" && pwd -P)/diaria-$DAY.html"
 
 # --- the lavish session: reuse the listed one, open only when none exists ---------
 command -v lavish-axi >/dev/null 2>&1 || fail "lavish-axi is not installed"

@@ -11,7 +11,12 @@
 #   3. the same date gives the same file and URL, opens one session only, and
 #      does not rewrite an unchanged page;
 #   4. an ended session is reported and never reopened;
-#   5. the URL carries the tailnet host, never localhost; an empty list still
+#   5. ghost holds (a main-home hold that asks to merge a PR that is already
+#      merged or closed) are released through the hold script and listed in
+#      the footer; doubtful ones stay and say "talvez já resolvida";
+#   6. resilience cards from state/resil/cards/ become cards of their own;
+#   7. the page is rebuilt at most twice a day unless forced;
+#   8. the URL carries the tailnet host, never localhost; an empty list still
 #      builds a page; a failing reader leaves the page alone and exits 1.
 set -u
 
@@ -59,7 +64,7 @@ run_page() {  # <home-name> [env...]
   local name=$1; shift
   env HOME="$HOME_DIR" PATH="$FAKEBIN:$PATH" SESSIONS="$SESSIONS" LAVISH_LOG="$LAVISH_LOG" \
     FM_HOME="$TMP_ROOT/$name" FM_DAILY_PAGE_DATE=2026-10-29 FM_SW_NO_NOTIFY=1 \
-    FM_DAILY_PAGE_READER="$TMP_ROOT/reader.sh" "$@" bash "$TOOL" 2>"$TMP_ROOT/err"
+    FM_DAILY_PAGE_READER="$TMP_ROOT/reader.sh" FM_DAILY_PAGE_MAX_RUNS=1000 "$@" bash "$TOOL" 2>"$TMP_ROOT/err"
 }
 
 write_decisions '{"decisions_open":[
@@ -166,5 +171,85 @@ assert_equals "$(cat "$TMP_ROOT/before.html")" "$(cat "$TMP_ROOT/w3/.lavish/diar
 run_page w3 FM_DAILY_PAGE_DATE=hoje >/dev/null; CODE=$?
 expect_code 1 "$CODE" "a malformed date exits 1"
 pass "daily-page: a failing reader or bad date exits 1 and leaves the page alone"
+
+# --- ghost holds closed by fact, resilience cards, and the daily rebuild limit -----------------------
+HOLD_LOG="$TMP_ROOT/hold.log"; : > "$HOLD_LOG"
+cat > "$TMP_ROOT/hold-cmd" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> '$HOLD_LOG'
+[ "\$2" = g-fails ] && exit 1
+f=
+while [ \$# -gt 0 ]; do [ "\$1" = --decision-file ] && f=\$2; shift; done
+cat "\$f" >> '$HOLD_LOG'
+exit 0
+SH
+cat > "$TMP_ROOT/pr-cmd" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  */pull/1|*/pull/5|*/pull/6|*/pull/7) echo merged; exit 0 ;;
+  */pull/3) echo closed; exit 1 ;;
+  */pull/2) echo open; exit 1 ;;
+  *) echo unknown; exit 1 ;;
+esac
+SH
+chmod +x "$TMP_ROOT/hold-cmd" "$TMP_ROOT/pr-cmd"
+write_decisions '{"decisions_open":[
+ {"id":"g-merged","key":"g-merged","verb":"captain-hold","summary":"Land PR https://github.com/o/r/pull/1 into main?","owner":"(main)"},
+ {"id":"g-open","key":"g-open","verb":"captain-hold","summary":"Land PR https://github.com/o/r/pull/2 into main?","owner":"(main)"},
+ {"id":"g-review","key":"g-review","verb":"captain-hold","summary":"Revisão da PR https://github.com/o/r/pull/3","owner":"(main)"},
+ {"id":"m1/g-other","key":"g-other","verb":"captain-hold","summary":"Merge PR https://github.com/o/r/pull/5?","owner":"m1"},
+ {"id":"g-status","key":"g-status","verb":"needs-decision","summary":"Land PR https://github.com/o/r/pull/6?","owner":"(main)"},
+ {"id":"g-fails","key":"g-fails","verb":"captain-hold","summary":"Merge PR https://github.com/o/r/pull/7?","owner":"(main)"},
+ {"id":"g-nourl","key":"g-nourl","verb":"captain-hold","summary":"Merge the branch?","owner":"(main)"}
+]}'
+mkdir -p "$TMP_ROOT/g1/state/resil/cards"
+printf 'key=spawn-w9\nowner=(main)\nat=1\nsummary=A criação do worker w9 falhou\n' > "$TMP_ROOT/g1/state/resil/cards/spawn-w9.card"
+GOUT=$(run_page g1 FM_DAILY_PAGE_PR_CMD="$TMP_ROOT/pr-cmd" FM_DAILY_PAGE_HOLD_CMD="$TMP_ROOT/hold-cmd"); CODE=$?
+expect_code 0 "$CODE" "a run with ghost holds succeeds: $(cat "$TMP_ROOT/err")"
+GPAGE="$TMP_ROOT/g1/.lavish/diaria-2026-10-29.html"
+assert_contains "$(cat "$HOLD_LOG")" "answer g-merged --decision-file" "the merged ghost was released through the hold script"
+assert_contains "$(cat "$HOLD_LOG")" "--release" "the ghost is released, not completed"
+assert_contains "$(cat "$HOLD_LOG")" "closed by fact: PR https://github.com/o/r/pull/1 is merged" "the decision text names the PR and its state"
+assert_not_contains "$(cat "$HOLD_LOG")" "g-open" "an open PR's hold was touched"
+assert_not_contains "$(cat "$HOLD_LOG")" "g-review" "a hold that does not ask for a merge was closed"
+assert_not_contains "$(cat "$HOLD_LOG")" "g-other" "another home's hold was closed from here"
+assert_not_contains "$(cat "$HOLD_LOG")" "g-status" "a status decision was closed as a hold"
+assert_not_contains "$(cat "$HOLD_LOG")" "g-nourl" "a hold naming no PR was closed"
+assert_not_contains "$(cat "$GPAGE")" 'data-lavish-question="g-merged"' "the closed ghost is still on the page"
+for kept in g-open g-review g-other g-status g-fails g-nourl; do
+  assert_contains "$(cat "$GPAGE")" "data-lavish-question=\"$kept\"" "$kept must stay on the page"
+done
+maybe=$(grep -c 'talvez já resolvida' "$GPAGE")
+assert_equals 3 "$maybe" "review, another home's hold and a hold that failed to close are marked as perhaps resolved"
+assert_not_contains "$(sed -n '/data-lavish-question="g-open"/,/<\/form>/p' "$GPAGE")" "talvez" "an open PR is not marked"
+assert_contains "$(cat "$GPAGE")" "Fechadas por fato" "the footer lists what was closed by fact"
+assert_contains "$(cat "$GPAGE")" "g-merged - PR https://github.com/o/r/pull/1 (merged)" "the footer names the closed hold"
+assert_contains "$(cat "$TMP_ROOT/g1/state/.resil.log")" "task=g-merged cause=ghost-hold action=close-by-fact" "the close was logged"
+# the card
+card=$(sed -n '/data-lavish-question="spawn-w9"/,/<\/form>/p' "$GPAGE")
+assert_contains "$card" 'value="retry" checked' "a card recommends trying again"
+assert_contains "$card" 'value="drop"' "a card offers to give up"
+assert_contains "$(cat "$GPAGE")" "A criação do worker w9 falhou" "the card text is on the page"
+# the footer outlives the run that closed the hold
+write_decisions '{"decisions_open":[]}'
+run_page g1 FM_DAILY_PAGE_PR_CMD="$TMP_ROOT/pr-cmd" FM_DAILY_PAGE_HOLD_CMD="$TMP_ROOT/hold-cmd" >/dev/null
+assert_contains "$(cat "$GPAGE")" "g-merged - PR https://github.com/o/r/pull/1 (merged)" "a later run forgot what was closed today"
+pass "daily-page: ghost holds are closed by fact and listed; doubtful ones are marked; cards get their own options"
+
+# Rebuilt at most twice a day unless forced.
+write_decisions '{"decisions_open":[{"id":"r1","key":"r1","verb":"captain-hold","summary":"primeira","owner":"(main)"}]}'
+run_page lim FM_DAILY_PAGE_MAX_RUNS=2 >/dev/null
+write_decisions '{"decisions_open":[{"id":"r1","key":"r1","verb":"captain-hold","summary":"segunda","owner":"(main)"}]}'
+run_page lim FM_DAILY_PAGE_MAX_RUNS=2 >/dev/null
+assert_contains "$(cat "$TMP_ROOT/lim/.lavish/diaria-2026-10-29.html")" "segunda" "the second run did not rebuild"
+write_decisions '{"decisions_open":[{"id":"r1","key":"r1","verb":"captain-hold","summary":"terceira","owner":"(main)"}]}'
+LOUT=$(run_page lim FM_DAILY_PAGE_MAX_RUNS=2); CODE=$?
+expect_code 0 "$CODE" "a run past the limit still prints the page"
+assert_contains "$LOUT" "url: http://100.96.168.50:4387/session/" "a run past the limit still prints the url"
+assert_not_contains "$(cat "$TMP_ROOT/lim/.lavish/diaria-2026-10-29.html")" "terceira" "a third run rebuilt the page"
+assert_contains "$(cat "$TMP_ROOT/err")" "already rebuilt 2 times today" "the limit is announced on stderr"
+run_page lim FM_DAILY_PAGE_MAX_RUNS=2 FM_DAILY_PAGE_FORCE=1 >/dev/null
+assert_contains "$(cat "$TMP_ROOT/lim/.lavish/diaria-2026-10-29.html")" "terceira" "FM_DAILY_PAGE_FORCE=1 did not rebuild"
+pass "daily-page: the page is rebuilt at most twice a day unless forced"
 
 printf '# all fm-daily-page tests passed\n'
