@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--scheduled-loop <name>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--scheduled-loop <name>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -226,7 +226,21 @@
 #   Lane cap: when config/lane-capacity exists, a fresh ship or scout spawn
 #   also defers the same way (one `deferred:` line, exit 75, nothing created,
 #   item stays queued) once bin/fm-capacity.sh counts as many lanes as the cap;
-#   an unreadable cap refuses with exit 1. There is no override: raise the cap.
+#   an unreadable cap refuses with exit 1. An ordinary spawn compares the lanes
+#   that are not scheduled loops with the cap, so scheduled lanes never take an
+#   ordinary slot, and nothing about ordinary admission can be overridden: raise
+#   the cap.
+#   Scheduled loops: --scheduled-loop <name> (letters, digits, dot, underscore,
+#   dash; fresh ship or scout spawns only, refused on a relaunch or a
+#   secondmate) marks a lane as one of the captain's recurring scheduled runs
+#   and records scheduled=<name> in state/<id>.meta. Such a lane is admitted
+#   from a reserved pool instead of the ordinary cap: it defers (one `deferred:`
+#   line, exit 75, nothing created) only once as many scheduled lanes already
+#   run as config/lane-capacity's scheduled-reserve key allows (default 4), a
+#   hard bound so a runaway loop cannot flood the host. The memory floor below
+#   still applies to it. bin/fm-scheduled-spawn.sh owns retrying a refused
+#   scheduled spawn and alerting; a failed scheduled spawn is recorded for
+#   bin/fm-lane-guard.sh even when its status is the 75 deferral.
 #   Memory floor: every launch kind, a relaunch and a --secondmate spawn
 #   included, refuses with exit 76 and one `error: spawn refused:` line before
 #   anything is created when the host has less than 2048 MB of available memory
@@ -916,6 +930,8 @@ BASE_BRANCH=
 BASE_BRANCH_SET=0
 UPSTREAM_CONSENT=
 UPSTREAM_CONSENT_SET=0
+SCHEDULED_LOOP=
+SCHEDULED_LOOP_SET=0
 TRACEPARENT_SET=0
 RELAUNCH=0
 # Opt-in only: exact-resume presentation-order lock waits instead of refusing.
@@ -967,6 +983,10 @@ for a in "$@"; do
     upstream-consent)
       UPSTREAM_CONSENT=$a
       UPSTREAM_CONSENT_SET=1
+      ;;
+    scheduled-loop)
+      SCHEDULED_LOOP=$a
+      SCHEDULED_LOOP_SET=1
       ;;
     traceparent)
       TRACEPARENT_ARG=$a
@@ -1036,6 +1056,11 @@ for a in "$@"; do
     UPSTREAM_CONSENT=${a#--upstream-consent=}
     UPSTREAM_CONSENT_SET=1
     ;;
+  --scheduled-loop) want_value="scheduled-loop" ;;
+  --scheduled-loop=*)
+    SCHEDULED_LOOP=${a#--scheduled-loop=}
+    SCHEDULED_LOOP_SET=1
+    ;;
   --traceparent) want_value=traceparent ;;
   --traceparent=*)
     TRACEPARENT_ARG=${a#--traceparent=}
@@ -1070,6 +1095,10 @@ done
 }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || {
   echo "error: --yolo requires a non-empty value" >&2
+  exit 1
+}
+[ "$SCHEDULED_LOOP_SET" -eq 0 ] || [[ $SCHEDULED_LOOP =~ ^[A-Za-z0-9._-]+$ ]] || {
+  echo "error: --scheduled-loop requires a loop name of letters, digits, dot, underscore, and dash (got '$SCHEDULED_LOOP')" >&2
   exit 1
 }
 [ "$UPSTREAM_CONSENT_SET" -eq 0 ] || [ -n "$UPSTREAM_CONSENT" ] || {
@@ -1132,6 +1161,10 @@ if [ "$RELAUNCH" -eq 1 ]; then
   }
   [ "$UPSTREAM_CONSENT_SET" -eq 0 ] || {
     echo "error: --relaunch reuses the task's recorded upstream consent; --upstream-consent cannot override it" >&2
+    exit 1
+  }
+  [ "$SCHEDULED_LOOP_SET" -eq 0 ] || {
+    echo "error: --scheduled-loop marks a fresh spawn only; a relaunch keeps the task's recorded scheduled marker" >&2
     exit 1
   }
 else
@@ -1199,6 +1232,10 @@ else
       exit 1
     }
   fi
+  [ "$KIND" != secondmate ] || [ "$SCHEDULED_LOOP_SET" -eq 0 ] || {
+    echo "error: --scheduled-loop applies only to ship and scout spawns; a secondmate holds no lane" >&2
+    exit 1
+  }
 fi
 
 spawn_remote_secondmate() {
@@ -1580,12 +1617,16 @@ spawn_orca_reclaim_launch_file() {
 
 # A failed creation must not stay silent: record it where bin/fm-lane-guard.sh
 # (run by the watcher and by cron) turns it into a warning within minutes. The
-# capacity deferral is a queue wait, not a failure.
+# capacity deferral of an ordinary spawn is a queue wait, not a failure; a
+# scheduled loop's is a missed run, so it is recorded too. bin/fm-scheduled-spawn.sh
+# retries and alerts on its own record, so a spawn it runs records nothing.
 spawn_failure_record() {  # <status>
-  [ "$1" -ne 0 ] && [ "$1" -ne "${FM_PROJECT_CAPACITY_DEFER_EXIT:-75}" ] || return 0
+  [ "$1" -ne 0 ] || return 0
+  [ "$1" -ne "${FM_PROJECT_CAPACITY_DEFER_EXIT:-75}" ] || [ -n "${SCHEDULED_LOOP:-}" ] || return 0
+  [ -z "${FM_SCHEDULED_SPAWN_HELPER:-}" ] || return 0
   [ -n "${ID:-}" ] && [ -n "${STATE:-}" ] || return 0
   FM_HOME="${FM_HOME:-}" FM_STATE_OVERRIDE="$STATE" "$FM_ROOT/bin/fm-lane-guard.sh" record-spawn-failure \
-    "$ID" "$1" "${KIND:-}" "${PROJ_ABS:-}" "${BACKEND:-}" "${HARNESS:-}" </dev/null >/dev/null 2>&1 || true
+    "$ID" "$1" "${KIND:-}" "${PROJ_ABS:-}" "${BACKEND:-}" "${HARNESS:-}" "${SCHEDULED_LOOP:-}" </dev/null >/dev/null 2>&1 || true
 }
 
 spawn_abort_cleanup() {
@@ -1917,6 +1958,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ "$YOLO_SET" -eq 0 ] || shared_args+=(--yolo "$YOLO")
   [ "$BRANCH_PREFIX_SET" -eq 0 ] || shared_args+=(--branch-prefix "$BRANCH_PREFIX")
   [ "$BASE_BRANCH_SET" -eq 0 ] || shared_args+=(--base-branch "$BASE_BRANCH")
+  [ "$SCHEDULED_LOOP_SET" -eq 0 ] || shared_args+=(--scheduled-loop "$SCHEDULED_LOOP")
   [ "$HERDR_RESUME_LOCK_WAIT" -eq 0 ] || shared_args+=(--herdr-resume-lock-wait)
   for pair in "${POS[@]}"; do
     case "$pair" in
@@ -3675,19 +3717,30 @@ fi
 # Lane ceiling (bin/fm-capacity.sh owns the count and the config/lane-capacity
 # cap): a fresh ship or scout is deferred, with the same exit and the same
 # nothing-created guarantee as the project capacity below, once this home
-# already runs as many lanes as the cap allows. A relaunch replaces a lane that
-# is already counted, and a secondmate holds none.
+# already runs as many ordinary lanes as the cap allows. A relaunch replaces a
+# lane that is already counted, and a secondmate holds none. A scheduled loop
+# (--scheduled-loop) is judged against the reserved pool instead: scheduled
+# lanes never count toward the ordinary cap, so ordinary admission is exactly
+# what it is without them.
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ -e "$CONFIG/lane-capacity" ]; then
   LANE_CAP_REPORT=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
     "$SCRIPT_DIR/fm-capacity.sh" 2>/dev/null | head -1) || LANE_CAP_REPORT=
   LANE_CAP_LANES=$(printf '%s\n' "$LANE_CAP_REPORT" | sed -n 's/.* lanes=\([0-9][0-9]*\) .*/\1/p')
   LANE_CAP_TARGET=$(printf '%s\n' "$LANE_CAP_REPORT" | sed -n 's/.* target=\([0-9][0-9]*\) .*/\1/p')
-  if [ -z "$LANE_CAP_LANES" ] || [ -z "$LANE_CAP_TARGET" ]; then
+  LANE_CAP_SCHEDULED=$(printf '%s\n' "$LANE_CAP_REPORT" | sed -n 's/.* scheduled=\([0-9][0-9]*\)\/[0-9][0-9]*\( .*\)\{0,1\}$/\1/p')
+  LANE_CAP_RESERVE=$(printf '%s\n' "$LANE_CAP_REPORT" | sed -n 's/.* scheduled=[0-9][0-9]*\/\([0-9][0-9]*\)\( .*\)\{0,1\}$/\1/p')
+  if [ -z "$LANE_CAP_LANES" ] || [ -z "$LANE_CAP_TARGET" ] || [ -z "$LANE_CAP_SCHEDULED" ] || [ -z "$LANE_CAP_RESERVE" ]; then
     echo "error: spawn refused: the lane cap ($CONFIG/lane-capacity) is unreadable; fix it so the captain's worker limit is known (docs/configuration.md \"Lane capacity\")" >&2
     exit 1
   fi
-  if [ "$LANE_CAP_LANES" -ge "$LANE_CAP_TARGET" ]; then
-    echo "deferred: this machine already runs $LANE_CAP_LANES lanes against a cap of $LANE_CAP_TARGET ($CONFIG/lane-capacity); task $ID was not launched and its backlog item stays queued - dispatch it again once a lane is cleaned up, route CPU-heavy work to another host with bin/fm-overflow.sh, or raise the cap" >&2
+  if [ -n "$SCHEDULED_LOOP" ]; then
+    # A scheduled loop draws on the reserved pool, never on the ordinary cap.
+    if [ "$LANE_CAP_SCHEDULED" -ge "$LANE_CAP_RESERVE" ]; then
+      echo "deferred: this machine already runs $LANE_CAP_SCHEDULED scheduled lanes against a reserve of $LANE_CAP_RESERVE ($CONFIG/lane-capacity); scheduled loop $SCHEDULED_LOOP (task $ID) was not launched - bin/fm-scheduled-spawn.sh retries it, or raise scheduled-reserve" >&2
+      exit "$FM_PROJECT_CAPACITY_DEFER_EXIT"
+    fi
+  elif [ $((LANE_CAP_LANES - LANE_CAP_SCHEDULED)) -ge "$LANE_CAP_TARGET" ]; then
+    echo "deferred: this machine already runs $((LANE_CAP_LANES - LANE_CAP_SCHEDULED)) lanes against a cap of $LANE_CAP_TARGET ($CONFIG/lane-capacity); task $ID was not launched and its backlog item stays queued - dispatch it again once a lane is cleaned up, route CPU-heavy work to another host with bin/fm-overflow.sh, or raise the cap" >&2
     exit "$FM_PROJECT_CAPACITY_DEFER_EXIT"
   fi
 fi
@@ -6319,6 +6372,7 @@ preserve_relaunch_meta() {
   echo "tasktmp=$TASK_TMP"
   [ -z "$BASE_BRANCH" ] || echo "base_branch=$BASE_BRANCH"
   [ -z "$UPSTREAM_CONSENT" ] || echo "upstream_consent=$UPSTREAM_CONSENT"
+  [ -z "$SCHEDULED_LOOP" ] || echo "scheduled=$SCHEDULED_LOOP"
   # Read by bin/fm-dod-lib.sh's ready-report gate; absent on every other forge.
   [ "$EXTERNAL_REVIEW" = 0 ] || echo "forge=external"
   [ -z "$EXTERNAL_BACKUP_REMOTE" ] || echo "backup_remote=$EXTERNAL_BACKUP_REMOTE"

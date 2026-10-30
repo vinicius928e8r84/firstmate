@@ -20,20 +20,27 @@
 # list in this fixed order:
 #   capacity: free_lanes=<N|unknown> reason=<reason> lanes=<N> target=<N|none|invalid>
 #     secondmates=<N> load1=<X|unknown> cores=<N|unknown>
-#     mem_free_pct=<N|unknown> disk_free_mb=<N|unknown>
+#     mem_free_pct=<N|unknown> disk_free_mb=<N|unknown> scheduled=<N>/<reserve>
 # (one physical line). A short human summary follows it. load1, cores,
 # mem_free_pct and disk_free_mb are always this host's own probes.
 #
 # lanes counts task metadata records whose kind is not secondmate (ship and
 # scout work, including records not yet reconciled after an endpoint died).
 # secondmates counts persistent secondmates separately; they hold no lane.
+# scheduled=<N>/<reserve> is the reserved pool for scheduled loops: N is how
+# many lanes carry a scheduled= line in their task record (bin/fm-spawn.sh
+# --scheduled-loop writes it), reserve is the scheduled-reserve key of
+# config/lane-capacity (default 4). Scheduled lanes are still counted in lanes=,
+# but never consume an ordinary slot: free_lanes and the spawn cap compare
+# lanes minus scheduled lanes against target, so with no scheduled lane every
+# figure is what it was before the pool existed.
 #
 # target is the cap from config/lane-capacity. Absent means no target, so
 # free_lanes=unknown reason=no-target and the counts are still printed. A
 # malformed file reports target=invalid reason=invalid-target, names the
 # problem and its line on stderr, and exits 1.
 #
-# With a target, free_lanes is target minus lanes (never below 0), unless a
+# With a target, free_lanes is target minus ordinary lanes (never below 0), unless a
 # constraint holds, in which case free_lanes=0 and reason names every
 # constraint, comma-separated, in this order:
 #   cpu       probe basis: 1-minute load average >= logical cores
@@ -75,8 +82,9 @@
 #   schema, generated_epoch (this host's clock), home ("main", or the id in
 #   .fm-secondmate-home), machine (the first readable beat's host, else the
 #   short host name),
-#   lanes {count, pr_ready (records with a pr= line), ids},
-#   cap {target (number or null), status ok|none|invalid},
+#   lanes {count, pr_ready (records with a pr= line), ids, scheduled (the
+#     scheduled-loop lanes among them)},
+#   cap {target (number or null), status ok|none|invalid, scheduled_reserve},
 #   projects (clone directory names under projects/),
 #   pressure {level ok|warn|critical|unknown, why[], basis beat|probe|none,
 #     beat_age_s, avail_gb, total_gb, runq_per_core (probe basis: load1 over
@@ -133,6 +141,7 @@ DISK_FREE_MIN_MB=5120
 LANE_FOOTPRINT_GB=1
 QUOTA_TIMEOUT=5
 BOOTS_KEPT=10
+DEFAULT_SCHEDULED_RESERVE=4
 
 mode=report
 case "${1:-}" in
@@ -187,6 +196,7 @@ fi
 lanes=0
 secondmates=0
 pr_ready=0
+scheduled_lanes=0
 lane_ids=
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
@@ -197,6 +207,7 @@ for meta in "$STATE"/*.meta; do
     lane_ids="$lane_ids$(basename "$meta" .meta)
 "
     grep -q '^pr=..*' "$meta" 2>/dev/null && pr_ready=$((pr_ready + 1))
+    grep -q '^scheduled=..*' "$meta" 2>/dev/null && scheduled_lanes=$((scheduled_lanes + 1))
   fi
 done
 
@@ -207,6 +218,7 @@ min_avail_gb=
 min_disk_gb=
 max_load1=
 captain_idle=
+scheduled_reserve=$DEFAULT_SCHEDULED_RESERVE
 quota_provider=
 pressure_files=
 reserve_flags=
@@ -240,7 +252,7 @@ parse_lane_config() {
     [ "$key" = "$line" ] || rest=$(printf '%s' "${line#* }" | sed 's/^ *//')
     value=${rest%% *}
     case "$key" in
-      min-avail-gb|min-disk-gb|max-load1|captain-idle|quota-provider|pressure-file|reserve-flag) ;;
+      min-avail-gb|min-disk-gb|max-load1|captain-idle|scheduled-reserve|quota-provider|pressure-file|reserve-flag) ;;
       *) config_error "$lineno" "unknown key" "'$key'"; return 1 ;;
     esac
     case "$key" in
@@ -263,6 +275,10 @@ parse_lane_config() {
       captain-idle)
         is_uint "$value" && [ "${#value}" -le 9 ] && [ "$((10#$value))" -gt 0 ] || { config_error "$lineno" "captain-idle needs a positive number of seconds"; return 1; }
         captain_idle=$((10#$value))
+        ;;
+      scheduled-reserve)
+        is_uint "$value" && [ "${#value}" -le 3 ] && [ "$((10#$value))" -gt 0 ] || { config_error "$lineno" "scheduled-reserve needs a positive number of lanes"; return 1; }
+        scheduled_reserve=$((10#$value))
         ;;
       quota-provider)
         case "$value" in ''|*[!a-z0-9-]*) config_error "$lineno" "quota-provider needs one provider name"; return 1 ;; esac
@@ -291,6 +307,7 @@ if [ -e "$LANE_CONFIG" ]; then
     target_reason="config/lane-capacity: $target_reason"
     target=invalid
     min_avail_gb='' min_disk_gb='' max_load1='' captain_idle='' quota_provider='' pressure_files='' reserve_flags=''
+    scheduled_reserve=$DEFAULT_SCHEDULED_RESERVE
   fi
 fi
 
@@ -530,7 +547,7 @@ case "$target" in
   none) reason=no-target ;;
   invalid) reason=invalid-target ;;
   *)
-    free_lanes=$((target - lanes))
+    free_lanes=$((target - (lanes - scheduled_lanes)))
     [ "$free_lanes" -ge 0 ] || free_lanes=0
     if [ -n "$constraints" ]; then
       free_lanes=0
@@ -540,7 +557,7 @@ case "$target" in
       admit=true
     else
       reason=full
-      reasons="full: $lanes of $target lanes
+      reasons="full: $((lanes - scheduled_lanes)) of $target lanes
 "
       pub_reasons=$reasons
     fi
@@ -560,14 +577,15 @@ fi
 
 # --- report -----------------------------------------------------------------
 if [ "$mode" = report ]; then
-  printf 'capacity: free_lanes=%s reason=%s lanes=%s target=%s secondmates=%s load1=%s cores=%s mem_free_pct=%s disk_free_mb=%s\n' \
-    "$free_lanes" "$reason" "$lanes" "$target" "$secondmates" "$load1" "$cores" "$mem_free_pct" "$disk_free_mb"
+  printf 'capacity: free_lanes=%s reason=%s lanes=%s target=%s secondmates=%s load1=%s cores=%s mem_free_pct=%s disk_free_mb=%s scheduled=%s/%s\n' \
+    "$free_lanes" "$reason" "$lanes" "$target" "$secondmates" "$load1" "$cores" "$mem_free_pct" "$disk_free_mb" "$scheduled_lanes" "$scheduled_reserve"
 
   case "$target" in
     none) echo "Lanes: $lanes running, no target set (config/lane-capacity absent)." ;;
     invalid) echo "Lanes: $lanes running, target unreadable ($target_error)." ;;
     *) echo "Lanes: $lanes running of $target target, $free_lanes open." ;;
   esac
+  [ "$scheduled_lanes" -eq 0 ] || echo "Scheduled loops: $scheduled_lanes of a $scheduled_reserve-lane reserve, held outside the target."
   [ "$secondmates" -eq 0 ] || echo "Secondmates: $secondmates (hold no lane)."
   mem_text="${mem_free_pct}%"; [ "$mem_free_pct" != unknown ] || mem_text=unknown
   disk_text="$disk_free_mb MB"; [ "$disk_free_mb" != unknown ] || disk_text=unknown
@@ -673,7 +691,7 @@ verdict_reasons=$pub_reasons
 
 doc=$(jq -n \
   --argjson now "$now" --arg home "$home" --arg machine "$machine" \
-  --arg lanes "$lanes" --arg pr_ready "$pr_ready" --arg lane_ids "$lane_ids" \
+  --arg lanes "$lanes" --arg scheduled "$scheduled_lanes" --arg reserve "$scheduled_reserve" --arg pr_ready "$pr_ready" --arg lane_ids "$lane_ids" \
   --arg target "$target" --arg cap_status "$cap_status" --arg projects "$project_names" \
   --arg level "$level" --arg why "$pub_why" --arg basis "$basis" --arg beat_age "$beat_age_s" \
   --arg avail "$avail_gb" --arg total "$total_gb" --arg runq "$runq_per_core" \
@@ -688,8 +706,10 @@ doc=$(jq -n \
   def num: if . == "" then null else tonumber + 0 end;
   def lines: split("\n") | map(select(. != ""));
   {schema: "fm-lane-capacity.v1", generated_epoch: $now, home: $home, machine: $machine,
-   lanes: {count: ($lanes | tonumber), pr_ready: ($pr_ready | tonumber), ids: ($lane_ids | lines)},
-   cap: {target: (if $cap_status == "ok" then ($target | tonumber) else null end), status: $cap_status},
+   lanes: {count: ($lanes | tonumber), pr_ready: ($pr_ready | tonumber), ids: ($lane_ids | lines),
+     scheduled: ($scheduled | tonumber)},
+   cap: {target: (if $cap_status == "ok" then ($target | tonumber) else null end), status: $cap_status,
+     scheduled_reserve: ($reserve | tonumber)},
    projects: ($projects | lines),
    pressure: {level: $level, why: ($why | lines), basis: $basis, beat_age_s: ($beat_age | num),
      avail_gb: ($avail | num), total_gb: ($total | num), runq_per_core: ($runq | num),

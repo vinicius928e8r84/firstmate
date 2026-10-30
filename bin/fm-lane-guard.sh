@@ -2,7 +2,9 @@
 # fm-lane-guard.sh - mechanical guards for the worker-creation lane and the pod job queue (daily speed audits
 # 2026-10-27 item 7 and 2026-10-28 item 2). Pure shell: no model call, never wakes an agent by itself.
 # Usage: fm-lane-guard.sh scan [slot|spawn|pod]      (default: all three; prints one line per NEW alert)
-#        fm-lane-guard.sh record-spawn-failure <task-id> <exit-code> [kind] [project] [backend] [harness]
+#        fm-lane-guard.sh record-spawn-failure <task-id> <exit-code> [kind] [project] [backend] [harness] [scheduled-loop]
+#        fm-lane-guard.sh alert <key> <message...>      raise one alert through the path below (bin/fm-scheduled-spawn.sh)
+#        fm-lane-guard.sh clear-alert <key>             a later success: log it and mark the registered ask done
 # Guards:
 #   slot   a `treehouse get` slot request that holds no slot yet - no child subshell - and is older than
 #          FM_SLOT_REQUEST_MAX_SEC (3600) is ended by its EXACT pid (SIGTERM then SIGCONT, since a request stopped on
@@ -11,7 +13,8 @@
 #          re-verified right before each signal, so a recycled pid is never hit. Never pkill, never a process group.
 #          Each kill is logged to state/.lane-guard.log and reported as an alert.
 #   spawn  bin/fm-spawn.sh records every failed creation (nonzero exit other than the capacity deferral) in
-#          state/spawn-failures/; the next scan - FM_LANE_GUARD_INTERVAL in the watcher, default 120 s, so well inside
+#          state/spawn-failures/, and a failed SCHEDULED-loop spawn (--scheduled-loop) even when its exit is the
+#          capacity deferral, since a refused scheduled run is a missed run rather than a queue wait; the next scan - FM_LANE_GUARD_INTERVAL in the watcher, default 120 s, so well inside
 #          10 minutes - alerts once per failure unless a later spawn of the same task has since published its record.
 #   pod    opt-in (config/pod-watch present). A job marker in the pod job queue (FM_POD_QUEUE_DIR, default
 #          state/.heavy-queue/<job>.queued, written by data/tools/fm-pod-auto.sh) older than FM_POD_WATCH_QUEUE_SEC
@@ -117,28 +120,30 @@ scan_slot() {
 }
 
 # ------------------------------------------------------------------ failed creations
-record_spawn_failure() { # <id> <rc> [kind project backend harness]
-  local id=$1 rc=$2 kind=${3:-} project=${4:-} backend=${5:-} harness=${6:-} f
+record_spawn_failure() { # <id> <rc> [kind project backend harness scheduled-loop]
+  local id=$1 rc=$2 kind=${3:-} project=${4:-} backend=${5:-} harness=${6:-} scheduled=${7:-} f
   [[ $id =~ ^[A-Za-z0-9._-]+$ ]] && [[ $rc =~ ^[0-9]+$ ]] || return 1
+  [ -z "$scheduled" ] || [[ $scheduled =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   mkdir -p "$FAILDIR" || return 1
   f="$FAILDIR/$id.$(now).$$.fail"
-  printf 'id=%s\nrc=%s\nat=%s\nkind=%s\nproject=%s\nbackend=%s\nharness=%s\n' \
-    "$id" "$rc" "$(now)" "$kind" "$project" "$backend" "$harness" > "$f.tmp" && mv "$f.tmp" "$f"
+  printf 'id=%s\nrc=%s\nat=%s\nkind=%s\nproject=%s\nbackend=%s\nharness=%s\nscheduled=%s\n' \
+    "$id" "$rc" "$(now)" "$kind" "$project" "$backend" "$harness" "$scheduled" > "$f.tmp" && mv "$f.tmp" "$f"
 }
 fget() { sed -n "s/^$2=//p" "$1" | head -1; }
 scan_spawn() {
-  local f id rc at kind project backend harness meta
+  local f id rc at kind project backend harness scheduled meta
   [ -d "$FAILDIR" ] || return 0
   for f in "$FAILDIR"/*.fail; do
     [ -e "$f" ] || continue
     id=$(fget "$f" id); rc=$(fget "$f" rc); at=$(fget "$f" at)
     kind=$(fget "$f" kind); project=$(fget "$f" project); backend=$(fget "$f" backend); harness=$(fget "$f" harness)
+    scheduled=$(fget "$f" scheduled)
     meta=$S/$id.meta
     if [ -e "$meta" ] && [ "$(stat -c %Y "$meta")" -ge "${at:-0}" ]; then   # a later spawn of this task succeeded
       mv "$f" "$f.warned"; continue
     fi
     mv "$f" "$f.warned"
-    alert "spawn-$id-$at" 1 "worker creation failed: task $id exited $rc at $(date -u -d "@${at:-0}" +%FT%TZ) (kind=${kind:-?} project=${project:-?} backend=${backend:-?} harness=${harness:-?}); rerun bin/fm-spawn.sh for the error text"
+    alert "spawn-$id-$at" 1 "${scheduled:+scheduled loop $scheduled: }worker creation failed: task $id exited $rc at $(date -u -d "@${at:-0}" +%FT%TZ) (kind=${kind:-?} project=${project:-?} backend=${backend:-?} harness=${harness:-?}); rerun bin/fm-spawn.sh for the error text"
   done
   find "$FAILDIR" -name '*.warned' -mtime +7 -delete 2>/dev/null
 }
@@ -204,8 +209,22 @@ scan_pod() {
   fi
 }
 
+clear_alert() { # <key>
+  local key=$1
+  log "CLEARED $key"
+  notify lane-guard-clear "cleared: $key"
+  [ -x "$ASKS" ] && FM_HOME=$F "$ASKS" "done" "lane-guard-$key" >/dev/null 2>&1
+  return 0
+}
+
 case "${1:-}" in
-  record-spawn-failure) shift; [ $# -ge 2 ] || { echo "usage: fm-lane-guard.sh record-spawn-failure <task-id> <exit-code> [kind project backend harness]" >&2; exit 64; }
+  alert) shift; [ $# -ge 2 ] && [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || { echo "usage: fm-lane-guard.sh alert <key> <message...>" >&2; exit 64; }
+    USAGE_KIND=alert; key=$1; shift
+    alert "$key" 1 "$*"; USAGE_OUTCOME=alerts-1; exit 1 ;;
+  clear-alert) shift; [ $# -eq 1 ] && [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || { echo "usage: fm-lane-guard.sh clear-alert <key>" >&2; exit 64; }
+    USAGE_KIND=clear-alert; USAGE_OUTCOME=cleared
+    clear_alert "$1"; exit 0 ;;
+  record-spawn-failure) shift; [ $# -ge 2 ] || { echo "usage: fm-lane-guard.sh record-spawn-failure <task-id> <exit-code> [kind project backend harness scheduled-loop]" >&2; exit 64; }
     USAGE_KIND=record-spawn-failure; USAGE_OUTCOME=recorded
     record_spawn_failure "$@"; exit $? ;;
   scan)
@@ -218,5 +237,5 @@ case "${1:-}" in
     esac
     USAGE_OUTCOME=alerts-$ALERT_N
     [ "$ALERTED" = 0 ] ;;
-  *) echo "usage: fm-lane-guard.sh scan [slot|spawn|pod] | record-spawn-failure <task-id> <exit-code> [kind project backend harness]" >&2; exit 64 ;;
+  *) echo "usage: fm-lane-guard.sh scan [slot|spawn|pod] | record-spawn-failure <task-id> <exit-code> [kind project backend harness scheduled-loop] | alert <key> <message...> | clear-alert <key>" >&2; exit 64 ;;
 esac

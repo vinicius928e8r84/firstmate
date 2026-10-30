@@ -441,7 +441,7 @@ family_for_basename() {
     fm-procevent-quota.test.sh|fm-procevent-when.test.sh|fm-procevent.test.sh|\
     fm-live-gate.test.sh|\
     fm-pr-merge-main.test.sh|fm-review-delta.test.sh|fm-review-rules.test.sh|\
-    fm-project-origin.test.sh|fm-public-followup.test.sh|fm-quota-choose.test.sh|\
+    fm-project-origin.test.sh|fm-public-followup.test.sh|fm-quota-choose.test.sh|fm-scheduled-spawn.test.sh|\
     fm-remote-entrypoint.test.sh|fm-remote-secondmate-parent-binding.test.sh|\
     fm-send-remote-delivery.test.sh|fm-spawn-pool-base-freshen.test.sh|\
     fm-test-fixture-cleanup.test.sh|fm-test-fixtures.test.sh|\
@@ -1576,6 +1576,9 @@ families_for_changed_path() {
       ;;
     bin/fm-capacity.sh)
       printf '%s\n' "__script__:fm-capacity.test.sh"
+      ;;
+    bin/fm-scheduled-spawn.sh)
+      printf '%s\n' "__script__:fm-scheduled-spawn.test.sh"
       ;;
     bin/fm-overflow.sh)
       printf '%s\n' "__script__:fm-overflow.test.sh"

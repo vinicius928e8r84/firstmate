@@ -743,6 +743,7 @@ reserve-flag /var/run/fm-reserved.flag host reserved by the captain   # repeatab
 captain-idle 300       # opt-in, macOS: the captain counts as present when input was idle under 300 s
 quota-provider claude  # opt-in: publish that provider's quota runway
 max-load1 20           # keep a raw 1-minute load rule while beats replace it
+scheduled-reserve 4    # lanes reserved for scheduled loops, outside the cap (default 4)
 ```
 
 `pressure-file` and `reserve-flag` may repeat and take an absolute or `~/` path; a `reserve-flag` path may be followed by the label it is reported by.
@@ -757,8 +758,16 @@ While the file exists, the watcher runs `bin/fm-capacity.sh --publish` detached 
 Publishing is best-effort and never changes what the watcher does.
 `bin/fm-capacity.sh --admit` is an advisory check of the same verdict: it exits 0 when the verdict admits or the file is absent, and reports the reasons on stderr with exit 75 when it does not.
 No Firstmate script calls it.
-The cap itself is a real ceiling: while the file exists, `bin/fm-spawn.sh` defers a fresh ship or scout with one `deferred:` line and exit 75 once `bin/fm-capacity.sh` counts as many lanes as the cap, before creating anything, so its backlog item stays queued.
-There is no override flag: clean up a lane or raise the number.
+The cap itself is a real ceiling: while the file exists, `bin/fm-spawn.sh` defers a fresh ship or scout with one `deferred:` line and exit 75 once `bin/fm-capacity.sh` counts as many ordinary lanes as the cap, before creating anything, so its backlog item stays queued.
+An ordinary worker has no override flag: clean up a lane or raise the number.
+
+The captain's recurring scheduled loops (the daily audit, the weekly retro, correct, architecture and benchmark runs, the monthly run, the end-of-day cleanup) draw on a separate reserved pool so a full cap never blocks them.
+`bin/fm-spawn.sh --scheduled-loop <name>` on a fresh ship or scout spawn records `scheduled=<name>` in the task record; such a lane is admitted while fewer than `scheduled-reserve` (default 4, a positive integer) scheduled lanes run, and is deferred with the same exit 75 once the reserve is full, so a runaway loop cannot flood the host.
+Scheduled lanes still show in `lanes=` but never count against the cap, so an ordinary spawn is judged on the lanes that are not scheduled and behaves exactly as it did without the pool; the memory floor (exit 76) applies to scheduled spawns unchanged.
+`bin/fm-capacity.sh` reports the pool as `scheduled=<N>/<reserve>` on its first line and as `lanes.scheduled` and `cap.scheduled_reserve` in its document.
+`bin/fm-scheduled-spawn.sh` is how a scheduled wrapper starts one: it retries a refused or failed spawn with a doubling pause, then alerts through the lane guard's outbox, webhook and captain asks and writes `state/scheduled-loops/<loop>.last`, and a later success clears the alert.
+A wrapper that declines only because of host load exits 79 and prints `scheduled-load-refused load1=<X> max=<Y>`; the helper keeps that run pending instead of losing it, the hourly `fm-scheduled-spawn.sh tick` runs it again once the load is under `<Y>`, and it alerts once if the run is still pending at the end of its UTC day.
+The helper's header owns the exit codes, the line contract, the retry bounds and their environment overrides, and the record formats; `bin/fm-lane-guard.sh` also records a failed scheduled spawn even when its status is the 75 deferral.
 Work that is CPU-heavy and needs none of this home's data can instead go to a remote secondmate with room: `bin/fm-overflow.sh pick` reads each candidate's published `state/lane-capacity.json` (creative-aux and pc-aux2 by default, so those homes need their own `config/lane-capacity`), skips any host without a free lane, with load per core at or over 3, under critical pressure, reserved, or with stale facts, and prints the pick with its reason or `none free`; `bin/fm-overflow.sh send <text...>` hands the text to the pick as a marked routed request through `bin/fm-send.sh` ([remote second mates](remote-secondmates.md)).
 The script's header owns the report line, the published document's fields, the verdict, the beat freshness rules, the host-constraint thresholds, and the probe fallbacks.
 

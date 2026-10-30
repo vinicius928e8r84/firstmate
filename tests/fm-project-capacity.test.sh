@@ -691,6 +691,152 @@ SH
   pass "an Orca spawn takes the shared project lock whenever a same-origin clone is capped and defers before creating anything"
 }
 
+# The reserved pool for scheduled loops (bin/fm-spawn.sh --scheduled-loop,
+# bin/fm-capacity.sh's scheduled=<N>/<reserve>): scheduled lanes never take an
+# ordinary slot, a scheduled spawn is admitted at the ordinary cap, and the
+# reserve is a hard bound.
+spawn_scheduled() {  # <case-dir> <id> <pane-path|-> [extra spawn args...]
+  local case_dir=$1 id=$2 pane=$3
+  shift 3
+  [ "$pane" != - ] || pane=$(new_worktree "$case_dir" "$id")
+  run_spawn "$case_dir" "$case_dir/home" "$pane" "$id" "$case_dir/project" \
+    --mode no-mistakes --yolo off --scheduled-loop daily-audit "$@"
+}
+
+test_ordinary_spawn_still_defers_at_the_cap_with_scheduled_lanes() {
+  local case_dir home out rc=0 before worktrees
+  case_dir=$(make_case sched-ordinary-defers task-c)
+  home="$case_dir/home"
+  printf '%s\n' 2 > "$home/config/lane-capacity"
+  write_live "$home" live-a "$case_dir/project"
+  write_live "$home" live-b "$case_dir/other-project"
+  write_live "$home" sched-a "$case_dir/project" "scheduled=weekly-retro"
+  before=$(call_count "$case_dir")
+  worktrees=$(worktree_list "$case_dir")
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "an ordinary spawn at the cap was admitted because scheduled lanes exist: $out"
+  assert_contains "$out" "deferred: this machine already runs 2 lanes against a cap of 2" \
+    "the ordinary deferral did not count the 2 ordinary lanes only"
+  assert_nothing_created "$case_dir" "$home" task-c "$before" "$worktrees"
+  pass "an ordinary spawn still defers at the unchanged cap while scheduled lanes are running"
+}
+
+test_scheduled_lanes_do_not_consume_ordinary_slots() {
+  local case_dir home out rc=0
+  case_dir=$(make_case sched-not-counted task-c)
+  home="$case_dir/home"
+  printf '%s\n' 2 > "$home/config/lane-capacity"
+  write_live "$home" live-a "$case_dir/project"
+  write_live "$home" sched-a "$case_dir/project" "scheduled=weekly-retro"
+  write_live "$home" sched-b "$case_dir/other-project" "scheduled=weekly-correct"
+  out=$(spawn_ship "$case_dir" task-c) || rc=$?
+  expect_code 0 "$rc" "scheduled lanes took an ordinary slot: $out"
+  assert_contains "$out" "spawned task-c" "an ordinary spawn with a free ordinary slot did not launch"
+  pass "scheduled lanes never count against the ordinary cap"
+}
+
+test_scheduled_spawn_is_admitted_at_the_cap() {
+  local case_dir home out rc=0
+  case_dir=$(make_case sched-admitted task-s)
+  home="$case_dir/home"
+  printf '%s\n' 2 > "$home/config/lane-capacity"
+  write_live "$home" live-a "$case_dir/project"
+  write_live "$home" live-b "$case_dir/other-project"
+  out=$(spawn_scheduled "$case_dir" task-s -) || rc=$?
+  expect_code 0 "$rc" "a scheduled spawn was refused at the ordinary cap: $out"
+  assert_contains "$out" "spawned task-s" "a scheduled spawn at the cap did not launch"
+  assert_grep "scheduled=daily-audit" "$home/state/task-s.meta" "the lane record did not carry the scheduled marker"
+  [ "$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-capacity.sh" --json | jq -r '.lanes.scheduled')" = 1 ] ||
+    fail "the capacity document did not count the scheduled lane"
+  pass "a scheduled spawn is admitted from the reserve at the ordinary cap and is marked in its record"
+}
+
+test_scheduled_spawn_is_refused_when_the_reserve_is_full() {
+  local case_dir home out rc=0 before worktrees
+  case_dir=$(make_case sched-reserve-full task-s)
+  home="$case_dir/home"
+  printf '%s\n' 14 "scheduled-reserve 2" > "$home/config/lane-capacity"
+  write_live "$home" sched-a "$case_dir/project" "scheduled=weekly-retro"
+  write_live "$home" sched-b "$case_dir/other-project" "scheduled=weekly-correct"
+  before=$(call_count "$case_dir")
+  worktrees=$(worktree_list "$case_dir")
+  out=$(spawn_scheduled "$case_dir" task-s "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "a scheduled spawn exceeded the reserve: $out"
+  assert_contains "$out" "deferred: this machine already runs 2 scheduled lanes against a reserve of 2" \
+    "the deferral did not name the reserve"
+  assert_nothing_created "$case_dir" "$home" task-s "$before" "$worktrees"
+
+  printf '%s\n' 14 > "$home/config/lane-capacity"
+  rc=0
+  out=$(spawn_scheduled "$case_dir" task-s -) || rc=$?
+  expect_code 0 "$rc" "a scheduled spawn under the default reserve of 4 was refused: $out"
+  pass "the scheduled reserve is a hard bound, 4 by default, and a refusal leaves nothing behind"
+}
+
+test_scheduled_spawn_keeps_the_memory_floor() {
+  local case_dir home out rc=0
+  case_dir=$(make_case sched-memory task-s)
+  home="$case_dir/home"
+  printf '%s\n' 2 > "$home/config/lane-capacity"
+  out=$(FM_SPAWN_MIN_FREE_MB=999999999 spawn_scheduled "$case_dir" task-s "$case_dir/unused") || rc=$?
+  expect_code 76 "$rc" "a scheduled spawn bypassed the memory floor: $out"
+  assert_contains "$out" "spawn refused: only" "the memory floor refusal was not reported"
+  assert_absent "$home/state/task-s.meta" "a memory-refused scheduled spawn published a record"
+  pass "a scheduled spawn still refuses under the memory floor"
+}
+
+test_invalid_scheduled_reserve_refuses_and_absent_defaults() {
+  local case_dir home out rc=0
+  case_dir=$(make_case sched-reserve-bad task-s)
+  home="$case_dir/home"
+  printf '%s\n' 14 "scheduled-reserve many" > "$home/config/lane-capacity"
+  out=$(spawn_scheduled "$case_dir" task-s "$case_dir/unused") || rc=$?
+  expect_code 1 "$rc" "an invalid scheduled-reserve did not refuse the spawn: $out"
+  assert_contains "$out" "the lane cap" "the refusal did not name the lane cap"
+  printf '%s\n' 14 "scheduled-reserve 0" > "$home/config/lane-capacity"
+  rc=0
+  out=$(spawn_scheduled "$case_dir" task-s "$case_dir/unused") || rc=$?
+  expect_code 1 "$rc" "a zero scheduled-reserve was accepted: $out"
+  printf '%s\n' 14 > "$home/config/lane-capacity"
+  [ "$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-capacity.sh" | head -1 | sed 's/.* scheduled=//')" = 0/4 ] ||
+    fail "an absent scheduled-reserve did not default to 4"
+  pass "an invalid scheduled-reserve refuses the spawn and an absent one defaults to 4"
+}
+
+test_scheduled_flag_is_limited_to_fresh_lanes() {
+  local case_dir home out rc=0
+  case_dir=$(make_case sched-flag task-s)
+  home="$case_dir/home"
+  out=$(spawn_scheduled "$case_dir" task-s "$case_dir/unused" --scheduled-loop 'bad name') || rc=$?
+  expect_code 1 "$rc" "an invalid loop name was accepted: $out"
+  rc=0
+  out=$(run_spawn "$case_dir" "$home" "$case_dir/unused" task-s "$case_dir/project" --relaunch --scheduled-loop daily-audit) || rc=$?
+  expect_code 1 "$rc" "a relaunch accepted --scheduled-loop: $out"
+  assert_contains "$out" "--scheduled-loop marks a fresh spawn only" "the relaunch refusal was not explained"
+  pass "--scheduled-loop needs a valid name and marks only a fresh ship or scout spawn"
+}
+
+test_failed_scheduled_spawn_is_recorded_even_when_deferred() {
+  local case_dir home out rc=0 records
+  case_dir=$(make_case sched-record task-c task-s)
+  home="$case_dir/home"
+  printf '%s\n' 14 "scheduled-reserve 1" > "$home/config/lane-capacity"
+  write_live "$home" sched-a "$case_dir/project" "scheduled=weekly-retro"
+  out=$(spawn_scheduled "$case_dir" task-s "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "the full reserve did not defer: $out"
+  records=("$home"/state/spawn-failures/task-s.*.fail)
+  [ -e "${records[0]}" ] || fail "a deferred scheduled spawn recorded no failure"
+  assert_grep "scheduled=daily-audit" "${records[0]}" "the failure record did not name the loop"
+  printf '%s\n' 1 > "$home/config/lane-capacity"
+  write_live "$home" live-a "$case_dir/project"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "the ordinary spawn was not deferred: $out"
+  records=("$home"/state/spawn-failures/task-c.*.fail)
+  [ ! -e "${records[0]}" ] || fail "an ordinary capacity deferral was recorded as a failure"
+  pass "a deferred scheduled spawn is recorded for the lane guard and an ordinary deferral is not"
+}
+
 test_undeclared_capacity_keeps_dispatch_uncapped
 test_available_capacity_admits_the_worker
 test_exhausted_capacity_defers_without_leaving_anything_behind
@@ -709,3 +855,11 @@ test_batch_reports_a_deferred_pair
 test_orca_spawn_is_admitted_under_the_shared_project_lock
 test_lane_cap_defers_a_fresh_spawn_at_the_ceiling
 test_unreadable_lane_cap_refuses_every_spawn
+test_ordinary_spawn_still_defers_at_the_cap_with_scheduled_lanes
+test_scheduled_lanes_do_not_consume_ordinary_slots
+test_scheduled_spawn_is_admitted_at_the_cap
+test_scheduled_spawn_is_refused_when_the_reserve_is_full
+test_scheduled_spawn_keeps_the_memory_floor
+test_invalid_scheduled_reserve_refuses_and_absent_defaults
+test_scheduled_flag_is_limited_to_fresh_lanes
+test_failed_scheduled_spawn_is_recorded_even_when_deferred

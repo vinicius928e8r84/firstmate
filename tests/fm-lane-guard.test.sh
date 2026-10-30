@@ -58,6 +58,22 @@ grep -q '^add --key lane-guard-spawn-gone' "$T/asks.calls"; check spawn-ask $? 0
 "$LG" scan spawn >/dev/null; check spawn-recovered-quiet "$?" 0
 "$LG" record-spawn-failure '../bad' 1 >/dev/null 2>&1; check spawn-bad-id "$?" 1
 
+# ---- scheduled loops: a refused (75) scheduled spawn is a missed run and is warned about; the helper's alert and clear
+rm -f "$T/state/.lane-guard-alerts" "$T/asks.calls" "$T/state/spawn-failures"/*
+"$LG" record-spawn-failure sched1 75 ship proj herdr pi daily-audit
+out=$("$LG" scan spawn); rc=$?
+check scheduled-deferral-warns "$rc" 1
+printf '%s' "$out" | grep -q 'scheduled loop daily-audit: worker creation failed: task sched1 exited 75'; check scheduled-deferral-text $? 0
+"$LG" record-spawn-failure bad1 1 ship proj herdr pi 'bad loop'; check scheduled-bad-loop-refused "$?" 1
+out=$("$LG" alert scheduled-daily-audit 'scheduled loop daily-audit did not start'); rc=$?
+check helper-alert-exit "$rc" 1
+printf '%s' "$out" | grep -q 'did not start'; check helper-alert-text $? 0
+grep -q '^add --key lane-guard-scheduled-daily-audit' "$T/asks.calls"; check helper-alert-ask $? 0
+"$LG" clear-alert scheduled-daily-audit; check helper-clear-exit "$?" 0
+grep -q '^done lane-guard-scheduled-daily-audit' "$T/asks.calls"; check helper-clear-ask-done $? 0
+grep -q 'CLEARED scheduled-daily-audit' "$T/state/.lane-guard.log"; check helper-clear-logged $? 0
+rm -f "$T/state/.lane-guard-alerts" "$T/asks.calls"
+
 # ---- pod job queue against a local fake RunPod
 cat > "$T/api.py" <<'PY'
 import json, os, sys

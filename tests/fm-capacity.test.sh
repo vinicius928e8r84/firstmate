@@ -70,7 +70,7 @@ test_no_target_prints_counts_only() {
   out=$(run_capacity "$home" "$fakebin"); rc=$?
   expect_code 0 "$rc" "absent target"
   assert_contains "$(printf '%s\n' "$out" | head -1)" \
-    'capacity: free_lanes=unknown reason=no-target lanes=3 target=none secondmates=1 load1=0.50 cores=8 mem_free_pct=60 disk_free_mb=20480' \
+    'capacity: free_lanes=unknown reason=no-target lanes=3 target=none secondmates=1 load1=0.50 cores=8 mem_free_pct=60 disk_free_mb=20480 scheduled=0/4' \
     "absent target must report counts without inventing one"
   pass "absent config/lane-capacity reports counts and no target"
 }
@@ -159,13 +159,44 @@ test_invalid_target_is_reported() {
   pass "a malformed target is reported, not guessed"
 }
 
+# The reserved pool for scheduled loops: lanes whose record carries scheduled=
+# stay in lanes= but never consume an ordinary slot, and the reserve defaults to 4.
+test_scheduled_lanes_form_a_reserved_pool() {
+  local home fakebin out doc rc
+  home=$(make_home scheduled 3 0)
+  fakebin=$(make_probes "$TMP_ROOT/p-scheduled" 0.50 60 8 20971520)
+  printf '%s\n' 3 > "$home/config/lane-capacity"
+  out=$(run_capacity "$home" "$fakebin")
+  assert_contains "$out" 'capacity: free_lanes=0 reason=full lanes=3 target=3 ' "ordinary lanes at the cap must read full"
+  assert_contains "$out" ' scheduled=0/4' "an absent reserve must default to 4"
+  printf '%s\n' "scheduled=weekly-retro" >> "$home/state/ship-0.meta"
+  printf '%s\n' "scheduled=daily-audit" >> "$home/state/ship-1.meta"
+  out=$(run_capacity "$home" "$fakebin")
+  assert_contains "$out" 'capacity: free_lanes=2 reason=ok lanes=3 target=3 ' "scheduled lanes must not consume ordinary slots"
+  assert_contains "$out" ' scheduled=2/4' "the scheduled count must be reported against the reserve"
+  assert_contains "$out" 'Scheduled loops: 2 of a 4-lane reserve' "the summary must name the reserve"
+  printf '3\nscheduled-reserve 6\n' > "$home/config/lane-capacity"
+  doc=$(capacity_doc "$home" "$fakebin")
+  assert_equals '3|2|3|6|2' \
+    "$(printf '%s\n' "$doc" | jq -r '[.lanes.count,.lanes.scheduled,.cap.target,.cap.scheduled_reserve,.verdict.free_lanes] | map(tostring) | join("|")')" \
+    "the document must keep its fields and add the scheduled pool"
+  printf '3\nscheduled-reserve nope\n' > "$home/config/lane-capacity"
+  out=$(run_capacity "$home" "$fakebin"); rc=$?
+  expect_code 1 "$rc" "an invalid reserve must be reported"
+  assert_contains "$out" 'line 2: scheduled-reserve needs a positive number of lanes' "the invalid reserve must name its line"
+  printf '3\nscheduled-reserve 0\n' > "$home/config/lane-capacity"
+  out=$(run_capacity "$home" "$fakebin"); rc=$?
+  expect_code 1 "$rc" "a zero reserve must be refused"
+  pass "scheduled lanes are a reserved pool outside the ordinary cap, with a documented default and refused bad values"
+}
+
 test_real_host_smoke() {
   local home out rc
   home=$(make_home real 0 0)
   out=$(FM_HOME="$home" "$CAPACITY" 2>&1); rc=$?
   expect_code 0 "$rc" "real host"
   case "$(printf '%s\n' "$out" | head -1)" in
-    'capacity: free_lanes=unknown reason=no-target lanes=0 target=none secondmates=0 load1='*' cores='*' mem_free_pct='*' disk_free_mb='*) : ;;
+    'capacity: free_lanes=unknown reason=no-target lanes=0 target=none secondmates=0 load1='*' cores='*' mem_free_pct='*' disk_free_mb='*' scheduled=0/4') : ;;
     *) fail "real host line malformed: $out" ;;
   esac
   pass "real host probes produce a well-formed report"
@@ -241,7 +272,7 @@ CFG
 }
 
 test_fresh_beat_replaces_probes() {
-  local home fakebin out doc
+  local home fakebin out doc rc
   home=$(make_home beat 1 0)
   # Probes say constrained on load; a fresh ok beat replaces them.
   fakebin=$(make_probes "$TMP_ROOT/p-beat" 9.00 60 8 20971520)
@@ -320,7 +351,7 @@ test_several_pressure_files() {
 }
 
 test_beat_with_missing_fields() {
-  local home fakebin out doc
+  local home fakebin out doc rc
   home=$(make_home sparse 1 0)
   fakebin=$(make_probes "$TMP_ROOT/p-sparse" 24.00 60 32 20971520)
   cat > "$home/beat.json" <<'JSON'
@@ -530,6 +561,7 @@ test_target_yields_open_lanes_and_full
 test_host_constraints_close_lanes
 test_unavailable_probes_degrade
 test_invalid_target_is_reported
+test_scheduled_lanes_form_a_reserved_pool
 test_config_keys_parse_and_refuse_guessing
 test_fresh_beat_replaces_probes
 test_late_stale_missing_and_malformed_beats
