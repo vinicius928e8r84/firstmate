@@ -3,6 +3,11 @@
 #   1. an unconfirmed secondmate steer is replayed through the printed
 #      correlation-reusing command at 1, 4 and 15 minutes, ends on delivery, and
 #      leaves one card after the last try;
+#   2. a stopped worker (agent gone, or its session ends in an API error) is
+#      relaunched through fm-control after the stop has lasted 10 minutes, up to
+#      four times at 2, 4, 8 and 16 minutes, then one card; busy, done, paused,
+#      decision-holding and secondmate lanes are never touched; a quiet half
+#      hour starts the count over;
 # Every acting command is a stub that records its arguments; nothing touches a
 # real lane, pane or remote.
 set -u
@@ -119,5 +124,117 @@ test_resend_ends_on_delivery_and_passes_the_state_override() {
   pass "a delivered steer ends the loop and a state override is honored"
 }
 
+# --- relaunch -----------------------------------------------------------------
+
+lane() {  # <home> <id> <kind> <status-line>
+  local h=$1 id=$2 kind=$3
+  fm_write_meta "$h/state/$id.meta" "window=firstmate:fm-$id" "endpoint_task_id=$id" "worktree=$h/wt-$id" \
+    "project=$h/proj" "harness=claude" "kind=$kind" "mode=local-only" "yolo=off"
+  mkdir -p "$h/wt-$id"
+  printf '%s\n' "$4" > "$h/state/$id.status"
+}
+
+DEAD="state: unknown · source: none · backend target gone: firstmate:fm-x (agent gone, pane shell remains)"
+
+test_stopped_worker_is_relaunched_four_times_then_one_card() {
+  local h
+  h=$(make_home relaunch)
+  lane "$h" w1 ship "working [at=$T0]: reading the sources"
+  echo "$DEAD" > "$h/stubs/crew.w1"
+  resil "$h" "$T0" relaunch >/dev/null
+  assert_present "$h/state/resil/stopped/w1" "a worker with no agent was not noticed"
+  resil "$h" $((T0 + 719)) relaunch >/dev/null
+  [ ! -e "$h/stubs/control.calls" ] || fail "a worker was relaunched before it was stopped for twelve minutes"
+  resil "$h" $((T0 + 721)) relaunch >/dev/null
+  assert_equals 1 "$(calls "$h/stubs/control.calls" 'w1 relaunch --note')" "the first relaunch did not use the normal control path"
+  assert_contains "$(cat "$h/stubs/control.calls")" "Automatic relaunch 1 of 4" "the relaunch note does not say why"
+  resil "$h" $((T0 + 721 + 239)) relaunch >/dev/null
+  assert_equals 1 "$(calls "$h/stubs/control.calls" w1)" "the second relaunch came before four minutes"
+  resil "$h" $((T0 + 721 + 241)) relaunch >/dev/null
+  resil "$h" $((T0 + 721 + 241 + 481)) relaunch >/dev/null
+  resil "$h" $((T0 + 721 + 241 + 481 + 961)) relaunch >/dev/null
+  assert_equals 4 "$(calls "$h/stubs/control.calls" w1)" "four relaunches were expected"
+  resil "$h" $((T0 + 721 + 241 + 481 + 961 + 500)) relaunch >/dev/null
+  assert_equals 4 "$(calls "$h/stubs/control.calls" w1)" "a fifth relaunch ran"
+  assert_absent "$h/state/resil/cards/stopped-w1.card" "the card came before the last wait passed"
+  resil "$h" $((T0 + 721 + 241 + 481 + 961 + 961)) relaunch >/dev/null
+  assert_equals 4 "$(calls "$h/stubs/control.calls" w1)" "a fifth relaunch ran at the card"
+  assert_present "$h/state/resil/cards/stopped-w1.card" "no card after four relaunches"
+  assert_contains "$(cat "$h/state/.resil.log")" "task=w1 cause=stopped-agent-gone action=relaunch-1 outcome=ok" "the relaunch was not logged"
+  assert_absent "$h/state/w1.status.bak" "unexpected file"
+  pass "a stopped worker is relaunched at 2, 4, 8 and 16 minutes, then one card"
+}
+
+test_refused_relaunch_counts_and_is_logged() {
+  local h
+  h=$(make_home relaunch-refused)
+  lane "$h" w2 scout "working [at=$T0]: x"
+  echo "$DEAD" > "$h/stubs/crew.w2"
+  echo 1 > "$h/stubs/control.rc"
+  resil "$h" "$T0" relaunch >/dev/null
+  resil "$h" $((T0 + 721)) relaunch >/dev/null
+  assert_contains "$(cat "$h/state/.resil.log")" "action=relaunch-1 outcome=rc=1" "a refused relaunch was not logged with its status"
+  assert_equals 1 "$(sed -n 's/^attempts=//p' "$h/state/resil/stopped/w2")" "a refused relaunch was not counted"
+  pass "a refused relaunch is counted and logged, never repeated blindly"
+}
+
+test_api_error_stop_counts_from_the_error() {
+  local h
+  h=$(make_home relaunch-api)
+  lane "$h" w3 ship "working [at=$T0]: x"
+  echo "state: working · source: status-log · working" > "$h/stubs/crew.w3"
+  echo $((T0 - 900)) > "$h/stubs/apierr.wt-w3"
+  resil "$h" "$T0" relaunch >/dev/null
+  assert_equals 1 "$(calls "$h/stubs/control.calls" 'w3 relaunch')" "a worker whose session ended in an API error 15 minutes ago was not relaunched"
+  assert_contains "$(cat "$h/state/.resil.log")" "cause=stopped-api-error" "the cause was not logged"
+  pass "an API-error stop counts from the error, not from the first look"
+}
+
+test_lanes_that_must_not_be_relaunched() {
+  local h id
+  h=$(make_home relaunch-skip)
+  lane "$h" busy ship "working [at=$T0]: x"; echo "state: working · source: pane · harness busy (spinner)" > "$h/stubs/crew.busy"
+  lane "$h" piped ship "working [at=$T0]: x"; echo "state: working · source: run-step · pipeline running" > "$h/stubs/crew.piped"
+  lane "$h" fin ship "done [at=$T0]: ready"; echo "$DEAD" > "$h/stubs/crew.fin"
+  lane "$h" par ship "paused [at=$T0]: waiting for ci"; echo "$DEAD" > "$h/stubs/crew.par"
+  lane "$h" ask ship "needs-decision [at=$T0]: pick"; echo "$DEAD" > "$h/stubs/crew.ask"
+  lane "$h" blk ship "blocked [at=$T0]: stuck"; echo "$DEAD" > "$h/stubs/crew.blk"
+  lane "$h" sm secondmate "working [at=$T0]: idle"; echo "$DEAD" > "$h/stubs/crew.sm"
+  lane "$h" idle ship "working [at=$T0]: thinking"; echo "state: working · source: status-log · working" > "$h/stubs/crew.idle"
+  resil "$h" "$T0" relaunch >/dev/null
+  resil "$h" $((T0 + 100000)) relaunch >/dev/null
+  [ ! -e "$h/stubs/control.calls" ] || fail "a lane that must be left alone was relaunched: $(cat "$h/stubs/control.calls")"
+  for id in busy piped fin par ask blk sm idle; do
+    assert_absent "$h/state/resil/stopped/$id" "$id was treated as stopped"
+  done
+  lane "$h" held ship "working [at=$T0]: x"; echo "$DEAD" > "$h/stubs/crew.held"
+  printf 'reason=test\n' > "$h/state/HOLD"
+  resil "$h" "$T0" relaunch >/dev/null
+  resil "$h" $((T0 + 100000)) relaunch >/dev/null
+  [ ! -e "$h/stubs/control.calls" ] || fail "a worker was relaunched while state/HOLD was in force"
+  pass "busy, pipeline-owned, finished, waiting, decision-holding, secondmate, merely idle lanes and a HOLD are left alone"
+}
+
+test_a_quiet_half_hour_starts_over() {
+  local h
+  h=$(make_home relaunch-recover)
+  lane "$h" w4 ship "working [at=$T0]: x"
+  echo "$DEAD" > "$h/stubs/crew.w4"
+  resil "$h" "$T0" relaunch >/dev/null
+  resil "$h" $((T0 + 721)) relaunch >/dev/null
+  echo "state: working · source: pane · harness busy (spinner)" > "$h/stubs/crew.w4"
+  resil "$h" $((T0 + 800)) relaunch >/dev/null
+  assert_present "$h/state/resil/stopped/w4" "the record vanished at the first healthy look"
+  resil "$h" $((T0 + 800 + 1801)) relaunch >/dev/null
+  assert_absent "$h/state/resil/stopped/w4" "a worker working again for half an hour kept its relaunch count"
+  assert_contains "$(cat "$h/state/.resil.log")" "action=recovered" "the recovery was not logged"
+  pass "a worker seen working for half an hour starts its count over"
+}
+
 test_resend_replays_the_printed_command_on_schedule
 test_resend_ends_on_delivery_and_passes_the_state_override
+test_stopped_worker_is_relaunched_four_times_then_one_card
+test_refused_relaunch_counts_and_is_logged
+test_api_error_stop_counts_from_the_error
+test_lanes_that_must_not_be_relaunched
+test_a_quiet_half_hour_starts_over
