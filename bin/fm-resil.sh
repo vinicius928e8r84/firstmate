@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# fm-resil.sh - the resilience loops that need a clock: replay of an unconfirmed secondmate steer and automatic
-# relaunch of a stopped worker. The watcher runs `tick` detached; every
+# fm-resil.sh - the resilience loops that need a clock: replay of an unconfirmed secondmate steer, automatic
+# relaunch of a stopped worker, and the hourly close of finished lanes. The watcher runs `tick` detached; every
 # action is one line in state/.resil.log (when, task, cause, action, outcome), so the effect is a grep away.
 #
 # Usage: fm-resil.sh resend            replay unconfirmed secondmate steers
 #        fm-resil.sh relaunch          relaunch workers that stopped
-#        fm-resil.sh tick              both, each on its own interval, under one lock
+#        fm-resil.sh close             close finished lanes (bin/fm-close-finished-lanes.sh --apply --max 1)
+#        fm-resil.sh tick              all three, each on its own interval, under one lock
 #        fm-resil.sh card-close <key>  drop a card (bin/fm-resil-lib.sh) that the captain answered
 #
 # resend  bin/fm-send.sh saves the exact arguments of a remote secondmate steer whose delivery stayed unknown
@@ -24,10 +25,13 @@
 #         times, 2, 4, 8 and 16 minutes after the previous point (FM_RESIL_RELAUNCH_SCHEDULE="120 240 480 960");
 #         when the last wait passes with the worker still stopped one card (key stopped-<id>) goes on the page.
 #         A worker seen not stopped for 30 minutes starts over. state/HOLD pauses the loop without counting.
-# Both are off with FM_RESIL=0 or a config/resil-off file. Test seams: FM_RESIL_NOW (epoch),
+# close   once per FM_RESIL_CLOSE_INTERVAL (3600) seconds, detached: the finished-lane closer with --max 1, so
+#         one lane at a time through bin/fm-teardown.sh, never forced, only after FM_LANE_CLOSE_TTL (6 h).
+#
+# All three are off with FM_RESIL=0 or a config/resil-off file. Test seams: FM_RESIL_NOW (epoch),
 # FM_RESIL_SEND_CMD, FM_RESIL_CONTROL_CMD <id> relaunch --note <text>, FM_RESIL_CREW_STATE_CMD <id>,
 # FM_RESIL_APIERR_CMD <worktree> (exit 0 and print the error time when the session ended in an API error),
-# Exit: 0 (also when a step could not act), 64 usage.
+# FM_RESIL_CLOSE_CMD. Exit: 0 (also when a step could not act), 64 usage.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -189,6 +193,12 @@ do_relaunch() {
   done
 }
 
+# ------------------------------------------------------------------ close
+do_close() {
+  # The closer logs each close and each refusal itself (state/.resil.log).
+  "${FM_RESIL_CLOSE_CMD:-$HERE/fm-close-finished-lanes.sh}" --apply --max 1 </dev/null >/dev/null 2>&1 || true
+}
+
 # ------------------------------------------------------------------ tick
 due_every() {  # <name> <seconds>: true (and stamp) when the step is due
   local stamp=$STATE/resil/.last-$1 last=0
@@ -205,14 +215,19 @@ do_tick() {
   fm_resil_off "$CONFIG" && return 0
   do_resend
   if due_every relaunch "${FM_RESIL_RELAUNCH_INTERVAL:-60}"; then do_relaunch; fi
+  if due_every close "${FM_RESIL_CLOSE_INTERVAL:-3600}"; then
+    # The closer outlives this tick, so it must not inherit (and hold) the tick's lock.
+    ( setsid nohup "$0" close </dev/null >/dev/null 2>&1 7>&- & ) || true
+  fi
 }
 
 case "${1:-}" in
   resend) fm_resil_off "$CONFIG" || do_resend ;;
   relaunch) fm_resil_off "$CONFIG" || do_relaunch ;;
+  close) fm_resil_off "$CONFIG" || do_close ;;
   tick) do_tick ;;
   card-close) [ -n "${2:-}" ] || { echo "usage: fm-resil.sh card-close <key>" >&2; exit 64; }; fm_resil_card_drop "$STATE" "$2" ;;
   -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0" ;;
-  *) echo "usage: fm-resil.sh resend|relaunch|tick|card-close <key>" >&2; exit 64 ;;
+  *) echo "usage: fm-resil.sh resend|relaunch|close|tick|card-close <key>" >&2; exit 64 ;;
 esac
 exit 0

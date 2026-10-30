@@ -229,6 +229,63 @@ SH
   pass "the real PR reader is called with the shape the helper expects"
 }
 
+# The lane must have been finished for the whole quiet period (default 6 h) before it closes.
+test_a_lane_closes_only_after_its_quiet_period() {
+  make_world ttl
+  add_task t1 ship "done" "pr=https://example.test/o/r/pull/71"
+  add_task t2 ship "done" "pr=https://example.test/o/r/pull/72"
+  add_task t3 scout "done"
+  echo merged > "$W/pr/71"; echo merged > "$W/pr/72"; mkdir -p "$W/home/data/t3"; echo r > "$W/home/data/t3/report.md"
+  printf 'done [at=%s]: finished\n' "$(( $(date +%s) - 600 ))" > "$W/home/state/t1.status"
+  printf 'done [at=%s]: finished\n' "$(( $(date +%s) - 21700 ))" > "$W/home/state/t2.status"
+  printf 'turn-ended without a stamp\n' > "$W/home/state/t3.status"   # no time in the line: the file's last write counts
+  touch -d '2 hours ago' "$W/home/state/t3.status"
+  out=$(run_close --apply)
+  assert_contains "$out" "waits for its 21600s quiet period" "a lane that ended ten minutes ago must wait"
+  assert_contains "$out" "closed: t2" "a lane finished more than six hours ago closes"
+  assert_contains "$out" "kept: t3 finished" "a lane with an unstamped line counts from the file's last write"
+  assert_equals "t2" "$(cat "$W/td.log")" "only the lane past its quiet period reached teardown"
+  out=$(FM_LANE_CLOSE_TTL=300 run_close --apply --max 1)
+  assert_contains "$out" "closed: t1" "FM_LANE_CLOSE_TTL sets the quiet period"
+  add_task t4 ship "done" "pr=https://example.test/o/r/pull/74"
+  echo merged > "$W/pr/74"
+  printf 'done [at=%s]: finished\n' "$(date +%s)" > "$W/home/state/t4.status"
+  out=$(run_close --apply --ttl 0)
+  assert_contains "$out" "closed: t4" "--ttl 0 turns the wait off"
+  pass "a lane closes only after its quiet period"
+}
+
+test_dirty_inbox_and_waiting_spawn_keep_the_lane() {
+  make_world guards
+  local proj="$W/proj" other="$W/other" i
+  git init -q -b main "$proj"; git init -q -b main "$other"
+  git -C "$proj" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+  git -C "$proj" worktree add -q -b fm/g1 "$W/wt-g1"
+  git -C "$proj" worktree add -q -b fm/g2 "$W/wt-g2"
+  git -C "$proj" worktree add -q -b fm/g3 "$W/wt-g3"
+  git -C "$proj" worktree add -q -b fm/g4 "$W/wt-g4"
+  for i in g1 g2 g3 g4; do
+    fm_write_meta "$W/home/state/$i.meta" "kind=ship" "worktree=$W/wt-$i" "project=$proj" "branch=fm/$i" "mode=local-only"
+    printf 'done [at=1]: finished\n' > "$W/home/state/$i.status"; echo done > "$W/cs/$i"
+  done
+  echo scratch > "$W/wt-g1/untracked.txt"
+  mkdir -p "$W/home/state/g2.inbox"; echo "please look" > "$W/home/state/g2.inbox/003.msg"
+  mkdir -p "$W/home/state/.spawn-waiting"
+  printf 'pid=%s\nproject=%s\nat=1\n' "$$" "$proj" > "$W/home/state/.spawn-waiting/newtask"
+  out=$(run_close --apply)
+  assert_contains "$out" "kept: g1 uncommitted changes in its local copy" "an untracked file keeps the lane"
+  assert_contains "$out" "kept: g2 unhandled steering message in its inbox" "an unhandled message keeps the lane"
+  assert_contains "$out" "kept: g3 yields to the spawn of newtask waiting for the same project" "a waiting spawn for the project is served first"
+  assert_absent "$W/td.log" "a guarded lane reached teardown"
+  # a marker whose spawn is gone, or for another project, no longer holds anything back
+  printf 'pid=%s\nproject=%s\nat=1\n' "99999999" "$proj" > "$W/home/state/.spawn-waiting/newtask"
+  printf 'pid=%s\nproject=%s\nat=1\n' "$$" "$other" > "$W/home/state/.spawn-waiting/other"
+  out=$(run_close --apply --max 1)
+  assert_contains "$out" "closed: g3" "a stale or foreign marker must not hold a lane back"
+  assert_contains "$(cat "$W/home/state/.resil.log")" "task=g3 cause=finished-lane action=close" "the close was not logged"
+  pass "uncommitted changes, an unhandled message and a waiting spawn each keep a lane; stale markers do not"
+}
+
 test_usage_error() {
   make_world usage
   run_close --bogus > /dev/null; rc=$?
@@ -246,6 +303,8 @@ test_ship_with_open_or_unreadable_pr_is_kept
 test_prless_ship_needs_branch_on_local_default
 test_archive_copy_failure_keeps_the_lane
 test_real_pr_reader_call_shape
+test_a_lane_closes_only_after_its_quiet_period
+test_dirty_inbox_and_waiting_spawn_keep_the_lane
 test_usage_error
 
 echo '# all fm-close-finished-lanes tests passed'

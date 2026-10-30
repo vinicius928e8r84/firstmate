@@ -8,6 +8,7 @@
 #      four times at 2, 4, 8 and 16 minutes, then one card; busy, done, paused,
 #      decision-holding and secondmate lanes are never touched; a quiet half
 #      hour starts the count over;
+#   3. the tick respects the off switch and leaves the closer to its own process.
 # Every acting command is a stub that records its arguments; nothing touches a
 # real lane, pane or remote.
 set -u
@@ -231,6 +232,31 @@ test_a_quiet_half_hour_starts_over() {
   pass "a worker seen working for half an hour starts its count over"
 }
 
+# --- tick ---------------------------------------------------------------------
+
+test_tick_runs_the_loops_and_honors_the_off_switch() {
+  local h i
+  h=$(make_home tick)
+  lane "$h" w5 ship "working [at=$T0]: x"
+  echo "$DEAD" > "$h/stubs/crew.w5"
+  touch "$h/config/resil-off"
+  resil "$h" "$T0" tick >/dev/null
+  resil "$h" $((T0 + 100000)) tick >/dev/null
+  assert_absent "$h/state/resil/stopped/w5" "the loops ran with config/resil-off present"
+  rm "$h/config/resil-off"
+  FM_RESIL=0 resil "$h" "$T0" tick >/dev/null
+  assert_absent "$h/state/resil/stopped/w5" "the loops ran with FM_RESIL=0"
+  resil "$h" "$T0" tick >/dev/null
+  assert_present "$h/state/resil/stopped/w5" "tick did not run the relaunch loop"
+  for i in $(seq 1 40); do [ -e "$h/stubs/close.calls" ] && break; sleep 0.1; done
+  assert_contains "$(cat "$h/stubs/close.calls" 2>/dev/null)" "--apply --max 1" "tick did not start the one-at-a-time closer"
+  rm -f "$h/stubs/close.calls"
+  resil "$h" $((T0 + 61)) tick >/dev/null
+  sleep 0.5
+  [ ! -e "$h/stubs/close.calls" ] || fail "the closer ran again inside its hour"
+  pass "tick runs the loops once per interval and the off switch stops them"
+}
+
 test_resend_replays_the_printed_command_on_schedule
 test_resend_ends_on_delivery_and_passes_the_state_override
 test_stopped_worker_is_relaunched_four_times_then_one_card
@@ -238,3 +264,4 @@ test_refused_relaunch_counts_and_is_logged
 test_api_error_stop_counts_from_the_error
 test_lanes_that_must_not_be_relaunched
 test_a_quiet_half_hour_starts_over
+test_tick_runs_the_loops_and_honors_the_off_switch
