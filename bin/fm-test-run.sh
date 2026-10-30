@@ -437,7 +437,7 @@ family_for_basename() {
     fm-extension-binding.test.sh|fm-gitignore-config.test.sh|fm-improvement-queue.test.sh|\
     fm-usage-ledger.test.sh|\
     fm-no-mistakes-required.test.sh|fm-peek-remote.test.sh|\
-    fm-pending-reply.test.sh|fm-pi-branch-extension.test.sh|\
+    fm-pending-reply.test.sh|fm-pi-branch-extension.test.sh|fm-resil.test.sh|\
     fm-procevent-quota.test.sh|fm-procevent-when.test.sh|fm-procevent.test.sh|\
     fm-live-gate.test.sh|\
     fm-pr-merge-main.test.sh|fm-review-delta.test.sh|fm-review-rules.test.sh|\

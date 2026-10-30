@@ -665,6 +665,7 @@ SH
     [ "$i" -lt 200 ] || fail "the lock holder never took the project lock"
     sleep 0.05
   done
+  export FM_SPAWN_LOCK_WAIT_SCHEDULE=
   out=$(run_spawn "$case_dir" "$home" "$case_dir/unused" task-o "$case_dir/project" \
     --backend orca --mode no-mistakes --yolo off) || rc=$?
   rc2=0
@@ -672,6 +673,7 @@ SH
     --backend orca --mode no-mistakes --yolo off) || rc2=$?
   : > "$case_dir/holder.release"
   wait "$holder" || true
+  unset FM_SPAWN_LOCK_WAIT_SCHEDULE
   expect_code 1 "$rc" "an Orca spawn ignored a held project lock: $out"
   assert_contains "$out" "another spawn or cleanup holds the shared project lock for $case_dir/project; refusing to race its capacity admission" \
     "the Orca spawn did not refuse on the shared project lock"
@@ -689,6 +691,87 @@ SH
   assert_absent "$home/state/task-o.meta" "the deferred Orca spawn published a record"
   assert_no_grep "orca " "$case_dir/calls.log" "the deferred Orca spawn created an Orca worktree"
   pass "an Orca spawn takes the shared project lock whenever a same-origin clone is capped and defers before creating anything"
+}
+
+# A cleanup or another spawn holding the Treehouse project lock for a moment is
+# a wait, not a failure: the spawn retries on FM_SPAWN_LOCK_WAIT_SCHEDULE,
+# leaves a marker so a batch cleanup yields to it, and only after the whole
+# schedule defers with the queue exit (so the backlog item stays queued and no
+# failed-creation alert fires).
+hold_project_lock() {  # <case-dir> <home> <release-when-this-path-exists> -> pid in $LOCK_HOLDER
+  # The spawn needs minutes to reach its lock on a loaded host, so the holder lets go on an event, not a timer.
+  local case_dir=$1 home=$2 until_path=$3 i=0
+  # shellcheck disable=SC2016 # expanded by the holder's own shell
+  FM_HOME="$home" FM_STATE_OVERRIDE='' bash -c '
+    . "$1/bin/fm-wake-lib.sh"
+    lock=$(fm_treehouse_project_lock_path "$2") || exit 1
+    fm_lock_try_acquire "$lock" || exit 1
+    : > "$3.held"
+    n=0
+    while [ ! -e "$4" ] && [ "$n" -lt 18000 ]; do sleep 0.05; n=$((n + 1)); done
+    sleep 1
+    fm_lock_release "$lock"
+  ' _ "$ROOT" "$case_dir/project" "$case_dir/holder" "$until_path" &
+  LOCK_HOLDER=$!
+  while [ ! -f "$case_dir/holder.held" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 200 ] || fail "the lock holder never took the project lock"
+    sleep 0.05
+  done
+}
+
+test_spawn_waits_for_a_briefly_held_project_lock() {
+  local case_dir home out rc=0
+  case_dir=$(make_case lockwait task-w)
+  home="$case_dir/home"
+  hold_project_lock "$case_dir" "$home" "$home/state/.spawn-waiting/task-w"
+  out=$(FM_SPAWN_LOCK_WAIT_SCHEDULE="1 1 1 1 1" spawn_ship "$case_dir" task-w) || rc=$?
+  wait "$LOCK_HOLDER" || true
+  expect_code 0 "$rc" "a spawn gave up on a project lock held for two seconds: $out"
+  assert_contains "$out" "spawned task-w" "the spawn did not launch after the lock cleared"
+  assert_present "$home/state/task-w.meta" "the waiting spawn published no record"
+  assert_absent "$home/state/.spawn-waiting/task-w" "the spawn left its waiting marker behind"
+  assert_contains "$(cat "$home/state/.resil.log")" "task=task-w cause=project-lock action=wait"     "the wait was not logged in .resil.log"
+  pass "a spawn waits out a briefly held project lock and then launches"
+}
+
+test_spawn_defers_when_the_project_lock_stays_held() {
+  local case_dir home out rc marker_seen=0 pid i
+  case_dir=$(make_case lockdefer task-d)
+  home="$case_dir/home"
+  hold_project_lock "$case_dir" "$home" "$case_dir/holder.release"
+  ( FM_SPAWN_LOCK_WAIT_SCHEDULE="1 1" spawn_ship "$case_dir" task-d > "$case_dir/spawn.out"; echo $? > "$case_dir/spawn.rc" ) &
+  pid=$!
+  for i in $(seq 1 12000); do
+    [ ! -f "$home/state/.spawn-waiting/task-d" ] || { marker_seen=1; break; }
+    [ -f "$case_dir/spawn.rc" ] && break
+    sleep 0.05
+  done
+  wait "$pid" || true
+  : > "$case_dir/holder.release"
+  wait "$LOCK_HOLDER" || true
+  out=$(cat "$case_dir/spawn.out"); rc=$(cat "$case_dir/spawn.rc")
+  expect_code "$DEFER_EXIT" "$rc" "a spawn that waited out its schedule did not defer: $out"
+  assert_contains "$out" "project lock" "the deferral did not name the project lock"
+  assert_contains "$out" "$LOCK_HOLDER" "the deferral did not name the holder pid"
+  [ "$marker_seen" = 1 ] || fail "a waiting spawn published no marker for the cleanup to yield to"
+  assert_absent "$home/state/.spawn-waiting/task-d" "a deferred spawn left its waiting marker behind"
+  assert_absent "$home/state/task-d.meta" "a deferred spawn published a record"
+  ls "$home"/state/spawn-failures/task-d.* >/dev/null 2>&1 && fail "a lock deferral was recorded as a failed creation"
+  pass "a spawn that waited out its schedule defers with the queue exit and no failure record"
+}
+
+test_empty_wait_schedule_keeps_the_single_try() {
+  local case_dir home out rc=0
+  case_dir=$(make_case locknowait task-n)
+  home="$case_dir/home"
+  hold_project_lock "$case_dir" "$home" "$case_dir/holder.release"
+  out=$(FM_SPAWN_LOCK_WAIT_SCHEDULE="" spawn_ship "$case_dir" task-n) || rc=$?
+  : > "$case_dir/holder.release"
+  wait "$LOCK_HOLDER" || true
+  expect_code 1 "$rc" "an empty wait schedule did not keep the single try: $out"
+  assert_contains "$out" "another Treehouse slot allocation or return is in progress" "the single try changed its message"
+  pass "an empty wait schedule keeps the old refuse-at-once behavior"
 }
 
 test_undeclared_capacity_keeps_dispatch_uncapped
@@ -709,3 +792,6 @@ test_batch_reports_a_deferred_pair
 test_orca_spawn_is_admitted_under_the_shared_project_lock
 test_lane_cap_defers_a_fresh_spawn_at_the_ceiling
 test_unreadable_lane_cap_refuses_every_spawn
+test_spawn_waits_for_a_briefly_held_project_lock
+test_spawn_defers_when_the_project_lock_stays_held
+test_empty_wait_schedule_keeps_the_single_try

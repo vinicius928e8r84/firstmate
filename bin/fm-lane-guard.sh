@@ -2,7 +2,7 @@
 # fm-lane-guard.sh - mechanical guards for the worker-creation lane and the pod job queue (daily speed audits
 # 2026-10-27 item 7 and 2026-10-28 item 2). Pure shell: no model call, never wakes an agent by itself.
 # Usage: fm-lane-guard.sh scan [slot|spawn|pod]      (default: all three; prints one line per NEW alert)
-#        fm-lane-guard.sh record-spawn-failure <task-id> <exit-code> [kind] [project] [backend] [harness]
+#        fm-lane-guard.sh record-spawn-failure <task-id> <exit-code> [kind project backend harness errfile cwd argv...]
 # Guards:
 #   slot   a `treehouse get` slot request that holds no slot yet - no child subshell - and is older than
 #          FM_SLOT_REQUEST_MAX_SEC (3600) is ended by its EXACT pid (SIGTERM then SIGCONT, since a request stopped on
@@ -11,8 +11,13 @@
 #          re-verified right before each signal, so a recycled pid is never hit. Never pkill, never a process group.
 #          Each kill is logged to state/.lane-guard.log and reported as an alert.
 #   spawn  bin/fm-spawn.sh records every failed creation (nonzero exit other than the capacity deferral) in
-#          state/spawn-failures/; the next scan - FM_LANE_GUARD_INTERVAL in the watcher, default 120 s, so well inside
-#          10 minutes - alerts once per failure unless a later spawn of the same task has since published its record.
+#          state/spawn-failures/ with its own error text and command line; the next scan - FM_LANE_GUARD_INTERVAL in the
+#          watcher, default 120 s - classifies it. A transient error (project lock, backlog read bound, network, login
+#          refresh, 429/5xx) is retried with the same command at 1, 4 and 15 minutes (FM_SPAWN_RETRY_SCHEDULE; failure
+#          N+1 carries attempt=N through FM_SPAWN_RETRY_ATTEMPT); a permanent or unclassified error is never repeated.
+#          Either kind alerts once and puts one card on the captain's page (fm_resil_card_put) only when it will not be
+#          retried again. Nothing is asked of the captain for a failure that a retry cleared: a later spawn of the same
+#          task that published its record ends the record and drops the card.
 #   pod    opt-in (config/pod-watch present). A job marker in the pod job queue (FM_POD_QUEUE_DIR, default
 #          state/.heavy-queue/<job>.queued, written by data/tools/fm-pod-auto.sh) older than FM_POD_WATCH_QUEUE_SEC
 #          (600) while the recorded pod (FM_POD_AUTO_DIR/pod.id, first field of the first line) is not RUNNING gets ONE
@@ -43,6 +48,8 @@ ALERT_N=0
 USAGE_KIND=
 # shellcheck source=bin/fm-usage-ledger-lib.sh
 . "$HERE/fm-usage-ledger-lib.sh"
+# shellcheck source=bin/fm-resil-lib.sh
+. "$HERE/fm-resil-lib.sh"
 # One usage line per run (bin/fm-usage-ledger-lib.sh): how many new alerts the scan printed, or the exit status.
 trap 'fm_usage_record fm-lane-guard "${USAGE_OUTCOME:-exit-$?}" - "${USAGE_KIND:-run}"' EXIT
 
@@ -117,30 +124,91 @@ scan_slot() {
 }
 
 # ------------------------------------------------------------------ failed creations
-record_spawn_failure() { # <id> <rc> [kind project backend harness]
-  local id=$1 rc=$2 kind=${3:-} project=${4:-} backend=${5:-} harness=${6:-} f
+# Classified once, by the failed run's own error text. permanent (a duplicate live pane, a missing brief, an unborn
+# HEAD, an account pin, an invalid profile - and any text nobody classified, which is never repeated blindly) becomes
+# one alert and one card for the captain. transient (the project lock, a backlog read bound, a timeout, the network, an
+# OAuth or login refresh, a 429/5xx) is retried by this scan with the same command line after each delay of
+# FM_SPAWN_RETRY_SCHEDULE (default "60 240 900": 1, 4 and 15 minutes); only when the retries are used up does it alert
+# and put a card. Every step is one line in state/.resil.log. A relaunch is never replayed.
+SPAWN_RETRY_SCHEDULE=${FM_SPAWN_RETRY_SCHEDULE-60 240 900}
+SPAWN_RETRY_CMD=${FM_LG_SPAWN_CMD:-$HERE/fm-spawn.sh}
+classify_error() { # <error text> -> transient|permanent
+  local t=${1,,}
+  case "$t" in
+    *"refusing duplicate launch"*|*"has a live pane"*|*"has no brief"*|*"no brief at"*|*"unborn head"*|*"no commit yet"*|\
+    *"account pin"*|*"worker account"*|*"invalid profile"*|*"dispatch profile"*|*"not a verified harness"*) echo permanent; return ;;
+  esac
+  case "$t" in
+    *"refusing to race"*|*"slot allocation or return"*|*"read bound"*|*"timed out"*|*"timeout"*|*"could not resolve host"*|\
+    *"connection refused"*|*"connection reset"*|*"network is unreachable"*|*"ssh: "*|*"oauth"*|*"failed to authenticate"*|\
+    *"session expired"*|*"not logged in"*|*"rate limit"*|*"too many requests"*|*"overloaded"*|*"temporarily"*|*"try again"*|\
+    *" 429"*|*" 502"*|*" 503"*|*" 504"*|*"econnreset"*|*"etimedout"*) echo transient ;;
+    *) echo permanent ;;
+  esac
+}
+record_spawn_failure() { # <id> <rc> [kind project backend harness errfile cwd argv...]
+  local id=$1 rc=$2 kind project backend harness errfile cwd f text line class=permanent attempt arg
+  shift 2
+  kind=${1:-}; project=${2:-}; backend=${3:-}; harness=${4:-}; errfile=${5:-}; cwd=${6:-}
+  if [ $# -ge 6 ]; then shift 6; else shift $#; fi
   [[ $id =~ ^[A-Za-z0-9._-]+$ ]] && [[ $rc =~ ^[0-9]+$ ]] || return 1
+  attempt=${FM_SPAWN_RETRY_ATTEMPT:-0}; [[ $attempt =~ ^[0-9]+$ ]] || attempt=0
+  text=; [ -n "$errfile" ] && [ -r "$errfile" ] && text=$(tail -n 20 "$errfile" 2>/dev/null)
+  line=$(printf '%s\n' "$text" | grep -E '^(error|deferred|fatal)' | tail -n 1)
+  [ -n "$line" ] || line=$(printf '%s\n' "$text" | grep -v '^[[:space:]]*$' | tail -n 1)
+  line=${line:0:300}
+  [ -z "$text" ] || class=$(classify_error "$text")
+  for arg in "$@"; do [ "$arg" = --relaunch ] && class=permanent; done
+  [ $# -gt 0 ] || class=permanent   # nothing to replay
   mkdir -p "$FAILDIR" || return 1
   f="$FAILDIR/$id.$(now).$$.fail"
-  printf 'id=%s\nrc=%s\nat=%s\nkind=%s\nproject=%s\nbackend=%s\nharness=%s\n' \
-    "$id" "$rc" "$(now)" "$kind" "$project" "$backend" "$harness" > "$f.tmp" && mv "$f.tmp" "$f"
+  printf 'id=%s\nrc=%s\nat=%s\nkind=%s\nproject=%s\nbackend=%s\nharness=%s\nclass=%s\nattempt=%s\ncwd=%s\nerr=%s\n' \
+    "$id" "$rc" "$(now)" "$kind" "$project" "$backend" "$harness" "$class" "$attempt" "$cwd" "${line//$'\n'/ }" > "$f.tmp" || return 1
+  if [ "$class" = transient ]; then printf '%s\0' "$@" > "$f.args" || return 1; fi
+  mv "$f.tmp" "$f"
+  fm_resil_log "$S" "$id" "$class" "spawn-failed" "rc=$rc attempt=$attempt ${line:0:120}"
 }
 fget() { sed -n "s/^$2=//p" "$1" | head -1; }
+retry_spawn() { # <fail-file> <id> <attempt> <cwd>: replay the failed command line, detached; its own failure writes a new record
+  local f=$1 id=$2 attempt=$3 cwd=$4 argv=()
+  mapfile -d '' -t argv < "$f.args" 2>/dev/null || return 1
+  [ "${#argv[@]}" -gt 0 ] || return 1
+  [ -d "$cwd" ] || cwd=$F
+  mv "$f" "$f.retried" || return 1
+  fm_resil_log "$S" "$id" transient "retry-$((attempt + 1))" "replaying the failed creation"
+  ( cd "$cwd" && FM_HOME=$F FM_SPAWN_RETRY_ATTEMPT=$((attempt + 1)) setsid nohup "$SPAWN_RETRY_CMD" "${argv[@]}" \
+      </dev/null >> "$FAILDIR/$id.retry.log" 2>&1 & ) || true
+  return 0
+}
 scan_spawn() {
-  local f id rc at kind project backend harness meta
+  local f id rc at kind project backend harness meta class attempt cwd err delay n_retries note
   [ -d "$FAILDIR" ] || return 0
+  read -r -a _sched <<<"$SPAWN_RETRY_SCHEDULE"; n_retries=${#_sched[@]}
   for f in "$FAILDIR"/*.fail; do
     [ -e "$f" ] || continue
     id=$(fget "$f" id); rc=$(fget "$f" rc); at=$(fget "$f" at)
     kind=$(fget "$f" kind); project=$(fget "$f" project); backend=$(fget "$f" backend); harness=$(fget "$f" harness)
+    class=$(fget "$f" class); attempt=$(fget "$f" attempt); cwd=$(fget "$f" cwd); err=$(fget "$f" err)
+    [[ ${attempt:-} =~ ^[0-9]+$ ]] || attempt=0
     meta=$S/$id.meta
     if [ -e "$meta" ] && [ "$(stat -c %Y "$meta")" -ge "${at:-0}" ]; then   # a later spawn of this task succeeded
-      mv "$f" "$f.warned"; continue
+      mv "$f" "$f.warned"; fm_resil_card_drop "$S" "spawn-$id"; continue
+    fi
+    note=
+    if [ "$class" = transient ] && ! fm_resil_off "$C"; then
+      if [ "$attempt" -lt "$n_retries" ]; then
+        delay=$(fm_resil_schedule_delay "$SPAWN_RETRY_SCHEDULE" $((attempt + 1)))
+        [[ $delay =~ ^[0-9]+$ ]] && [ "$(now)" -lt $(( ${at:-0} + delay )) ] && continue   # not due yet
+        retry_spawn "$f" "$id" "$attempt" "$cwd" && continue
+      fi
+      note=" after $attempt retries"
     fi
     mv "$f" "$f.warned"
-    alert "spawn-$id-$at" 1 "worker creation failed: task $id exited $rc at $(date -u -d "@${at:-0}" +%FT%TZ) (kind=${kind:-?} project=${project:-?} backend=${backend:-?} harness=${harness:-?}); rerun bin/fm-spawn.sh for the error text"
+    alert "spawn-$id-$at" 0 "worker creation failed: task $id exited $rc at $(date -u -d "@${at:-0}" +%FT%TZ)$note (kind=${kind:-?} project=${project:-?} backend=${backend:-?} harness=${harness:-?}); ${err:-rerun bin/fm-spawn.sh for the error text}"
+    fm_resil_card_put "$S" "spawn-$id" "(main)" "A criação do worker $id falhou${note:+ ($note)}: ${err:-sem texto de erro}. Corrigir a causa e despachar de novo, ou desistir da tarefa."
+    fm_resil_log "$S" "$id" "${class:-permanent}" card "creation failed$note"
   done
-  find "$FAILDIR" -name '*.warned' -mtime +7 -delete 2>/dev/null
+  find "$FAILDIR" \( -name '*.warned' -o -name '*.retried' -o -name '*.args' -o -name '*.retry.log' \) -mtime +7 -delete 2>/dev/null
 }
 
 # ------------------------------------------------------------------ pod job queue

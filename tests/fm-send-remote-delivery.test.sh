@@ -298,6 +298,11 @@ test_remote_rerun_is_idempotent() {
   done
   assert_contains "$err" "$expected_cmd" \
     "double transport loss must print the exact correlation-reusing resend command"
+  # The same command is saved for the watcher's automatic replay (bin/fm-resil.sh resend).
+  [ -f "$home/state/resil/resend/$corr.args" ] \
+    || fail "an unconfirmed remote steer saved no resend arguments for the automatic replay"
+  [ "$(tr '\0' '|' < "$home/state/resil/resend/$corr.args")" = "$home||rsm|please rename the metric|" ] \
+    || fail "the saved resend arguments differ from the printed command: $(tr '\0' '|' < "$home/state/resil/resend/$corr.args")"
 
   # A delivered record escalated for a missed report is genuinely stale: the
   # request reached the mate, so the same correlation must never be resent.
@@ -345,6 +350,8 @@ test_remote_rerun_is_idempotent() {
     || fail "the successful resend did not confirm pending-reply delivery: $(cat "$pend")"
   [ "$(fm_pending_reply_get "$pend" phase)" = awaiting_report ] \
     || fail "the successful resend did not restore awaiting_report: $(cat "$pend")"
+  [ ! -e "$home/state/resil/resend/$corr.args" ] \
+    || fail "a confirmed resend left its saved arguments for another automatic replay"
   pass "fm-send remote: the printed correlation-reusing resend deduplicates onto the same record"
 }
 

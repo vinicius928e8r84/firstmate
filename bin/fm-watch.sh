@@ -319,6 +319,10 @@ LANE_GUARD_INTERVAL=${FM_LANE_GUARD_INTERVAL:-120}  # seconds between fm-lane-gu
 case "$LANE_GUARD_INTERVAL" in
   ''|*[!0-9]*|0) LANE_GUARD_INTERVAL=120 ;;
 esac
+RESIL_INTERVAL=${FM_RESIL_INTERVAL:-60}  # seconds between detached fm-resil.sh ticks (steer replay, worker relaunch, lane close)
+case "$RESIL_INTERVAL" in
+  ''|*[!0-9]*|0) RESIL_INTERVAL=60 ;;
+esac
 CLEAN_PR_GUARD_INTERVAL=${FM_CLEAN_PR_GUARD_INTERVAL:-600}  # seconds between fm-clean-pr-guard.sh scans
 case "$CLEAN_PR_GUARD_INTERVAL" in
   ''|*[!0-9]*|0) CLEAN_PR_GUARD_INTERVAL=600 ;;
@@ -3646,6 +3650,18 @@ while :; do
       fm_wake_append check lane-guard "$reason" || exit 1
       wake "$reason"
     fi
+  fi
+
+  # Resilience loops (bin/fm-resil.sh owns them): replay an unconfirmed secondmate
+  # steer at 1, 4 and 15 minutes, relaunch a worker that stayed stopped, and close
+  # finished lanes one at a time. One detached single-flight tick, so a slow remote
+  # or teardown never stalls the beat; it wakes nobody - what it cannot fix becomes
+  # a card on the captain's page (bin/fm-daily-page.sh). Off with FM_RESIL=0 or
+  # config/resil-off (docs/configuration.md "Resilience loops").
+  if [ "$(age_of "$STATE/.resil-last")" -ge "$RESIL_INTERVAL" ]; then
+    : > "$STATE/.resil-last"
+    ( FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+        setsid nohup "$SCRIPT_DIR/fm-resil.sh" tick </dev/null >/dev/null 2>&1 & ) || true
   fi
 
   # Clean PR without a review record (bin/fm-clean-pr-guard.sh owns it): wake

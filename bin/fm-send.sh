@@ -35,7 +35,9 @@
 # once itself. For an ordinary reply-bearing request, a later re-run is
 # idempotent only through the printed FM_PENDING_REPLY_EXISTING_CORR=<corr>
 # command: it preserves the same correlation, body, and record, while a plain
-# re-run mints a new correlation and delivers a separate record. An explicit
+# re-run mints a new correlation and delivers a separate record. The
+# unconfirmed remote steer also saves that exact command's arguments, and the
+# watcher replays it at 1, 4 and 15 minutes (bin/fm-resil.sh resend). An explicit
 # fire-and-forget request instead retries with its same caller-supplied delivery
 # id. A still-unconfirmed reply-bearing request keeps its reply expectation
 # preserved for the record that may have landed.
@@ -249,6 +251,8 @@ fi
 . "$SCRIPT_DIR/fm-marker-lib.sh"
 # shellcheck source=bin/fm-pending-reply-lib.sh
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
+# shellcheck source=bin/fm-resil-lib.sh
+. "$SCRIPT_DIR/fm-resil-lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-line-cap-lib.sh
@@ -978,6 +982,9 @@ else
         printf ' %q' "$resend_arg" >&2
       done
       printf '\n' >&2
+      # The watcher replays exactly this command at 1, 4 and 15 minutes (bin/fm-resil.sh resend).
+      [ -z "$PENDING_REPLY_CORR" ] ||
+        fm_resil_resend_save "$STATE" "$PENDING_REPLY_CORR" "$resend_home" "${resend_state:-}" "${FM_SEND_ORIGINAL_ARGS[@]}" || true
       exit 1
     fi
     if [ "$remote_rc" -ne 0 ]; then
@@ -989,7 +996,7 @@ else
     # The remote record is durable delivery, exactly as a local enqueue is.
     if [ -n "$PENDING_REPLY_CORR" ]; then
       if fm_pending_reply_confirm_delivery "$STATE" "$PENDING_REPLY_CORR"; then
-        :
+        fm_resil_resend_clear "$STATE" "$PENDING_REPLY_CORR"
       else
         delivery_commit_status=$?
         if [ "$delivery_commit_status" = 2 ]; then

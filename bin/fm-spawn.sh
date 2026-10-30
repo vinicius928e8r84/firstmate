@@ -673,6 +673,10 @@ case "${1:-}" in
   ;;
 esac
 
+# The command line as given, so a failed creation can be retried exactly (bin/fm-lane-guard.sh).
+SPAWN_ORIG_ARGS=("$@")
+SPAWN_ORIG_PWD=$PWD
+
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
@@ -845,6 +849,8 @@ if [ -e "$STATE" ] || [ -L "$STATE" ]; then
 fi
 # shellcheck source=bin/fm-ff-lib.sh
 . "$SCRIPT_DIR/fm-ff-lib.sh"
+# shellcheck source=bin/fm-resil-lib.sh
+. "$SCRIPT_DIR/fm-resil-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
@@ -1584,8 +1590,11 @@ spawn_orca_reclaim_launch_file() {
 spawn_failure_record() {  # <status>
   [ "$1" -ne 0 ] && [ "$1" -ne "${FM_PROJECT_CAPACITY_DEFER_EXIT:-75}" ] || return 0
   [ -n "${ID:-}" ] && [ -n "${STATE:-}" ] || return 0
+  # The stderr tee may still be flushing the last error line.
+  [ -z "$SPAWN_ERR_FILE" ] || sleep 0.2
   FM_HOME="${FM_HOME:-}" FM_STATE_OVERRIDE="$STATE" "$FM_ROOT/bin/fm-lane-guard.sh" record-spawn-failure \
-    "$ID" "$1" "${KIND:-}" "${PROJ_ABS:-}" "${BACKEND:-}" "${HARNESS:-}" </dev/null >/dev/null 2>&1 || true
+    "$ID" "$1" "${KIND:-}" "${PROJ_ABS:-}" "${BACKEND:-}" "${HARNESS:-}" \
+    "$SPAWN_ERR_FILE" "$SPAWN_ORIG_PWD" "${SPAWN_ORIG_ARGS[@]}" </dev/null >/dev/null 2>&1 || true
 }
 
 spawn_abort_cleanup() {
@@ -1803,8 +1812,17 @@ spawn_abort_cleanup() {
     fi
     fm_lock_release "$SPAWN_TASK_LOCK" || true
   fi
+  [ -z "$SPAWN_ERR_FILE" ] || rm -f "$SPAWN_ERR_FILE" 2>/dev/null || true
   return "$status"
 }
+# Keep a copy of this run's stderr so a failed creation is classified by its own error text
+# (transient: retried; permanent: one card; bin/fm-lane-guard.sh owns the classes).
+SPAWN_ERR_FILE=
+if [ -z "${FM_SPAWN_NO_ERRCAP:-}" ] && SPAWN_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-spawn-err.XXXXXX" 2>/dev/null); then
+  exec 2> >(tee -a "$SPAWN_ERR_FILE" >&2)
+else
+  SPAWN_ERR_FILE=
+fi
 trap spawn_abort_cleanup EXIT
 
 # One lock per live Herdr session/socket, shared across all homes. <session>
@@ -3718,12 +3736,46 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] &&
     exit 1
   }
   if ! fm_lock_try_acquire "$SPAWN_TREEHOUSE_PROJECT_LOCK"; then
-    if [ "$BACKEND" = orca ]; then
-      echo "error: another spawn or cleanup holds the shared project lock for $PROJ_ABS; refusing to race its capacity admission" >&2
-    else
-      echo "error: another Treehouse slot allocation or return is in progress for $PROJ_ABS; refusing to race it" >&2
+    # A cleanup or another spawn holding the lock for a moment is a wait, not a
+    # failure (fm-resil-lib.sh): retry on the schedule, show a marker so a batch
+    # cleanup yields to this spawn, and only then defer with the queue exit so
+    # the item stays queued and no failed-creation alert fires. An empty
+    # schedule keeps the single try.
+    SPAWN_LOCK_WAITED=0
+    SPAWN_LOCK_GOT=0
+    SPAWN_LOCK_HOLDER=${FM_LOCK_HELD_PID:-unknown}
+    SPAWN_LOCK_SCHEDULE=${FM_SPAWN_LOCK_WAIT_SCHEDULE-5 10 20 40 80 145}
+    if [ -n "$SPAWN_LOCK_SCHEDULE" ] && ! fm_resil_off "$CONFIG"; then
+      mkdir -p "$STATE/.spawn-waiting" 2>/dev/null &&
+        printf 'pid=%s\nproject=%s\nat=%s\n' "$$" "$PROJ_ABS" "$(date +%s)" > "$STATE/.spawn-waiting/$ID" 2>/dev/null
+      for SPAWN_LOCK_DELAY in $SPAWN_LOCK_SCHEDULE; do
+        sleep "$SPAWN_LOCK_DELAY"
+        SPAWN_LOCK_WAITED=$((SPAWN_LOCK_WAITED + SPAWN_LOCK_DELAY))
+        if fm_lock_try_acquire "$SPAWN_TREEHOUSE_PROJECT_LOCK"; then
+          SPAWN_LOCK_GOT=1
+          break
+        fi
+        SPAWN_LOCK_HOLDER=${FM_LOCK_HELD_PID:-$SPAWN_LOCK_HOLDER}
+      done
+      rm -f "$STATE/.spawn-waiting/$ID" 2>/dev/null || true
     fi
-    exit 1
+    if [ "$SPAWN_LOCK_GOT" = 1 ]; then
+      fm_resil_log "$STATE" "$ID" project-lock wait "acquired after ${SPAWN_LOCK_WAITED}s (holder pid $SPAWN_LOCK_HOLDER)"
+    else
+      if [ "$SPAWN_LOCK_WAITED" -gt 0 ]; then
+        fm_resil_log "$STATE" "$ID" project-lock wait "gave up after ${SPAWN_LOCK_WAITED}s (holder pid $SPAWN_LOCK_HOLDER)"
+      fi
+      if [ "$BACKEND" = orca ]; then
+        echo "error: another spawn or cleanup holds the shared project lock for $PROJ_ABS (pid $SPAWN_LOCK_HOLDER); refusing to race its capacity admission" >&2
+      else
+        echo "error: another Treehouse slot allocation or return is in progress for $PROJ_ABS (project lock held by pid $SPAWN_LOCK_HOLDER); refusing to race it" >&2
+      fi
+      if [ "$SPAWN_LOCK_WAITED" -gt 0 ]; then
+        echo "deferred: the project lock stayed held for ${SPAWN_LOCK_WAITED}s; task $ID was not launched and its backlog item stays queued - dispatch it again" >&2
+        exit "$FM_PROJECT_CAPACITY_DEFER_EXIT"
+      fi
+      exit 1
+    fi
   fi
   SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=1
 fi
