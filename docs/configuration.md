@@ -762,6 +762,23 @@ There is no override flag: clean up a lane or raise the number.
 Work that is CPU-heavy and needs none of this home's data can instead go to a remote secondmate with room: `bin/fm-overflow.sh pick` reads each candidate's published `state/lane-capacity.json` (creative-aux and pc-aux2 by default, so those homes need their own `config/lane-capacity`), skips any host without a free lane, with load per core at or over 3, under critical pressure, reserved, or with stale facts, and prints the pick with its reason or `none free`; `bin/fm-overflow.sh send <text...>` hands the text to the pick as a marked routed request through `bin/fm-send.sh` ([remote second mates](remote-secondmates.md)).
 The script's header owns the report line, the published document's fields, the verdict, the beat freshness rules, the host-constraint thresholds, and the probe fallbacks.
 
+## Resilience loops (config/resil-off)
+
+Four loops keep transient trouble from stopping work or reaching the captain.
+Every action they take is one line in `state/.resil.log` (time, task, cause, action, outcome), so the effect is a `grep` away.
+`FM_RESIL=0` in the watcher's environment or an existing `config/resil-off` file switches the clocked loops (relaunch, steer replay, lane close) off; the file is a per-machine choice and is not inherited by secondmate homes.
+
+- Worker creation: `bin/fm-spawn.sh` waits for a held Treehouse project lock on `FM_SPAWN_LOCK_WAIT_SCHEDULE` (default `5 10 20 40 80 145` seconds, about five minutes) and then defers with exit 75, so the item stays queued and no failure is recorded; an empty schedule keeps the single refuse-at-once try.
+  While it waits it shows a marker in `state/.spawn-waiting/`, and the lane closer yields to it.
+  A creation that fails is classified by its own error text in `bin/fm-lane-guard.sh`: a transient error is replayed with the same command line after 1, 4 and 15 minutes (`FM_SPAWN_RETRY_SCHEDULE`), a permanent or unclassified one is never repeated and becomes one alert and one card.
+- Steers: an unconfirmed remote secondmate steer is replayed through the correlation-reusing command `bin/fm-send.sh` printed, 1, 4 and 15 minutes apart (`FM_RESIL_RESEND_SCHEDULE`), until the delivery is confirmed.
+- Stopped workers: `bin/fm-resil.sh relaunch` relaunches a ship or scout whose agent is gone, or whose session ends in an API error, after it has been stopped for ten minutes (`FM_RESIL_STOPPED_SECS`), through `bin/fm-control.sh <id> relaunch`, up to four times at 2, 4, 8 and 16 minutes (`FM_RESIL_RELAUNCH_SCHEDULE`); a worker that said done, failed, paused, needs-decision or blocked, a busy one, a secondmate, and any lane while `state/HOLD` is in force are left alone.
+- Finished lanes: once an hour `bin/fm-close-finished-lanes.sh --apply --max 1` closes one lane that ended more than six hours ago (`FM_LANE_CLOSE_TTL`) through `bin/fm-teardown.sh` without `--force`.
+
+What no loop can fix becomes a card: a small file in `state/resil/cards/` that `bin/fm-daily-page.sh` shows on the captain's single page and that the loop drops once its cause clears.
+`bin/fm-resil.sh card-close <key>` drops one by hand.
+The watcher runs `bin/fm-resil.sh tick` every `FM_RESIL_INTERVAL` seconds (default 60) as a detached single-flight process; the script headers own the schedules, seams, and thresholds, and `tests/fm-resil.test.sh`, `tests/fm-lane-guard.test.sh`, `tests/fm-close-finished-lanes.test.sh`, `tests/fm-daily-page.test.sh`, and `tests/fm-project-capacity.test.sh` pin them.
+
 ## PR-ready line after green (config/ready-after-green)
 
 The optional local, gitignored `config/ready-after-green` presence flag opts a secondmate home into publishing its child's PR-ready parent line only after the child has reported checks green.
@@ -1697,6 +1714,7 @@ Every rehearsal closes the test Anki it started, by that Anki's own PID, and nev
 
 `bin/fm-daily-page.sh` builds or refreshes `.lavish/diaria-YYYY-MM-DD.html` in this home from the open captain decisions, one pt-BR card per decision with the recorded recommendation preselected, and prints the page path and its `http://100.96.168.50:4387/session/<id>` URL.
 It reads the decisions from `bin/fm-bearings-snapshot.sh --json` (no new store), gives the same date the same file and URL, and opens a Lavish session only when none is listed for that file.
+It also lists the resilience cards (see [Resilience loops](#resilience-loops-configresil-off)), releases main-home captain holds whose merge question names a PR that is already merged or closed (listed in the page footer as closed by fact), and rebuilds at most twice a day unless forced.
 It is run on demand and installs no cron line; the script header owns the card markup, the optional `options` and `recommend` fields, and its environment.
 
 **Missing or invalid rules**

@@ -50,7 +50,9 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-ensure-agents-md.sh` | Manually initialize project agent-memory files (see the helper's header and help) |
 | `fm-capacity.sh`         | Report of open lanes against the optional `config/lane-capacity` target and host headroom for queued-work dispatch; `--publish` writes this home's `state/lane-capacity.json` |
 | `fm-overflow.sh`         | Pick the remote secondmate host (creative-aux, pc-aux2) with a free lane and light load from its published `state/lane-capacity.json`, and `send` CPU-heavy, main-data-free work to it as a routed request |
-| `fm-close-finished-lanes.sh` | Guarded nightly step: archive the logs of finished, unheld ordinary tasks and close their lanes through `fm-teardown.sh` without `--force`, one at a time under a per-run cap and time budget; lists everything else as `kept` |
+| `fm-close-finished-lanes.sh` | Guarded nightly step: archive the logs of finished, unheld ordinary tasks and close their lanes through `fm-teardown.sh` without `--force`, one at a time under a per-run cap, time budget and six-hour quiet period; lists everything else as `kept` |
+| `fm-resil.sh`            | The clocked resilience loops: replay an unconfirmed secondmate steer, relaunch a stopped worker, close finished lanes one at a time (docs/configuration.md "Resilience loops") |
+| `fm-resil-lib.sh`        | Shared pieces of those loops: the `state/.resil.log` line, schedules, the off switch, captain-page cards, and the PR-state reader |
 | `fm-guard.sh`            | Warn on primary-checkout tangles, main-session pending wakes, and unhealthy supervision |
 | `fm-primary-scope-lib.sh` | Shared marker-or-plain-checkout primary-home predicate for tracked hooks             |
 | `fm-session-lock-lib.sh` | Shared session-lock ownership from harness ancestry, a trusted Claude session id, or on Windows/Git Bash a published harness pid, for fm-lock.sh and the Claude Stop auto-arm, plus the read-only lock inspection behind `fm-lock.sh status` and `fm-inbox.sh ready` |

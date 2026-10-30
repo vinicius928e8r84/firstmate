@@ -295,6 +295,8 @@ Every `FM_LANE_GUARD_INTERVAL` seconds (default 120) the watcher runs `bin/fm-la
 The scan ends a `treehouse get` slot request that has held no slot for over an hour by its exact pid, warns about a worker creation that `bin/fm-spawn.sh` recorded as failed, and, when `config/pod-watch` exists, starts or warns about a stopped pod behind a queued pod job.
 The script header owns the guards, limits, and environment; it never creates or deletes a pod and never wakes an agent on its own.
 `tests/fm-lane-guard.test.sh` pins each guard against real processes, a real failed spawn, and a local stand-in for the pod API.
+A failed creation is classified by its own error text: a transient one is replayed with the same command line at 1, 4 and 15 minutes before it alerts, a permanent one becomes one alert and one captain card.
+The same beat starts a detached `bin/fm-resil.sh tick` every `FM_RESIL_INTERVAL` seconds (default 60); it wakes nobody and docs/configuration.md "Resilience loops" owns what it does.
 
 ## Runner watch
 
