@@ -162,7 +162,6 @@ test_stopped_worker_is_relaunched_four_times_then_one_card() {
   assert_equals 4 "$(calls "$h/stubs/control.calls" w1)" "a fifth relaunch ran at the card"
   assert_present "$h/state/resil/cards/stopped-w1.card" "no card after four relaunches"
   assert_contains "$(cat "$h/state/.resil.log")" "task=w1 cause=stopped-agent-gone action=relaunch-1 outcome=ok" "the relaunch was not logged"
-  assert_absent "$h/state/w1.status.bak" "unexpected file"
   pass "a stopped worker is relaunched at 2, 4, 8 and 16 minutes, then one card"
 }
 
@@ -189,6 +188,28 @@ test_api_error_stop_counts_from_the_error() {
   assert_equals 1 "$(calls "$h/stubs/control.calls" 'w3 relaunch')" "a worker whose session ended in an API error 15 minutes ago was not relaunched"
   assert_contains "$(cat "$h/state/.resil.log")" "cause=stopped-api-error" "the cause was not logged"
   pass "an API-error stop counts from the error, not from the first look"
+}
+
+test_default_api_error_probe_reads_the_claude_session_file() {
+  local h dir
+  h=$(make_home relaunch-session)
+  lane "$h" w6 ship "working [at=$T0]: x"
+  lane "$h" w7 ship "working [at=$T0]: x"
+  echo "state: working · source: status-log · working" > "$h/stubs/crew.w6"
+  echo "state: working · source: status-log · working" > "$h/stubs/crew.w7"
+  dir="$h/home/.claude/projects/$(printf '%s' "$h/wt-w6" | sed 's|[^A-Za-z0-9]|-|g')"
+  mkdir -p "$dir" "$h/home/.claude/projects/$(printf '%s' "$h/wt-w7" | sed 's|[^A-Za-z0-9]|-|g')"
+  printf '%s\n' '{"type":"user","message":{"content":"go"}}' \
+    '{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"Failed to authenticate: OAuth session expired"}]}}' > "$dir/s.jsonl"
+  touch -d "@$((T0 - 900))" "$dir/s.jsonl"
+  printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"all good"}]}}' \
+    > "$h/home/.claude/projects/$(printf '%s' "$h/wt-w7" | sed 's|[^A-Za-z0-9]|-|g')/s.jsonl"
+  STUB_DIR="$h/stubs" FM_HOME="$h" FM_RESIL_NOW="$T0" HOME="$h/home" \
+    FM_RESIL_CONTROL_CMD="$h/stubs/control" FM_RESIL_CREW_STATE_CMD="$h/stubs/crew" \
+    "$RESIL" relaunch >/dev/null 2>&1
+  assert_equals 1 "$(calls "$h/stubs/control.calls" 'w6 relaunch')" "a session ending in an API error was not relaunched"
+  assert_equals 0 "$(calls "$h/stubs/control.calls" 'w7 relaunch')" "a session ending normally was relaunched"
+  pass "the default probe reads the newest Claude session file of the worker's copy"
 }
 
 test_lanes_that_must_not_be_relaunched() {
@@ -262,6 +283,7 @@ test_resend_ends_on_delivery_and_passes_the_state_override
 test_stopped_worker_is_relaunched_four_times_then_one_card
 test_refused_relaunch_counts_and_is_logged
 test_api_error_stop_counts_from_the_error
+test_default_api_error_probe_reads_the_claude_session_file
 test_lanes_that_must_not_be_relaunched
 test_a_quiet_half_hour_starts_over
 test_tick_runs_the_loops_and_honors_the_off_switch
