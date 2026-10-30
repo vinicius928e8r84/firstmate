@@ -60,7 +60,7 @@ rec_set() {  # <file> <key> <value>
 
 # ------------------------------------------------------------------ resend
 do_resend() {
-  local dir=$STATE/resil/resend args corr rec phase delivered tries last n delay a send_cmd rc out sched n_sched
+  local dir=$STATE/resil/resend args corr rec phase delivered last n delay a send_cmd rc out sched n_sched
   local -a argv
   [ -d "$dir" ] || return 0
   sched=${FM_RESIL_RESEND_SCHEDULE-60 240 900}
@@ -108,9 +108,13 @@ do_resend() {
 
 # ------------------------------------------------------------------ relaunch
 default_apierr() {  # <worktree> -> 0 and the session's last write time when it ends in an API error
-  local wt=$1 dir f
+  local wt=$1 dir f best=
   dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$wt" | sed 's|[^A-Za-z0-9]|-|g')
-  f=$(ls -t "$dir"/*.jsonl 2>/dev/null | head -n 1)
+  for f in "$dir"/*.jsonl; do
+    [ -e "$f" ] || continue
+    if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best=$f; fi
+  done
+  f=$best
   [ -n "$f" ] || return 1
   tail -n 2 "$f" 2>/dev/null | grep -q '"isApiErrorMessage":true' || return 1
   stat -c %Y "$f"
@@ -144,7 +148,7 @@ lane_stopped() {  # <id> <meta>
 }
 
 do_relaunch() {
-  local meta id kind rec since why sched n_sched n last first delay due note ctl out rc a hold
+  local meta id kind rec since why sched n_sched n last first delay due note ctl out rc a
   [ -d "$STATE" ] || return 0
   if fm_hold_active 2>/dev/null; then return 0; fi
   sched=${FM_RESIL_RELAUNCH_SCHEDULE-120 240 480 960}
