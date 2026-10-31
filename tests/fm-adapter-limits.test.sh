@@ -21,7 +21,7 @@ test_shipped_table_passes() {
   out=$("$LIMITS" check 2>&1); rc=$?
   expect_code 0 "$rc" "shipped table check exit"
   assert_contains "$out" "adapter limits ok" "check reports success"
-  assert_equals 200 "$("$LIMITS" get arm_term_wait)" "get prints a row's value"
+  assert_equals 1000 "$("$LIMITS" get arm_term_cleanup)" "get prints a row's value"
   pass "shipped table passes its own check"
 }
 
@@ -31,9 +31,9 @@ test_oversized_knobs_are_refused() {
   out=$(FM_ADAPTER_LIMITS_FILE="$t" "$LIMITS" check 2>&1); rc=$?
   expect_code 1 "$rc" "backoff past the hook timeout"
   assert_contains "$out" "arm_confirm_cap + arm_backoff_cap" "the failed inequality is named"
-  table_with "$t" arm_term_wait 2900
+  table_with "$t" arm_term_cleanup 3100
   out=$(FM_ADAPTER_LIMITS_FILE="$t" "$LIMITS" check 2>&1); rc=$?
-  expect_code 1 "$rc" "TERM wait past the retire allowance"
+  expect_code 1 "$rc" "TERM cleanup past the retire allowance"
   assert_contains "$out" "adapter_retire_allowance" "the retire allowance is named"
   table_with "$t" arm_confirm_base 13
   out=$(FM_ADAPTER_LIMITS_FILE="$t" "$LIMITS" check 2>&1); rc=$?

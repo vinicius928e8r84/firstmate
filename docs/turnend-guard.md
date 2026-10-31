@@ -343,9 +343,10 @@ A claim is open while all of these hold:
 - Its owner is still reachable by its session: it descends from the numeric pid in `state/.lock`, or its recorded `owner_session_id` matches the trusted session id in `state/.lock-session` while the lock-holder pid-identity recorded on entry line 3 still recomputes from that lock's holder pid.
 - It is not stuck.
 
-Stuck means the entry and the watcher beacon are both older than the guard grace, which proves the owner hung mid-arm.
-A healthy hours-long foregrounded cycle keeps the beacon beating, and every arming phase with no watcher is bounded in seconds.
-A missing or malformed lock means no session can receive a rewake, so such a claim is never open.
+The guard classifies an owner as stuck when the entry and the watcher beacon are both older than the guard grace.
+A healthy hours-long foregrounded cycle keeps the beacon beating.
+An unconfirmed startup follows the [arm backstop and safe-interruption contract](watcher-continuity.md#startup-interruption-window), not an unconditional arming deadline.
+A missing or unusable lock means no session can receive a rewake, so such a claim is never open.
 The reachability test is what makes an open claim deliverable: a hook whose session exited mid-cycle stays alive with no parent to receive its exit 2, so deferring to it would leave the replacement session deaf until a captain turn.
 The session-id signal is the second one the claiming hook's own admission accepts, so a background session whose bridge is recycled mid-cycle - breaking the ancestry to its still-live lock owner - keeps its live claim instead of being double-armed.
 Pinning that signal to the lock holder's pid-identity recorded at claim time is what keeps a resumed session, which carries the same conversation id in a new process, from reading its own dead predecessor's orphan as open - a reused pid number is a different identity, so it does not match.

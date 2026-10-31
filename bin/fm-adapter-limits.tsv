@@ -8,5 +8,4 @@ adapter_retire_allowance	3000	ms	limit	Pi, omp, OpenCode adapters: how long a te
 arm_confirm_base	10	s	knob	bin/fm-watch-arm.sh: unloaded confirmation window (FM_ARM_CONFIRM_TIMEOUT)
 arm_confirm_cap	120	s	knob	bin/fm-wake-lib.sh: ceiling of the load-stretched confirmation window (FM_ARM_CONFIRM_CAP)
 arm_backoff_cap	30	s	knob	bin/fm-wake-lib.sh: ceiling of the wait before re-arming after a failed start (FM_ARM_BACKOFF_CAP)
-arm_term_wait	200	ms	knob	bin/fm-watch-arm.sh: wait for a starting watcher to reach cleanup before the TERM is forwarded (FM_ARM_TERM_WAIT_MS)
-arm_term_cleanup	1000	ms	knob	measured upper bound of the rest of the arm's TERM handler on a busy host
+arm_term_cleanup	1000	ms	knob	measured upper bound of the arm's TERM handler once its child has reached the startup safe point, on a busy host

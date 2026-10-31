@@ -35,12 +35,30 @@
 #   watcher: FAILED - attached watcher pid=<N> stalled (beacon <age>s at or past hard bound <bound>s)
 #                                                        - the followed holder is alive but its beacon
 #                                                          reached the stall bound
+#   watcher: FAILED - startup lock <path> held by live pid <N>
+#                                                        - the child's own startup could not
+#                                                          take <path> from a live holder
+#                                                          inside FM_WATCHER_STARTUP_LOCK_BOUND
 # It NEVER reports started/attached/healthy off a stale beacon or a dead/reused pid: a
 # stale-beacon or dead-pid holder either self-heals (the fresh child steals the
 # dead lock per the singleton self-eviction/steal path and is confirmed) or this
 # returns the FAILED line. On started it waits the child and propagates the wake
-# reason; on attached it stays live across identity-matched successors. Once
-# attached, a stale beacon alone does not end the followed cycle: while that
+# reason; on attached it stays live across identity-matched successors.
+#
+# Confirmation is a liveness backstop: the arm keeps waiting while its child is
+# alive and unconfirmed up to CONFIRM_TIMEOUT (the unloaded window, stretched by
+# the host load below), because a timeout TERM used to land before the child
+# could run cleanup and cascade stale locks into the next arm. The child's own
+# startup lock waits are bounded by FM_WATCHER_STARTUP_LOCK_BOUND and fail with
+# the typed line above.
+# Whenever the arm forwards a stop - a signal mid-start or the deadline itself -
+# it TERM's only at the startup safe point: the child's published lock identity,
+# which the child writes immediately after installing its EXIT cleanup trap, so
+# the stop runs through the same downtime publication and lock release as an
+# ordinary exit. A child still before that point when the deadline expires is
+# waited for, never killed mid-claim. A failed identity publication exits through
+# the child's trap instead of leaving a live child that cannot pass this gate.
+# Once attached, a stale beacon alone does not end the followed cycle: while that
 # holder is alive and the lock still names it under the same identity, the arm
 # keeps following it, as a started arm waits out a slow child, until the lock
 # changes or the beacon reaches fm_watcher_stall_bound (bin/fm-wake-lib.sh), the
@@ -81,8 +99,8 @@
 # watcher clears the record. An unloaded host never waits. Helpers and their
 # test overrides live in bin/fm-wake-lib.sh (fm_arm_backoff_*, fm_load_milli).
 # An arm terminated before it confirmed a watcher (an adapter that gave up on a
-# slow start) counts as one more failed start, and leaves within about
-# FM_ARM_TERM_WAIT_MS (default 200) plus its own cleanup, however long its window is.
+# slow start) counts as one more failed start, and leaves once its child reaches
+# the startup safe point above and runs its own cleanup.
 #
 # --budget: print the whole extra seconds a start may take beyond the base
 # FM_ARM_CONFIRM_TIMEOUT - the load stretch of the window plus any back-off still
@@ -190,9 +208,17 @@ WATCH_LOCK="$STATE/.watch.lock"
 BEAT="$STATE/.last-watcher-beat"
 # "Fresh" reuses the guard's threshold so there is one definition of liveness.
 GRACE=${FM_GUARD_GRACE:-300}
+case "$GRACE" in
+  ''|*[!0-9]*) GRACE=300 ;;
+  *) GRACE=$((10#$GRACE)) ;;
+esac
 # How long to wait for a freshly forked watcher to acquire the lock and beat.
-# Git Bash/MSYS pays a much higher fork cost while the watcher completes its
-# required pre-lock migration, so its bounded default covers that cold start.
+# The bound is a liveness backstop, not a fork-budget: watcher startup lock
+# waits are bounded internally (FM_WATCHER_STARTUP_LOCK_BOUND), and the child
+# is only ever stopped at its startup safe point, so a deadline that fires on a
+# fork-heavy start no longer cascades stale locks. Git Bash/MSYS pays a much
+# higher fork cost while the watcher completes its required pre-lock migration,
+# so its default is longer.
 case "${OSTYPE:-}" in
   msys*|mingw*|cygwin*) ARM_CONFIRM_DEFAULT=30 ;;
   *) ARM_CONFIRM_DEFAULT=$(fm_adapter_limit arm_confirm_base) ;;
@@ -203,22 +229,17 @@ CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-$ARM_CONFIRM_DEFAULT}
 case "$CONFIRM_TIMEOUT" in ''|*[!0-9]*) CONFIRM_TIMEOUT=$ARM_CONFIRM_DEFAULT ;; esac
 BASE_CONFIRM_TIMEOUT=$CONFIRM_TIMEOUT
 CONFIRM_TIMEOUT=$(fm_arm_confirm_window "$CONFIRM_TIMEOUT")
-# How long a TERM waits for a starting watcher to reach its cleanup-ready point,
-# in milliseconds (default 200): the Pi, omp and OpenCode adapters allow an arm
-# a few seconds to exit after they terminate it (FM_WATCH_ARM_RETIRE_TIMEOUT_MS),
-# and the rest of the handler costs a second or less on a busy host. Wall-clock,
-# not a poll count, because each poll forks and a loaded host makes polls slow.
-TERM_WAIT_MS=${FM_ARM_TERM_WAIT_MS:-}
-case "$TERM_WAIT_MS" in ''|*[!0-9]*) TERM_WAIT_MS=$(fm_adapter_limit arm_term_wait) ;; esac
-# shellcheck disable=SC2329 # Invoked indirectly by the signal handler below.
-now_ms() {
-  if [ -n "${EPOCHREALTIME:-}" ]; then
-    local t=${EPOCHREALTIME/[.,]/}
-    printf '%s\n' $((t / 1000))
-  else
-    printf '%s\n' $(($(date +%s) * 1000))
-  fi
-}
+# How long an attached arm may wait for a successor to prove itself after a
+# delivery it confirmed. This budget is deliberately short and separate from
+# CONFIRM_TIMEOUT: it answers "did the handoff land" for a watcher that is
+# already known-live, not "may a cold start still be in flight", so it keeps
+# the legacy fork-cost default even when the fresh-child backstop runs long.
+SUCCESSOR_CONFIRM_TIMEOUT=${FM_ARM_SUCCESSOR_CONFIRM_TIMEOUT:-$ARM_CONFIRM_DEFAULT}
+case "$SUCCESSOR_CONFIRM_TIMEOUT" in
+  ''|*[!0-9]*) SUCCESSOR_CONFIRM_TIMEOUT=0 ;;
+  *) SUCCESSOR_CONFIRM_TIMEOUT=$((10#$SUCCESSOR_CONFIRM_TIMEOUT)) ;;
+esac
+[ "$SUCCESSOR_CONFIRM_TIMEOUT" -gt 0 ] || SUCCESSOR_CONFIRM_TIMEOUT=$ARM_CONFIRM_DEFAULT
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
 # The beacon age at which the watcher's own re-arm evicts a live holder; an
@@ -444,14 +465,14 @@ fail_arm_ground_gone() {
   return 1
 }
 
-# Give a successor the same bounded confirmation window used for a fresh child.
-# Adapter-owned continuations normally win immediately, but the bound avoids a
-# false failure when process-close delivery and lock publication cross briefly.
+# Give a successor its own short bounded confirmation window. Adapter-owned
+# continuations normally win immediately, but the bound avoids a false failure
+# when process-close delivery and lock publication cross briefly.
 wait_for_healthy_successor() {
   local deadline
   # date(1) exposes whole seconds. Add one rounding second so a timeout of one
   # second cannot collapse to a few milliseconds when called near a boundary.
-  deadline=$(( $(date +%s) + CONFIRM_TIMEOUT + 1 ))
+  deadline=$(( $(date +%s) + SUCCESSOR_CONFIRM_TIMEOUT + 1 ))
   while :; do
     healthy_watcher && return 0
     arm_ground_gone && return 1
@@ -783,27 +804,43 @@ cleanup_child() {
   fi
 }
 
+# The watcher installs its EXIT cleanup trap immediately after claiming the
+# singleton and publishes its home-bound lock identity right after that. TERM
+# before that identity is complete can still land mid-claim - abandoning the
+# steal mutex or a startup lock - so a stop is forwarded only once the
+# identity matches the child (the startup safe point) or once the state
+# directory holding those locks is gone; otherwise this waits for the child to
+# exit on its own. No deadline overrides it; startup identity-publication
+# failure exits through the child's cleanup rather than stranding this wait.
+term_child_at_safe_point() {
+  # The cheap gate reads only files the child itself writes after its trap
+  # installs: the claimed pid plus all three identity records. The full
+  # fm_watcher_lock_matches_pid proof (a ps-backed identity compare) is not
+  # needed here - our own child pid cannot be recycled while it still lives -
+  # and would add a ps fork per iteration on a host that is already loaded.
+  while fm_pid_alive "$child"; do
+    if [ ! -d "$STATE" ]; then
+      kill -TERM "$child" 2>/dev/null || true
+      break
+    fi
+    if [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" = "$child" ] \
+      && [ -s "$WATCH_LOCK/fm-home" ] \
+      && [ -s "$WATCH_LOCK/watcher-path" ] \
+      && [ -s "$WATCH_LOCK/pid-identity" ]; then
+      kill -TERM "$child" 2>/dev/null || true
+      break
+    fi
+    sleep 0.1
+  done
+  wait "$child" 2>/dev/null
+}
+
 # shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
 handle_arm_signal() {
   local signal=$1 rc=$2
   trap - HUP TERM INT
   if [ -n "$child" ] && fm_pid_alive "$child"; then
-    # The watcher installs its own cleanup traps only after acquiring and
-    # publishing the home-bound lock identity. Do not TERM it in the middle of
-    # stale-lock acquisition: that can abandon the steal mutex. Let startup
-    # reach that cleanup-ready point (or exit naturally) before forwarding TERM,
-    # but never past the startup confirmation deadline nor FM_ARM_TERM_WAIT_MS.
-    local term_deadline_ms=$(( $(now_ms) + TERM_WAIT_MS ))
-    while fm_pid_alive "$child"; do
-      if [ "$(now_ms)" -ge "$term_deadline_ms" ] \
-        || fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$child" "$FM_HOME" \
-        || [ "$(date +%s)" -ge "$deadline" ]; then
-        kill -TERM "$child" 2>/dev/null || true
-        break
-      fi
-      sleep 0.02
-    done
-    wait "$child" 2>/dev/null || true
+    term_child_at_safe_point
     # Terminated before it confirmed a watcher: one more failed start.
     [ "${ARM_CHILD_CONFIRMED:-0}" -eq 1 ] || fm_arm_backoff_note_failure "$STATE"
   fi
@@ -1007,8 +1044,8 @@ while :; do
     exit $?
   fi
   if arm_ground_gone; then
+    term_child_at_safe_point
     cleanup_child
-    wait "$child" 2>/dev/null || true
     fail_arm_ground_gone
     exit 1
   fi
@@ -1016,11 +1053,20 @@ while :; do
   sleep 0.2
 done
 
+# The backstop expired: forward the stop only at the same safe point the
+# signal path waits for, so the child always exits through watcher_cleanup.
+if [ -n "$child" ] && fm_pid_alive "$child"; then
+  term_child_at_safe_point
+  rc=$?
+else
+  wait "$child" 2>/dev/null
+  rc=$?
+fi
 trap - HUP TERM INT
+# Startup can fail while the safe-point wait is still joining the child.
+# Read its final output only after that join, before cleanup removes the file.
 print_watch_output "$child_out"
 cleanup_child
-wait "$child" 2>/dev/null
-rc=$?
 cycle_log_append "$rc" "$(cycle_signal_name "$rc")" confirmation-timeout none
 fm_arm_backoff_note_failure "$STATE"
 echo "watcher: FAILED - no live watcher with a fresh beacon"
