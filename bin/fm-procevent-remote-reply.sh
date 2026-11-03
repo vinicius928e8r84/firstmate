@@ -10,6 +10,8 @@
 #   fm-procevent-remote-reply.sh self-announcing
 #   fm-procevent-remote-reply.sh source-id <secondmate-id>
 #   fm-procevent-remote-reply.sh relisten
+#   fm-procevent-remote-reply.sh listener-error <secondmate-id> <arm|copy> <detail...>
+#   fm-procevent-remote-reply.sh listener-ok <secondmate-id>
 #   fm-procevent-remote-reply.sh retire <secondmate-id>
 #
 # `arm` registers one blocking, non-destructive delta source for the remote
@@ -23,6 +25,14 @@
 # window, so it relistens too (see JOB_PREEMPTED below).
 # A continuity break is escalated and not re-armed, so the registration is dropped
 # and the runner stops. The runner does not refresh the owner lease.
+#
+# A listener that cannot copy or cannot be armed is never silent. The process-event
+# runner discards an adapter's output, so this adapter records the failure itself:
+# state/remote-replies/<id>.listener-error holds the phase (arm or copy), when,
+# the exit status, and the first error line, and ONE keyed blocker
+# `remote-reply-listener-<id>` is raised in the parent's state/<id>.status. While
+# that blocker is open a repeat of the same failure raises nothing more, and the
+# next successful arm or copy removes the record and closes the blocker.
 #
 # `autohandle` is the runner's own entry into that same `handle`: it takes the
 # canonical source id instead of the secondmate id and is called by the runner
@@ -97,7 +107,7 @@ DOCUMENT_LOCAL_FAILURE=2
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-usage() { sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,75p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -266,14 +276,91 @@ remote_route_exists() {
   [ "$remote" = 1 ] || die "secondmate $id is not a configured remote route"
 }
 
+listener_error_path() { printf '%s/%s.listener-error\n' "$CURSOR_DIR" "$1"; }
+listener_key() { printf 'remote-reply-listener-%s\n' "$1"; }
+
+# One line of plain text from arbitrary error output: control bytes dropped, the
+# first nonblank line only, at most 160 characters.
+listener_detail() { # <text>
+  printf '%s\n' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177' \
+    | awk 'NF { sub(/^[ \t]+/, ""); print substr($0, 1, 160); exit }'
+}
+
+listener_alert_open() { # <id>
+  status_open_decisions "$STATE/$1.status" | cut -f1 | grep -Fqx -- "$(listener_key "$1")"
+}
+
+# Record why the reply listener for <id> stopped copying or could not be armed,
+# and raise one alert. A failure that is already alerted and still open adds no
+# second blocker; a new failure after the blocker closed raises a new one.
+record_listener_error() { # <id> <arm|copy> <detail> [<sequence> <exit-status>]
+  local id=$1 phase=$2 detail rec dir tmp status_file line key append_rc=0
+  detail=$(listener_detail "$3")
+  [ -n "$detail" ] || detail='no error output'
+  dir=$CURSOR_DIR
+  rec=$(listener_error_path "$id")
+  mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" 2>/dev/null || true
+  tmp="$dir/.listener-error.$id.$$"
+  if printf 'schema=fm-remote-reply-listener-error.v1\nphase=%s\nat_epoch=%s\nsequence=%s\nexit_status=%s\ndetail=%s\n' \
+    "$phase" "$(fm_pending_reply_now)" "${4:-}" "${5:-}" "$detail" > "$tmp" 2>/dev/null; then
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$rec" 2>/dev/null || rm -f -- "$tmp"
+  else
+    rm -f -- "$tmp" 2>/dev/null || true
+  fi
+  status_file="$STATE/$id.status"
+  [ ! -L "$status_file" ] || return 1
+  listener_alert_open "$id" && return 0
+  key=$(listener_key "$id")
+  line="blocked [key=$key]: remote reply listener for $id stopped copying replies ($phase failed: $detail); its status here goes stale until the listener is re-armed (fm-procevent-remote-reply.sh arm $id); error recorded in state/remote-replies/$id.listener-error"
+  append_status_once "$status_file" "$(status_stamp_line "$line")" || append_rc=$?
+  [ "$append_rc" -ne 2 ] || return 1
+  return 0
+}
+
+# The listener for <id> armed or copied successfully: drop the error record and
+# close the blocker it raised. Quiet when there is nothing to clear.
+clear_listener_error() { # <id>
+  local id=$1 rec key status_file
+  rec=$(listener_error_path "$id")
+  [ -e "$rec" ] || [ -L "$rec" ] || return 0
+  rm -f -- "$rec"
+  status_file="$STATE/$id.status"
+  listener_alert_open "$id" || return 0
+  key=$(listener_key "$id")
+  fm_wake_status_append_self_announced "$STATE" "$status_file" \
+    "resolved [key=$key]: remote reply listener for $id is copying replies again" >/dev/null 2>&1 || true
+}
+
+cmd_listener_error() { # <id> <arm|copy> <detail...>
+  local id=${1:-} phase=${2:-}
+  validate_id "$id"
+  case "$phase" in arm|copy) ;; *) die "listener phase must be arm or copy: $phase" ;; esac
+  shift 2
+  record_listener_error "$id" "$phase" "$*"
+}
+
+cmd_listener_ok() { # <id>
+  validate_id "${1:-}"
+  clear_listener_error "$1"
+}
+
 cmd_arm_locked() {
-  local id=${1:-} sid
+  local id=${1:-} sid arm_err
   validate_id "$id"
   remote_route_exists "$id"
   read_cursor "$id"
   sid=$(source_id "$id")
-  "$SCRIPT_DIR/fm-procevent.sh" register remote-reply "$sid" -- \
-    "$SCRIPT_DIR/fm-procevent-remote-reply.sh" source "$id" || return 1
+  arm_err=$(mktemp "${TMPDIR:-/tmp}/fm-remote-reply-arm.XXXXXX") || return 1
+  if ! "$SCRIPT_DIR/fm-procevent.sh" register remote-reply "$sid" -- \
+    "$SCRIPT_DIR/fm-procevent-remote-reply.sh" source "$id" 2> "$arm_err"; then
+    record_listener_error "$id" arm "$(cat "$arm_err" 2>/dev/null)" || true
+    cat "$arm_err" >&2
+    rm -f -- "$arm_err"
+    return 1
+  fi
+  rm -f -- "$arm_err"
+  clear_listener_error "$id"
   printf 'armed: %s offset=%s\n' "$sid" "$CURSOR_OFFSET"
 }
 
@@ -708,14 +795,23 @@ cmd_handle_locked() {
 # continuity break is fully handled too, so its distinct exit 3 is a success
 # here; only a genuine handling failure leaves the result for the handler.
 cmd_autohandle() {
-  local sid=${1:-} seq=${2:-} result=${3:-} id rc=0
+  local sid=${1:-} seq=${2:-} result=${3:-} id rc=0 handle_err
   case "$sid" in
     remote-reply-?*) id=${sid#remote-reply-} ;;
     *) die "not a remote reply source: $sid" ;;
   esac
   validate_id "$id"
   [ "$(source_id "$id")" = "$sid" ] || die "source id does not identify one secondmate: $sid"
-  cmd_handle "$id" "$seq" "$result" || rc=$?
+  # The runner discards this command's output, so a failed copy is recorded and
+  # alerted here rather than lost (see the listener-failure note in the header).
+  handle_err=$(mktemp "${TMPDIR:-/tmp}/fm-remote-reply-handle.XXXXXX") || handle_err=/dev/null
+  cmd_handle "$id" "$seq" "$result" 2> "$handle_err" || rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+    record_listener_error "$id" copy "$(cat "$handle_err" 2>/dev/null)" "$seq" "$rc" || true
+  else
+    clear_listener_error "$id"
+  fi
+  [ "$handle_err" = /dev/null ] || { cat "$handle_err" >&2; rm -f -- "$handle_err"; }
   [ "$rc" -eq 3 ] && rc=0
   return "$rc"
 }
@@ -836,6 +932,8 @@ case "${1:-}" in
   self-announcing) shift; [ "$#" -eq 0 ] || usage; exit 0 ;;
   source-id) shift; [ "$#" -eq 1 ] || usage; source_id "$1" ;;
   relisten) shift; [ "$#" -eq 0 ] || usage; exit 0 ;;
+  listener-error) shift; [ "$#" -ge 3 ] || usage; cmd_listener_error "$@" ;;
+  listener-ok) shift; [ "$#" -eq 1 ] || usage; cmd_listener_ok "$@" ;;
   retire) shift; [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage; cmd_retire "$@" ;;
   retire-quiesce-locked) shift; [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage; require_parent_lifecycle_lock "$1"; cmd_retire_quiesce_locked "$@" ;;
   retire-finalize-locked) shift; [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage; require_parent_lifecycle_lock "$1"; cmd_retire_finalize_locked "$@" ;;

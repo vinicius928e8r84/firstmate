@@ -617,8 +617,14 @@ assert_grep 'cannot extract remote document pointers' "$TMP_ROOT/extract-fail.ou
   "the failed extraction pass did not report its failure"
 [ "$(cat "$PARENT/state/remote-replies/ios.cursor")" = "$extractfail_cursor_before" ] \
   || fail "a failed extraction pass advanced the cursor past dropped status content"
-cmp -s "$TMP_ROOT/ios-status-before-extractfail" "$PARENT/state/ios.status" \
-  || fail "a failed extraction pass appended partial or blank status content"
+# The runner's own autohandle failed the same way, so a listener alert may join the log; it is the
+# only line the failed pass may add, and every other line must be untouched.
+grep -vF 'remote-reply-listener-ios' "$PARENT/state/ios.status" > "$TMP_ROOT/ios-status-after-extractfail"
+grep -vF 'remote-reply-listener-ios' "$TMP_ROOT/ios-status-before-extractfail" > "$TMP_ROOT/ios-status-before-extractfail.plain"
+cmp -s "$TMP_ROOT/ios-status-before-extractfail.plain" "$TMP_ROOT/ios-status-after-extractfail" \
+  || fail "a failed extraction pass appended partial or blank status content: $(diff "$TMP_ROOT/ios-status-before-extractfail.plain" "$TMP_ROOT/ios-status-after-extractfail" | head -5)"
+assert_contains "$(status_open_decisions "$PARENT/state/ios.status")" $'remote-reply-listener-ios\t' \
+  "a failed extraction pass in the runner raised no listener alert"
 remote_env "$ADAPTER" handle ios "$GEN" "$RESULT_EXTRACTFAIL" >/dev/null \
   || fail "the delta did not apply once pointer extraction worked again"
 assert_grep 'report=data/remote-secondmates/ios/data/reply/extractfail.md' "$PARENT/state/ios.status" \
@@ -1297,5 +1303,46 @@ assert_absent "$PARENT/state/remote-replies/ios.cursor" \
 [ "$(cat "$PARENT/state/remote-replies/ios.retirements")" = "$count_before" ] \
   || fail "a retirement that stopped after removal changed the count"
 pass "a retirement that stops after removing the cursor leaves the old count"
+
+# A listener that cannot copy or cannot be armed is never silent: the runner discards the adapter's
+# output, so the adapter records the error itself and raises one keyed blocker for the parent.
+LISTENER_ERR="$PARENT/state/remote-replies/ios.listener-error"
+LISTENER_STATUS="$PARENT/state/ios.status"
+listener_closes() { grep -cF 'resolved [key=remote-reply-listener-ios]' "$LISTENER_STATUS" || true; }
+listener_blockers() { grep -cF 'blocked [key=remote-reply-listener-ios]' "$LISTENER_STATUS" || true; }
+printf 'schema=not-a-delta\n\n' > "$TMP_ROOT/listener-bad.result"
+blockers_before=$(listener_blockers)
+set +e
+remote_env "$ADAPTER" autohandle remote-reply-ios 901 "$TMP_ROOT/listener-bad.result" >/dev/null 2>&1
+listener_rc=$?
+set -e
+[ "$listener_rc" -ne 0 ] || fail "a result the adapter cannot copy was reported as handled"
+assert_present "$LISTENER_ERR" "a failed copy did not record its error"
+assert_grep 'phase=copy' "$LISTENER_ERR" "the recorded error did not name the copy phase"
+assert_grep 'malformed' "$LISTENER_ERR" "the recorded error lost the reason the copy failed"
+assert_grep 'sequence=901' "$LISTENER_ERR" "the recorded error lost the failing sequence"
+[ "$(listener_blockers)" -eq $((blockers_before + 1)) ] || fail "a failed copy did not raise exactly one alert"
+assert_contains "$(status_open_decisions "$LISTENER_STATUS")" $'remote-reply-listener-ios\t' \
+  "the listener alert is not an open decision"
+set +e
+remote_env "$ADAPTER" autohandle remote-reply-ios 902 "$TMP_ROOT/listener-bad.result" >/dev/null 2>&1
+set -e
+remote_env "$ADAPTER" listener-error ios arm "ssh: connection refused" >/dev/null 2>&1
+[ "$(listener_blockers)" -eq $((blockers_before + 1)) ] || fail "a repeat failure while the alert is open raised another alert"
+assert_grep 'phase=arm' "$LISTENER_ERR" "the newest failure was not the one recorded"
+assert_grep 'connection refused' "$LISTENER_ERR" "the newest failure's reason was not recorded"
+closes_before=$(listener_closes)
+remote_env "$ADAPTER" listener-ok ios >/dev/null 2>&1
+assert_absent "$LISTENER_ERR" "a recovered listener kept its error record"
+[ -z "$(status_open_decisions "$LISTENER_STATUS" | grep -F $'remote-reply-listener-ios\t')" ] \
+  || fail "a recovered listener left its alert open"
+assert_grep 'resolved [key=remote-reply-listener-ios]' "$LISTENER_STATUS" "the recovery did not close the alert"
+remote_env "$ADAPTER" listener-ok ios >/dev/null 2>&1
+[ "$(listener_closes)" -eq $((closes_before + 1)) ] \
+  || fail "a repeated recovery closed the alert twice"
+remote_env "$ADAPTER" listener-error ios arm "ssh: connection refused" >/dev/null 2>&1
+[ "$(listener_blockers)" -eq $((blockers_before + 2)) ] || fail "a failure after the alert closed did not raise a new alert"
+remote_env "$ADAPTER" listener-ok ios >/dev/null 2>&1
+pass "a listener that cannot copy or arm records its error and raises one alert until it recovers"
 
 echo "ALL TESTS PASSED"
