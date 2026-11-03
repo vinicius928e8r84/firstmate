@@ -3,7 +3,8 @@
 # optionally acknowledge handled records,
 # annotate every unread line for validated signal status keys, surface unread
 # informational status lines, latest captain-facing statuses not covered by a
-# newer branch outcome, OPEN DECISIONS, captain-call record divergence, and on
+# newer branch outcome, OPEN DECISIONS, captain-call record divergence,
+# MERGE-READY reports still waiting for a merge, and on
 # a supervision-host home the supervision session's new and unprocessed
 # outcomes (BRANCH OUTCOMES), then assert liveness.
 #
@@ -705,6 +706,54 @@ EOF
   printf 'RECORD DIVERGENCE: reconcile each one - record the captain'"'"'s own words with bin/fm-captain-hold.sh answer <task> --decision-file <path>, or re-open the status decision when that resolution was not the captain'"'"'s word.\n' || return 1
 }
 
+# Print MERGE-READY WAITING: every PR a task reported MERGE-READY that no later
+# status line says was merged, fleet-wide and oldest first, because the wake
+# annotation shows only the newest event of a task and a later routine line
+# buries the ask (fm-classify-lib.sh's scan_merge_ready_waiting owns what counts
+# and its heuristic). A reminder rather than news: it prints on every
+# presentation while a PR waits, so the quiet-wake probe deliberately does not
+# count it. Bounded and silent when nothing waits. A scan failure never changes
+# the drain's exit status.
+print_merge_ready_waiting_section() {
+  local snapshot=${1:-} rows task first label note line age now shown=0 omitted=0 bytes
+  local output='' used=0 item_bytes=260 global_bytes=2600
+
+  [ -n "$snapshot" ] || return 0
+  now=$(date +%s)
+  rows=$(scan_merge_ready_waiting "$STATE" "$snapshot" "$now" 2>/dev/null) || return 0
+  [ -n "$rows" ] || return 0
+
+  while IFS=$(printf '\t') read -r task first label note; do
+    [ -n "$task" ] || continue
+    if [ "${first:-0}" -gt 0 ] 2>/dev/null; then
+      age="waiting $(( (now - first) / 3600 ))h"
+    else
+      age="waiting, age unknown"
+    fi
+    line="$task $label MERGE-READY $age: $note"
+    fm_cap_line_var "$line" $((item_bytes - 1))
+    line=$FM_LINE_CAP_LINE
+    bytes=$(( ${#line} + 1 ))
+    if [ $((used + bytes)) -gt "$global_bytes" ]; then
+      omitted=$((omitted + 1))
+      continue
+    fi
+    output="$output$line
+"
+    used=$((used + bytes))
+    shown=$((shown + 1))
+  done <<EOF
+$rows
+EOF
+
+  [ "$shown" -gt 0 ] || [ "$omitted" -gt 0 ] || return 0
+  printf 'MERGE-READY WAITING (reported ready, no later status says it was merged - confirm each PR'"'"'s live state before asking the captain):\n' || return 1
+  printf '%s' "$output" || return 1
+  if [ "$omitted" -gt 0 ]; then
+    printf 'MERGE-READY WAITING: %d more omitted (byte cap)\n' "$omitted" || return 1
+  fi
+}
+
 # Print BRANCH OUTCOMES: what the supervision host's session recorded since
 # main last drained (docs/supervision-host.md "Captain outcomes"). Off Pi this
 # presentation is what the Pi branch's transcript entries are. It runs only for
@@ -891,7 +940,8 @@ print_status_sections() {
     print_unread_status_section "$snapshot" \
       && print_status_outcome_backstop_section "$snapshot" \
       && print_open_decisions_section "$snapshot" \
-      && print_record_divergence_section
+      && print_record_divergence_section \
+      && print_merge_ready_waiting_section "$snapshot"
   } > "$prepared"; then
     rm -f -- "$prepared"
     return 1

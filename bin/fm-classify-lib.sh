@@ -1964,6 +1964,93 @@ $snapshot
 EOF
 }
 
+# --- MERGE-READY still waiting for a merge ----------------------------------
+#
+# A worker or secondmate reports a PR ready for the captain's merge call as a
+# free-text status line containing MERGE-READY. The wake annotation only shows
+# the newest event of a task, so a later routine line buries that ask and the
+# PR can sit ready for hours. scan_merge_ready_waiting is the ONE owner of "which
+# MERGE-READY reports have no merge after them": it reads each listed status log
+# whole and prints one tab-separated row per PR, oldest first: task, first
+# MERGE-READY epoch (0 when no line carries [at=]), label (full URL when the line
+# names one, else "PR <n>"), and the newest MERGE-READY note.
+# The PR is identified from the line (a /pull/<n> or /merge_requests/<n> URL,
+# "PR <n>", "#<n>", or a leading "<n>"); a report naming none is kept only
+# until a later merge-word line of the same task. A later line retires a report
+# when it says merged, mesclado, landed, closed, or abandoned (never "not
+# merged") and names that PR's URL, or carries its number as a whole word. This
+# is a text heuristic over unstructured lines, so the section it feeds tells
+# the reader to confirm each PR's live state. Reports older than
+# FM_MERGE_READY_MAX_AGE_DAYS (default 7) stop being listed so a forgotten log
+# cannot nag forever.
+scan_merge_ready_waiting() {  # <state> <task-and-endpoint-snapshot> <now-epoch>
+  local state=$1 snapshot=$2 now=$3 task endpoint ident f max_days
+  local files=()
+  max_days=${FM_MERGE_READY_MAX_AGE_DAYS:-7}
+  case "$max_days" in ''|*[!0-9]*|0) max_days=7 ;; esac
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  while IFS=$(printf '\t') read -r task endpoint ident; do
+    [ -n "$task" ] || continue
+    f="$state/$task.status"
+    [ -f "$f" ] && [ -r "$f" ] || continue
+    files+=("$f")
+  done <<EOF
+$snapshot
+EOF
+  [ "${#files[@]}" -gt 0 ] || return 0
+  awk -v now="$now" -v max_age=$((max_days * 86400)) '
+    function pr_number(text,   m, url) {
+      if (match(text, /https?:\/\/[^ )]*\/(pull|pulls|merge_requests)\/[0-9]+/)) {
+        url = substr(text, RSTART, RLENGTH); match(url, /[0-9]+$/); return substr(url, RSTART)
+      }
+      if (match(text, /(PR|MR|pull request)[ #]*[0-9]+/)) { m = substr(text, RSTART, RLENGTH); match(m, /[0-9]+$/); return substr(m, RSTART) }
+      if (match(text, /#[0-9]+/)) return substr(text, RSTART + 1, RLENGTH - 1)
+      if (match(text, /^[0-9]+([ :,]|$)/)) { m = substr(text, 1, RLENGTH); gsub(/[^0-9]/, "", m); return m }
+      return ""
+    }
+    function has_number(text, n) { return text ~ ("(^|[^0-9A-Za-z])" n "($|[^0-9A-Za-z])") }
+    FNR == 1 { task = FILENAME; sub(/.*\//, "", task); sub(/\.status$/, "", task) }
+    {
+      line = $0; seq++
+      t = 0
+      if (match(line, /\[at=[0-9]+\]/)) t = substr(line, RSTART + 4, RLENGTH - 5) + 0
+      note = line; sub(/^[A-Za-z-]+( \[[^]]*\])*:[ \t]*/, "", note)
+      if (line ~ /MERGE-READY/ && line !~ /([Nn]ot|NOT|no longer|n[ãa]o) +(yet +)?MERGE-READY/) {
+        url = ""
+        n = pr_number(note)
+        if (match(note, /https?:\/\/[^ )]*\/(pull|pulls|merge_requests)\/[0-9]+/)) url = substr(note, RSTART, RLENGTH)
+        key = task SUBSEP (n == "" ? "?" SUBSEP seq : n)
+        if (!(key in first_t)) { first_t[key] = t; keys[++nkeys] = key }
+        last_t[key] = t; last_seq[key] = seq; last_task[key] = task
+        label[key] = url != "" ? url : (n != "" ? "PR " n : "(PR not named)")
+        num[key] = n; text[key] = note
+        next
+      }
+      if (line ~ /([Mm]erged|MERGED|mesclad|[Ll]anded|[Cc]losed|[Aa]bandon)/ \
+          && line !~ /([Nn]ot|NOT|[Uu]n|never|n[ãa]o) ?(yet )?(merged|mesclad)/ \
+          && line !~ /([Mm]erged|MERGED) (main|master|origin)|merge conflict/) {
+        nm++; m_task[nm] = task; m_seq[nm] = seq; m_t[nm] = t; m_line[nm] = line
+        m_hasurl[nm] = (line ~ /\/(pull|pulls|merge_requests)\/[0-9]+/)
+      }
+    }
+    END {
+      for (i = 1; i <= nkeys; i++) {
+        key = keys[i]; retired = 0
+        if (last_t[key] > 0 && now - last_t[key] > max_age) continue
+        for (j = 1; j <= nm && !retired; j++) {
+          if (m_task[j] == last_task[key] && m_seq[j] <= last_seq[key]) continue
+          if (m_task[j] != last_task[key] && !(m_t[j] > 0 && m_t[j] >= last_t[key])) continue
+          if (num[key] == "") { retired = (m_task[j] == last_task[key]); continue }
+          if (label[key] ~ /^http/ && index(m_line[j], label[key])) retired = 1
+          else if (!m_hasurl[j] && has_number(m_line[j], num[key])) retired = 1
+        }
+        if (retired) continue
+        out = text[key]; gsub(/[\t\r\n]+/, " ", out)
+        printf "%s\t%d\t%s\t%s\n", last_task[key], first_t[key], label[key], out
+      }
+    }' "${files[@]}" | sort -t "$(printf '\t')" -k2,2n
+}
+
 # --- unread status lines since the presentation cursor ----------------------
 #
 # The drain annotation historically printed only the newest status line, so a
