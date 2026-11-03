@@ -62,7 +62,11 @@
 #                           escalation was closed again (see the escalation
 #                           lifecycle note below); empty until then
 #   resolved_epoch=
-#   resolved_via=           status | document | helper | empty
+#   resolved_via=           status | document | helper | ghost-close | superseded | empty
+#   answer_only=            1 when the request only answered an open decision (fm-send
+#                           --resolve-key); it never supersedes an earlier order
+#   superseded_by=          corr of the later order that replaced this undelivered one
+#                           (see the superseded undelivered orders section)
 #   wrong_home_hits=        count of corr sightings under the secondmate home
 #   wrong_home_first_sighting= encoded path:line identity of the first sighting
 #   wrong_home_sightings=   comma-separated encoded path:line identities
@@ -1474,8 +1478,16 @@ fm_pending_reply_tick_one() {  # <state-dir> <corr_id> <busy_state> [secondmate-
   delivered=$(fm_pending_reply_get "$rec" delivered_epoch)
   if [ -z "$delivered" ]; then
     case "$phase" in
-      delivery_unknown) fm_pending_reply_maybe_escalate "$state" "$corr" 2>/dev/null || true ;;
-      escalated) fm_pending_reply_try_resolve "$state" "$corr" >/dev/null 2>&1 || true ;;
+      delivery_unknown)
+        # A correlated report still wins; only a silent older order is superseded.
+        fm_pending_reply_try_resolve "$state" "$corr" >/dev/null 2>&1 && return 0
+        fm_pending_reply_supersede_if_later "$state" "$corr" 2>/dev/null && return 0
+        fm_pending_reply_maybe_escalate "$state" "$corr" 2>/dev/null || true
+        ;;
+      escalated)
+        fm_pending_reply_try_resolve "$state" "$corr" >/dev/null 2>&1 && return 0
+        fm_pending_reply_supersede_if_later "$state" "$corr" 2>/dev/null || true
+        ;;
     esac
     return 0
   fi
@@ -1970,4 +1982,150 @@ fm_pending_reply_close_ghost() {  # <state-dir> <corr_id> <reason>
     esac
   fi
   return 0
+}
+
+# --- superseded undelivered orders -------------------------------------------
+#
+# A marked order that never reached its mate (delivery_unknown, or escalated
+# before any delivery) stays the owner's to resend under the same correlation.
+# Once a LATER order to the same task has been delivered, or may have been (its
+# own delivery is confirmed or unknown), the earlier one is superseded: the mate
+# acts on the newer order, so resending the older one only re-opens a decision
+# nobody can answer. fm-send refuses that resend once, loudly, naming the later
+# order, and the tick resolves the superseded record via=superseded and closes
+# its escalation decision through the one close path above, so no ghost blocker
+# is left for an operator to close by hand. A delivered order is never
+# superseded: an unanswered delivered order is a missed report, a different
+# failure with its own recovery.
+
+# 0 when <record-path> is a later order that may have reached its mate: it is
+# delivered, or its delivery is unknown, escalated, or already settled. A send
+# still in flight (awaiting_report, undelivered) does not count, because a failed
+# send discards its record and must not retire an older order that was never
+# replaced.
+_fm_pending_reply_may_have_arrived() {  # <record-path>
+  local rec=$1 phase
+  [ "$(fm_pending_reply_get "$rec" answer_only)" != 1 ] || return 1
+  [ -z "$(fm_pending_reply_get "$rec" delivered_epoch)" ] || return 0
+  phase=$(fm_pending_reply_get "$rec" phase)
+  case "$phase" in delivery_unknown|escalated|resolved) return 0 ;; esac
+  return 1
+}
+
+# Prints the correlation of the earliest later order to <corr_id>'s task that may
+# have reached its mate, and returns 0; returns 1 when there is none or when
+# <corr_id> is itself delivered (only an undelivered order can be superseded).
+fm_pending_reply_later_order() {  # <state-dir> <corr_id>
+  local state=$1 corr=$2 dir rec own task created other_created best='' best_created=''
+  dir=$(fm_pending_reply_dir "$state")
+  own=$(fm_pending_reply_path "$state" "$corr")
+  [ -f "$own" ] || return 1
+  [ -z "$(fm_pending_reply_get "$own" delivered_epoch)" ] || return 1
+  task=$(fm_pending_reply_get "$own" task_id)
+  created=$(fm_pending_reply_get "$own" created_epoch)
+  case "$created" in ''|*[!0-9]*) return 1 ;; esac
+  for rec in "$dir"/*; do
+    [ -f "$rec" ] || continue
+    case "${rec##*/}" in .*|"$corr") continue ;; esac
+    [ "$(fm_pending_reply_get "$rec" task_id)" = "$task" ] || continue
+    other_created=$(fm_pending_reply_get "$rec" created_epoch)
+    case "$other_created" in ''|*[!0-9]*) continue ;; esac
+    [ "$other_created" -gt "$created" ] || continue
+    _fm_pending_reply_may_have_arrived "$rec" || continue
+    if [ -z "$best" ] || [ "$other_created" -lt "$best_created" ]; then
+      best=${rec##*/}
+      best_created=$other_created
+    fi
+  done
+  [ -n "$best" ] || return 1
+  printf '%s' "$best"
+}
+
+# Resolve an undelivered order <corr_id> as superseded by <by_corr> and close its
+# escalation decision. 0 when it is (now or already) superseded, 1 when it cannot
+# be: delivered, not found, a send still in flight, or a failed write.
+fm_pending_reply_supersede() {  # <state-dir> <corr_id> <by_corr>
+  local state=$1 corr=$2 by=$3 rec phase marker entry now rc=0
+  local STATE FM_WAKE_QUEUE FM_WAKE_QUEUE_LOCK lock
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  [ -f "$rec" ] && [ ! -L "$rec" ] || return 1
+  STATE=$state
+  lock="$state/.pending-reply-$corr.lock"
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$_FM_PENDING_REPLY_LIB_DIR/fm-wake-lib.sh"
+  fm_lock_acquire_wait "$lock" || return 1
+  _fm_pending_reply_reconcile_delivery_locked "$state" "$corr" || true
+  phase=$(fm_pending_reply_get "$rec" phase)
+  if [ "$phase" = resolved ]; then
+    [ "$(fm_pending_reply_get "$rec" resolved_via)" = superseded ] || rc=1
+    [ "$rc" -ne 0 ] || _fm_pending_reply_close_escalation_locked "$state" "$corr" || true
+    fm_lock_release "$lock"
+    return "$rc"
+  fi
+  case "$phase" in awaiting_report|delivery_unknown|escalated) ;; *) fm_lock_release "$lock"; return 1 ;; esac
+  if [ -n "$(fm_pending_reply_get "$rec" delivered_epoch)" ]; then
+    fm_lock_release "$lock"
+    return 1
+  fi
+  marker=$(fm_pending_reply_delivery_confirmation_path "$state" "$corr")
+  if [ -f "$marker" ]; then
+    entry=$(cat "$marker" 2>/dev/null || true)
+    # A fresh attempt marker is a send in flight on this very correlation.
+    if [ "$phase" = awaiting_report ] && [ "${entry%%=*}" = attempted ]; then
+      fm_lock_release "$lock"
+      return 1
+    fi
+  fi
+  now=$(fm_pending_reply_now)
+  fm_pending_reply_set "$rec" superseded_by "$by" &&
+    fm_pending_reply_set "$rec" ghost_reason "superseded by a later order (corr=$by)" &&
+    fm_pending_reply_set "$rec" phase resolved &&
+    fm_pending_reply_set "$rec" resolved_epoch "$now" &&
+    fm_pending_reply_set "$rec" resolved_via superseded || rc=1
+  if [ "$rc" -eq 0 ]; then
+    rm -f -- "$marker" 2>/dev/null || true
+    _fm_pending_reply_close_escalation_locked "$state" "$corr" || true
+  fi
+  fm_lock_release "$lock"
+  return "$rc"
+}
+
+# Supersede <corr_id> when a later order covers it. 0 when it was superseded.
+fm_pending_reply_supersede_if_later() {  # <state-dir> <corr_id>
+  local state=$1 corr=$2 later
+  later=$(fm_pending_reply_later_order "$state" "$corr") || return 1
+  fm_pending_reply_supersede "$state" "$corr" "$later"
+}
+
+# Supersede every undelivered order to the same task that <new_corr> replaces.
+# Prints the number superseded.
+fm_pending_reply_supersede_older() {  # <state-dir> <new_corr>
+  local state=$1 new=$2 dir rec own task created other_created n=0
+  dir=$(fm_pending_reply_dir "$state")
+  own=$(fm_pending_reply_path "$state" "$new")
+  [ -f "$own" ] || { printf '0'; return 0; }
+  [ "$(fm_pending_reply_get "$own" answer_only)" != 1 ] || { printf '0'; return 0; }
+  task=$(fm_pending_reply_get "$own" task_id)
+  created=$(fm_pending_reply_get "$own" created_epoch)
+  case "$created" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  for rec in "$dir"/*; do
+    [ -f "$rec" ] || continue
+    case "${rec##*/}" in .*|"$new") continue ;; esac
+    [ "$(fm_pending_reply_get "$rec" task_id)" = "$task" ] || continue
+    other_created=$(fm_pending_reply_get "$rec" created_epoch)
+    case "$other_created" in ''|*[!0-9]*) continue ;; esac
+    [ "$other_created" -lt "$created" ] || continue
+    [ "$(fm_pending_reply_get "$rec" phase)" != resolved ] || continue
+    fm_pending_reply_supersede_if_later "$state" "${rec##*/}" && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+
+# 0 when <corr_id> was already resolved as superseded by a later order.
+fm_pending_reply_corr_superseded() {  # <state-dir> <corr_id>
+  local rec
+  printf '%s' "$2" | grep -Eq '^[A-Fa-f0-9]{16}$' || return 1
+  rec=$(fm_pending_reply_path "$1" "$2")
+  [ -f "$rec" ] || return 1
+  [ "$(fm_pending_reply_get "$rec" resolved_via)" = superseded ]
 }

@@ -116,6 +116,10 @@
 # inspect (it can no longer reconcile or escalate on its own). Only a
 # failed enqueue discards the expectation. On the typed plane an unconfirmed submit (exit 3) keeps
 # it armed rather than dropping it, and only a proven send failure discards it.
+# An undelivered order (delivery-unknown) that a later order to the same task
+# replaced is superseded: the later send resolves it and closes its blocker, and
+# a resend of its correlation exits 1 once, naming the later order, instead of
+# being delivered (bin/fm-pending-reply-lib.sh, superseded undelivered orders).
 # Set FM_PENDING_REPLY_EXISTING_CORR=<id> when re-sending a recovery request
 # for an already-open expectation so a second record is not created. Direct
 # unmarked captain input never creates one. A marked secondmate instruction
@@ -540,6 +544,13 @@ fm_send_known_undelivered_cleanup() {
     fm_pending_reply_reset_known_undelivered "$STATE" "$PENDING_REPLY_CORR"
   fi
 }
+# A freshly created order that reached (or may have reached) its mate replaces
+# every earlier undelivered order to the same task: resolve those as superseded
+# so none is resent and no ghost blocker is left behind (bin/fm-pending-reply-lib.sh).
+fm_send_supersede_older_orders() {
+  [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ] || return 0
+  fm_pending_reply_supersede_older "$STATE" "$PENDING_REPLY_CORR" >/dev/null 2>&1 || true
+}
 if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ "$(fm_meta_get "$TARGET_META" kind)" = secondmate ]; then
   MARK_FROM_FIRSTMATE=1
   TARGET_TASK_ID=$(fm_send_id_from_meta "$TARGET_META")
@@ -826,8 +837,19 @@ else
     fi
     if [ -n "$existing_corr" ] &&
       fm_pending_reply_corr_reusable "$STATE" "$existing_corr" "$TARGET_TASK_ID"; then
+      # An undelivered order that a later order to the same task replaced is
+      # never resent: close it once, loudly, and say which order superseded it.
+      if superseding=$(fm_pending_reply_later_order "$STATE" "$existing_corr"); then
+        fm_pending_reply_supersede "$STATE" "$existing_corr" "$superseding" || true
+        echo "error: order corr=$existing_corr to $TARGET_TASK_ID is superseded by a later order (corr=$superseding); not resending it. Its pending-reply record is closed." >&2
+        exit 1
+      fi
       PENDING_REPLY_CORR=$existing_corr
     else
+      if [ -n "$existing_corr" ] && fm_pending_reply_corr_superseded "$STATE" "$existing_corr"; then
+        echo "error: order corr=$existing_corr to $TARGET_TASK_ID was superseded by a later order (corr=$(fm_pending_reply_get "$(fm_pending_reply_path "$STATE" "$existing_corr")" superseded_by)); not resending it" >&2
+        exit 1
+      fi
       if [ "$existing_corr_explicit" = 1 ]; then
         echo "error: explicitly requested pending-reply correlation '${existing_corr:-empty}' is not reusable for $TARGET_TASK_ID; refusing to mint a replacement correlation" >&2
         exit 1
@@ -842,6 +864,10 @@ else
           exit 1
         }
       PENDING_REPLY_CREATED=1
+      # An answer to an open decision is not a new order: it must never retire
+      # an earlier undelivered order to the same task.
+      [ -z "$RESOLVE_KEYS" ] ||
+        fm_pending_reply_set "$(fm_pending_reply_path "$STATE" "$PENDING_REPLY_CORR")" answer_only 1 || true
     fi
     fm_pending_reply_embed_corr "$MESSAGE" "$PENDING_REPLY_CORR" MESSAGE
     if [ "$PENDING_REPLY_CREATED" != 1 ] &&
@@ -989,7 +1015,7 @@ else
     # The remote record is durable delivery, exactly as a local enqueue is.
     if [ -n "$PENDING_REPLY_CORR" ]; then
       if fm_pending_reply_confirm_delivery "$STATE" "$PENDING_REPLY_CORR"; then
-        :
+        fm_send_supersede_older_orders
       else
         delivery_commit_status=$?
         if [ "$delivery_commit_status" = 2 ]; then
@@ -1061,7 +1087,7 @@ else
     # parent report acknowledges the request.
     if [ -n "$PENDING_REPLY_CORR" ]; then
       if fm_pending_reply_confirm_delivery "$STATE" "$PENDING_REPLY_CORR"; then
-        :
+        fm_send_supersede_older_orders
       else
         delivery_commit_status=$?
         if [ "$delivery_commit_status" = 2 ]; then
@@ -1193,7 +1219,7 @@ else
   # it: only a correlated parent report acknowledges the request.
   if [ -n "$PENDING_REPLY_CORR" ]; then
     if fm_pending_reply_confirm_delivery "$STATE" "$PENDING_REPLY_CORR"; then
-      :
+      fm_send_supersede_older_orders
     else
       delivery_commit_status=$?
       if [ "$delivery_commit_status" = 2 ]; then

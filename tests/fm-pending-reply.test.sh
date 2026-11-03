@@ -42,6 +42,11 @@
 #      explicit reason, refuses a live resolvable endpoint, and for a retired or
 #      unresolvable one resolves the record and closes its escalation decision
 #      with the owned close note, so the open-decision fold really drops it
+#  21. An undelivered order that a later order to the same task replaced is
+#      superseded: the tick and the later send resolve it and close its blocker,
+#      and a resend of its correlation is refused once, naming the later order,
+#      while a delivered order, an in-flight later send, and another task's
+#      order never supersede anything
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -2378,6 +2383,100 @@ RECORD
   pass "ghost close: needs a reason, refuses a live endpoint, closes retired and unreachable ones with the owned note"
 }
 
+# An order that never reached its mate stays resendable until a later order to the same task
+# replaces it; after that the tick closes it (and its blocker) and fm-send refuses the resend.
+test_superseded_undelivered_order_is_closed_and_not_resent() {
+  local home state old later other delivered rec out rc fb log
+  home=$(setup_parent superseded)
+  state="$home/state"
+  dir="$TMP_ROOT/superseded-stubs"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  fm_write_secondmate_meta "$state/hibit.meta" "$home/sm" "sess:fm-hibit"
+  export FM_PENDING_REPLY_NOW=1000
+  old=$(fm_pending_reply_create "$home" "$state" hibit "resume the proof")
+  fm_pending_reply_prepare_delivery "$state" "$old" || fail "prepare delivery failed"
+  fm_pending_reply_mark_delivery_unknown "$state" "$old" || fail "mark delivery unknown failed"
+  fm_pending_reply_maybe_escalate "$state" "$old" || fail "delivery-unknown escalation should fire"
+  [ -n "$(status_open_decisions "$state/hibit.status")" ] || fail "the escalation should be open before the later order"
+  other=$(fm_pending_reply_create "$home" "$state" other "an order for another task")
+  export FM_PENDING_REPLY_NOW=1100
+  later=$(fm_pending_reply_create "$home" "$state" hibit "resume with the new plan")
+  # A later send still in flight replaces nothing: a failed send discards its record.
+  fm_pending_reply_later_order "$state" "$old" >/dev/null && fail "an in-flight later order must not supersede"
+  fm_pending_reply_prepare_delivery "$state" "$later" || fail "prepare later failed"
+  fm_pending_reply_later_order "$state" "$old" >/dev/null && fail "an attempted later order must not supersede"
+  fm_pending_reply_confirm_delivery "$state" "$later" || fail "confirm later failed"
+  [ "$(fm_pending_reply_later_order "$state" "$old")" = "$later" ] || fail "the delivered later order should supersede the old one"
+  fm_pending_reply_later_order "$state" "$other" >/dev/null && fail "another task's order is never superseded by this task's"
+  fm_pending_reply_later_order "$state" "$later" >/dev/null && fail "the newest order is not superseded"
+  # The resend is refused once, loudly, naming the later order, and closes the record and its blocker.
+  : > "$log"
+  out=$(env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_PENDING_REPLY_EXISTING_CORR="$old" "$SEND" hibit "resume the proof" 2>&1); rc=$?
+  expect_code 1 "$rc" "resending a superseded order must be refused"
+  assert_contains "$out" "superseded by a later order (corr=$later)" "the refusal should name the later order"
+  rec=$(fm_pending_reply_path "$state" "$old")
+  [ "$(fm_pending_reply_get "$rec" phase)" = resolved ] || fail "the superseded record should be resolved"
+  [ "$(fm_pending_reply_get "$rec" resolved_via)" = superseded ] || fail "the record should say it was superseded"
+  [ -z "$(status_open_decisions "$state/hibit.status")" ] || fail "the superseded blocker should be closed:"$'\n'"$(status_open_decisions "$state/hibit.status")"
+  [ -z "$(find "$state/hibit.inbox" -name '*.msg' 2>/dev/null)" ] || fail "nothing may be delivered for the superseded order"
+  out=$(env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_PENDING_REPLY_EXISTING_CORR="$old" "$SEND" hibit "resume the proof" 2>&1); rc=$?
+  expect_code 1 "$rc" "a second resend must still be refused"
+  assert_contains "$out" "superseded by a later order" "the second refusal should still say why"
+  # A delivered order is never superseded: an unanswered delivered order is a missed report.
+  export FM_PENDING_REPLY_NOW=1200
+  delivered=$(fm_pending_reply_create "$home" "$state" hibit "delivered earlier")
+  fm_pending_reply_mark_delivered "$state" "$delivered"
+  export FM_PENDING_REPLY_NOW=1300
+  fm_pending_reply_later_order "$state" "$delivered" >/dev/null && fail "a delivered order is never superseded"
+  pass "superseded order: the later order closes the undelivered one and its blocker, and its resend is refused once"
+}
+
+# The send itself retires older undelivered orders to the same task when the new order lands, and the
+# watcher tick retires one the send never reached; a correlated report on the old order still wins.
+test_later_order_supersedes_at_send_and_in_the_tick() {
+  local home state fb dir log old tick_old rec got new
+  home=$(setup_parent superseded-send)
+  state="$home/state"
+  dir="$TMP_ROOT/superseded-send-stubs"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  fm_write_secondmate_meta "$state/hibit.meta" "$home/sm" "sess:fm-hibit"
+  export FM_PENDING_REPLY_NOW=2000
+  old=$(fm_pending_reply_create "$home" "$state" hibit "first order")
+  fm_pending_reply_prepare_delivery "$state" "$old" || fail "prepare delivery failed"
+  fm_pending_reply_mark_delivery_unknown "$state" "$old" || fail "mark delivery unknown failed"
+  export FM_PENDING_REPLY_NOW=2100
+  run_send "$fb" "$home" "$log" hibit "second order"; rc=$?
+  expect_code 0 "$rc" "the later order should send"
+  rec=$(fm_pending_reply_path "$state" "$old")
+  [ "$(fm_pending_reply_get "$rec" resolved_via)" = superseded ] || fail "sending the later order should supersede the undelivered one"
+  got=$(latest_record_body "$home" hibit)
+  new=$(fm_pending_reply_extract_corr "$got")
+  [ "$(fm_pending_reply_get "$rec" superseded_by)" = "$new" ] || fail "the record should name the order that replaced it"
+  # The tick closes one the send path never reached, unless the mate answered it.
+  export FM_PENDING_REPLY_NOW=2200
+  tick_old=$(fm_pending_reply_create "$home" "$state" hibit "third order")
+  fm_pending_reply_prepare_delivery "$state" "$tick_old" || fail "prepare delivery failed"
+  fm_pending_reply_mark_delivery_unknown "$state" "$tick_old" || fail "mark delivery unknown failed"
+  answered=$(fm_pending_reply_create "$home" "$state" hibit "answered order")
+  fm_pending_reply_prepare_delivery "$state" "$answered" || fail "prepare delivery failed"
+  fm_pending_reply_mark_delivery_unknown "$state" "$answered" || fail "mark delivery unknown failed"
+  printf 'done [corr=%s]: picked up\n' "$answered" >> "$state/hibit.status"
+  export FM_PENDING_REPLY_NOW=2300
+  later=$(fm_pending_reply_create "$home" "$state" hibit "fourth order")
+  fm_pending_reply_mark_delivered "$state" "$later"
+  fm_pending_reply_tick_one "$state" "$tick_old" idle
+  fm_pending_reply_tick_one "$state" "$answered" idle
+  [ "$(fm_pending_reply_get "$(fm_pending_reply_path "$state" "$tick_old")" resolved_via)" = superseded ] \
+    || fail "the tick should supersede the silent undelivered order"
+  [ "$(fm_pending_reply_get "$(fm_pending_reply_path "$state" "$answered")" resolved_via)" = status ] \
+    || fail "a correlated report must still resolve the order as answered, not superseded"
+  [ -z "$(grep -F 'blocked [key=pending-reply-' "$state/hibit.status")" ] \
+    || fail "no delivery-unknown blocker should have been raised for a superseded order"
+  pass "later order: the send and the tick retire silent undelivered orders, and an answered one stays answered"
+}
+
 # Settled records older than FM_PENDING_REPLY_ARCHIVE_DAYS move to the sibling archive directory,
 # with their delivery marker; younger settled records, open work and escalations still waiting for
 # their decision to close stay in the live directory, and the tick performs the move once an hour.
@@ -2457,6 +2556,8 @@ test_escalated_undelivered_correlation_stays_retryable
 test_same_kind_escalation_reopens_after_operator_close
 test_summary_keeps_accents_and_caps_by_character
 test_ghost_close_guards_and_closes
+test_superseded_undelivered_order_is_closed_and_not_resent
+test_later_order_supersedes_at_send_and_in_the_tick
 test_archive_moves_only_old_settled_records
 
 printf 'ok - all pending-reply tests passed\n'
