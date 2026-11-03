@@ -285,6 +285,10 @@
 #   task's generation in --mod-option values; no global or project config is
 #   edited. Its --effort is passed only where the model's accepted set is
 #   verified, because an unknown value exits the launch.
+#   For pi and pi-signed, the requested --model is checked against the executable's
+#   `--model <m> --list-models` table before any endpoint exists (pi_model_validate): a model
+#   matching no listed id or <provider>/<id> refuses the spawn, and an unreadable
+#   listing launches unvalidated with a notice.
 #   For omp (Oh My Pi), fm-spawn resolves the `omp` executable from PATH once and
 #   refuses when it is absent. Every omp launch clears the foreign harness
 #   markers (omp publishes none of its own), sets the Firstmate-owned
@@ -2515,6 +2519,51 @@ agy_model_validate() {  # <agy-bin> <model>
   return 1
 }
 
+# pi / pi-signed pre-launch model validation. `pi --list-models` prints a
+# whitespace table whose first two columns are "<provider> <model>" under a
+# "provider model ..." header, for every provider the install can reach,
+# extension-registered ones such as claude-bridge included. A --model pattern
+# that matches no row makes the worker print "model not found" and never read
+# its brief, which the supervisor then sees as a dead pane instead of a refusal
+# (a bare claude-sonnet-5-5 did exactly that). The check mirrors Pi's own
+# matching, an exact id, an exact <provider>/<id>, or a case-insensitive
+# substring of either, so it only refuses a pattern Pi itself cannot resolve; a
+# trailing :<thinking> level is stripped first. An unreadable or unparseable
+# listing establishes nothing and launches unvalidated, and the probe runs under
+# the shared hard bound (bin/fm-timeout-lib.sh) with stdin detached. The
+# listing is requested with the same --model the launch will carry because a pi
+# route shim may pick the executable from that argument (a claude-bridge/<id>
+# model runs a pinned bridge build that lists the 5.5 models plain pi lacks), so
+# the listing must come from the build the worker would actually run.
+pi_model_validate() { # <pi-bin> <model>
+  local bin=$1 model=$2 listing rc=0 bound=${FM_PI_MODELS_TIMEOUT:-15} pattern rows hints
+  case "$bound" in '' | *[!0-9]* | 0*) bound=15 ;; esac
+  [ -n "$model" ] && [ "$model" != default ] || return 0
+  pattern=$model
+  case "$pattern" in
+  *:off | *:minimal | *:low | *:medium | *:high | *:xhigh) pattern=${pattern%:*} ;;
+  esac
+  listing=$(fm_run_timed "$bound" "$bin" --model "$model" --list-models 2>/dev/null </dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "notice: '$(basename "$bin") --list-models' is unavailable (exit $rc); launching with --model '$model' unvalidated" >&2
+    return 0
+  fi
+  rows=$(printf '%s\n' "$listing" | awk 'hdr && NF >= 2 { print $1 "/" $2 } $1 == "provider" && $2 == "model" { hdr = 1 }')
+  [ -n "$rows" ] || return 0
+  if printf '%s\n' "$rows" | awk -v p="$pattern" '
+    BEGIN { p = tolower(p) }
+    { sel = tolower($0); id = sel; sub(/^[^\/]*\//, "", id) }
+    sel == p || id == p || index(sel, p) { found = 1; exit }
+    END { exit !found }'; then
+    return 0
+  fi
+  hints=$(printf '%s\n' "$rows" | awk -v p="$pattern" '
+    BEGIN { id = p; sub(/^[^\/]*\//, "", id); sub(/-[^-]*$/, "", id); id = tolower(id) }
+    id != "" && index(tolower($0), id) { printf "%s%s", n++ ? ", " : "", $0 }')
+  echo "error: pi model '$model' matches nothing in '$(basename "$bin") --list-models'; use <provider>/<id> from that listing (Claude models need the claude-bridge/ prefix)${hints:+; similar: $hints}" >&2
+  return 1
+}
+
 # The verified launch command per adapter. The knowledge half of each adapter
 # (busy-state source, exit command, dialogs, quirks) lives in the harness-adapters skill.
 launch_template() {
@@ -3034,6 +3083,9 @@ if [ "$EFFORT" = ultra ]; then
 fi
 if [ "$HARNESS" = omp ]; then
   omp_model_validate "$OMP_BIN" "$MODEL" || exit 1
+fi
+if [ "$RAW_LAUNCH" -eq 0 ] && { [ "$HARNESS" = pi ] || [ "$HARNESS" = pi-signed ]; }; then
+  pi_model_validate "$PI_BIN" "$MODEL" || exit 1
 fi
 if [ "$HARNESS" = agy ]; then
   agy_model_validate "$AGY_BIN" "$MODEL" || exit 1

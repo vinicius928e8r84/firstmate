@@ -14,7 +14,7 @@ Verified on 2026-07-27 with Pi and Pi-signed 0.82.0 unless a fact gives another 
 | Skill invocation | No separate verified form beyond normal command behavior; use natural language when the exact command is uncertain. |
 | Model flag | `--model <model>`; under a home's worker account pin the model must be `<provider>/<id>` and Firstmate also passes `--provider <provider>` (`../../../docs/configuration.md` "Worker account pin"). |
 | Effort flag | `--thinking <low\|medium\|high\|xhigh\|max>`; both identities expose the same levels and completed the same model-qualified max-thinking smoke. |
-| Model discovery | Run the selected executable as `<executable> --list-models [search]`; Pi's installed `docs/models.md` owns how built-in, extension-registered, and custom provider/model entries reach that list. |
+| Model discovery | Run the selected executable as `<executable> --list-models [search]`; Pi's installed `docs/models.md` owns how built-in, extension-registered, and custom provider/model entries reach that list. `bin/fm-spawn.sh` runs it before launch and refuses a `--model` that matches no listed id or `<provider>/<id>` (Claude models need the `claude-bridge/` prefix), so a stale id stops the spawn instead of leaving a dead pane; an unreadable listing launches unvalidated with a notice. |
 
 Native Codex sessions may request `ultra` through the native extension flag described by `../../../bin/fm-spawn.sh`; it is separate from Pi's thinking levels.
 Pi has no permission system, so workers are always autonomous.

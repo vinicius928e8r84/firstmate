@@ -29,6 +29,15 @@ if [ "${1:-}" = --help ]; then
   *) printf '%s\n' "Pi ${FM_FAKE_PI_VERSION:-0.84.0}" 'Options: --help --tui-mode <mode> --approve' ;;
   esac
 fi
+for arg in "$@"; do
+  if [ "$arg" = --list-models ]; then
+    # A real route shim picks its build from --model, so the probe must pass it.
+    case " $* " in *" --model "*) ;; *) exit 9 ;; esac
+    [ "${FM_FAKE_PI_LIST_STATUS:-0}" -eq 0 ] || exit "${FM_FAKE_PI_LIST_STATUS}"
+    [ -z "${FM_FAKE_PI_MODELS:-}" ] || printf '%b\n' "$FM_FAKE_PI_MODELS"
+    exit 0
+  fi
+done
 exit 0
 SH
   chmod +x "$fakebin/$tool"
@@ -141,6 +150,8 @@ run_spawn() {
     FM_OPENCODE_POLL_INTERVAL="${FM_TEST_OPENCODE_POLL_INTERVAL:-0.01}" \
     FM_FAKE_CURSOR_MODELS="${FM_TEST_CURSOR_MODELS:-}" \
     FM_FAKE_CURSOR_LIST_STATUS="${FM_TEST_CURSOR_LIST_STATUS:-0}" \
+    FM_FAKE_PI_MODELS="${FM_TEST_PI_MODELS:-}" \
+    FM_FAKE_PI_LIST_STATUS="${FM_TEST_PI_LIST_STATUS:-0}" \
     GROK_HOME="$home/grok-home" \
     fm_test_run_spawn "$home" "$wt" "$fakebin" "$@"
 }
@@ -1314,6 +1325,63 @@ test_pi_threads_model_and_max_effort() {
   assert_contains "$launch" "fm-operational-input.sh' encode launch-brief" \
     "pi launch lost the canonical typed launch-brief envelope"
   pass "pi receives --model and --thinking max profile flags"
+}
+
+PI_LISTING='provider       model            context\nanthropic      claude-sonnet-5  1M\nclaude-bridge  claude-sonnet-5  1M\nopenai-codex   gpt-5.6-sol      272K'
+
+test_pi_refuses_model_absent_from_live_listing() {
+  local rec id out status
+  id=profile-pi-badmodel-z8b
+  rec=$(make_spawn_case profile-pi-badmodel pi "$id")
+  read_case_record "$rec"
+
+  FM_TEST_PI_MODELS=$PI_LISTING \
+    out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+      --model claude-sonnet-5-5 2>&1)
+  status=$?
+  expect_code 1 "$status" "pi spawn should refuse a model absent from a readable listing"
+  assert_contains "$out" "pi model 'claude-sonnet-5-5' matches nothing" \
+    "pi model refusal did not name the unresolved model"
+  assert_contains "$out" "claude-bridge/ prefix" \
+    "pi model refusal did not name the claude-bridge prefix"
+  assert_contains "$out" "claude-bridge/claude-sonnet-5" \
+    "pi model refusal did not suggest the listed near match"
+  [ ! -s "$LAUNCH_LOG" ] || fail "pi model refusal must happen before launch"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "pi model refusal left a task record"
+  pass "pi refuses a model its own listing cannot resolve before any pane exists"
+}
+
+test_pi_accepts_listed_model_forms() {
+  local rec id out status m n=0
+  for m in claude-bridge/claude-sonnet-5 claude-sonnet-5 claude-sonnet-5:high openai-codex/gpt-5.6-sol; do
+    n=$((n + 1))
+    id=profile-pi-listed-z8c$n
+    rec=$(make_spawn_case "profile-pi-listed-$n" pi "$id")
+    read_case_record "$rec"
+    FM_TEST_PI_MODELS=$PI_LISTING \
+      out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+        --model "$m" 2>&1)
+    status=$?
+    expect_code 0 "$status" "pi spawn should accept listed model form $m: $out"
+    assert_contains "$(cat "$LAUNCH_LOG")" "--model '$m'" "pi launch lost listed model $m"
+  done
+  pass "pi accepts exact, bare, provider-prefixed, and thinking-suffixed listed models"
+}
+
+test_pi_unavailable_listing_does_not_block_spawn() {
+  local rec id out status
+  id=profile-pi-nolisting-z8d
+  rec=$(make_spawn_case profile-pi-nolisting pi "$id")
+  read_case_record "$rec"
+
+  FM_TEST_PI_LIST_STATUS=3 \
+    out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+      --model claude-sonnet-5-5 2>&1)
+  status=$?
+  expect_code 0 "$status" "pi spawn should launch unvalidated when the listing is unavailable: $out"
+  assert_contains "$out" "launching with --model 'claude-sonnet-5-5' unvalidated" \
+    "unavailable pi listing launched without its notice"
+  pass "pi launches unvalidated when its model listing is unavailable"
 }
 
 test_pi_signed_threads_shared_pi_profile_and_preserves_identity() {
@@ -2762,6 +2830,9 @@ test_batch_preserves_native_ultra
 test_pi_scout_launch_enters_recorded_worktree
 test_pi_threads_model_and_max_effort
 test_pi_tui_mode_probe_is_safe_for_old_and_new_pi
+test_pi_refuses_model_absent_from_live_listing
+test_pi_accepts_listed_model_forms
+test_pi_unavailable_listing_does_not_block_spawn
 test_pi_signed_threads_shared_pi_profile_and_preserves_identity
 test_pi_signed_missing_binary_refuses_before_endpoint_or_metadata
 test_pi_signed_persistent_secondmate_uses_pi_extensions_and_identity
