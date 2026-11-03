@@ -64,15 +64,16 @@ fm_quota_silence_store() { # <until-epoch> <checked-epoch>
 }
 
 # fm_quota_silence_read <target> -> prints the epoch the exhausted account comes
-# back, or nothing when quota-axi cannot be read or the account is not exhausted.
+# back and returns 0; prints nothing and returns 0 when the account is not
+# exhausted, and returns 3 when quota-axi cannot be read or has no such row.
 fm_quota_silence_read() {
   local target=$1 provider key json rows row_until reset epoch best='' all=1 any=0 ok resets
   local axi=${FM_QUOTA_SILENCE_AXI:-quota-axi}
   provider=${target%%/*}
   key=
   case "$target" in */*) key=${target#*/} ;; esac
-  json=$(fm_run_timed 20 "$axi" --json 2>/dev/null </dev/null) || return 0
-  printf '%s\n' "$json" | fm_quota_json_valid || return 0
+  json=$(fm_run_timed 20 "$axi" --json 2>/dev/null </dev/null) || return 3
+  printf '%s\n' "$json" | fm_quota_json_valid || return 3
   rows=$(printf '%s\n' "$json" | jq -r --arg p "$provider" --arg k "$key" '
     .providers[]? | select(.provider == $p)
     | select($k == "" or ((.accountKey // "default") == $k))
@@ -82,8 +83,8 @@ fm_quota_silence_read() {
         or ($a.status == "known" and $a.effectivePercentRemaining == 0))) as $ex
     | [($ex | if . then "1" else "0" end),
        ([($a.limitingWindowIds // [])[] as $id | $row.windows[]? | select(.id == $id) | .resetsAt // empty] | join(","))]
-    | @tsv' 2>/dev/null) || return 0
-  [ -n "$rows" ] || return 0
+    | @tsv' 2>/dev/null) || return 3
+  [ -n "$rows" ] || return 3
   while IFS=$(printf '\t') read -r ok resets; do
     any=1
     if [ "$ok" != 1 ] || [ -z "$resets" ]; then all=0; continue; fi

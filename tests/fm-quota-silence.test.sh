@@ -119,7 +119,27 @@ test_account_key_scopes_the_hold() {
   pass "a configured account key ignores other accounts' exhaustion"
 }
 
+test_status_helper_reports_exhausted_clear_and_unknown() {
+  local dir out rc
+  dir=$(new_case status)
+  run_status() { FM_HOME="$dir" FM_QUOTA_SILENCE_AXI="$dir/quota-axi" bash "$ROOT/bin/fm-quota-silence.sh" status; }
+  fake_axi "$dir" 0 600
+  rc=0; out=$(run_status) || rc=$?
+  [ "$rc" -eq 0 ] && [[ "$out" == "exhausted "* ]] || fail "an exhausted account was not reported (rc $rc): $out"
+  fake_axi "$dir" 50 600
+  rc=0; out=$(run_status) || rc=$?
+  [ "$rc" -eq 1 ] && [ "$out" = clear ] || fail "a healthy account was not reported clear (rc $rc): $out"
+  fake_axi "$dir" 0 -60
+  rc=0; out=$(run_status) || rc=$?
+  [ "$rc" -eq 1 ] && [ "$out" = clear ] || fail "a past reset was not reported clear (rc $rc): $out"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/quota-axi"
+  rc=0; out=$(run_status) || rc=$?
+  [ "$rc" -eq 2 ] && [ "$out" = unknown ] || fail "an unreadable quota-axi was not reported unknown (rc $rc): $out"
+  pass "the status helper tells exhausted, clear, and unknown apart"
+}
+
 test_exhausted_limit_holds_the_wake_until_the_reset
+test_status_helper_reports_exhausted_clear_and_unknown
 test_cached_hold_does_not_reread_quota
 test_nothing_holds_without_an_exhausted_configured_account
 test_account_key_scopes_the_hold

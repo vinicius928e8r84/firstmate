@@ -818,7 +818,8 @@ Exhausted means the `all_models` scope reads `exhausted_now` or zero percent rem
 The wake rows are already queued when the hold starts, so nothing is lost: the watcher keeps its liveness beacon fresh, sleeps, and then delivers the one wake it held, which the drain presents with every row queued meanwhile.
 An away record, an unreadable `quota-axi`, or removing the file ends or skips the hold.
 `state/.quota-silence` caches the verdict (`until=`, `checked=`) and the silent-watcher cron skips its undelivered-wake alarm while it stands.
-`FM_QUOTA_SILENCE_RECHECK` (seconds between `quota-axi` reads while not holding, default `300`) tunes the read rate.
+`FM_QUOTA_SILENCE_RECHECK` tunes the read rate while not holding.
+`bin/fm-quota-silence.sh status` prints the same verdict (`exhausted <epoch>`, `clear`, or `unknown`) for the Pi limit resume described under the `FM_LIMIT_RESUME` setting below, and reads `claude` when the file is absent.
 
 The file is a home-local preference and is not inherited by secondmate homes.
 Point it at the account the supervising session actually runs under: a hold on the wrong account silences a healthy session until that account resets.
@@ -3018,6 +3019,10 @@ FM_CACHE_KEEPALIVE=1   # Pi primary cache keep-alive (.pi/extensions/fm-cache-ke
 FM_CACHE_KEEPALIVE_IDLE_MS=3000000   # idle time after which an idle primary sends one hidden turn so the prompt cache does not expire (50 minutes)
 FM_CACHE_KEEPALIVE_MAX_PINGS=4   # consecutive keep-alive turns with no real activity between them; real activity resets the count, zero disables
 FM_CACHE_KEEPALIVE_MIN_TOKENS=30000   # context size under which a cache miss is cheaper than a keep-alive turn and none is sent
+FM_LIMIT_RESUME=1   # the same extension continues a turn the provider cut with a usage-limit refusal once `bin/fm-quota-silence.sh status` reports the limit lifted, instead of the do-nothing keep-alive; 0 disables it
+FM_LIMIT_RESUME_POLL_MS=300000   # interval between those no-model-call limit checks while a cut turn waits (5 minutes)
+FM_LIMIT_RESUME_MAX_ATTEMPTS=4   # resume turns spent per cut; a turn that goes through starts the count over
+FM_QUOTA_SILENCE_RECHECK=300   # seconds between quota-axi reads while the watcher is not holding its wake for a usage limit (config/quota-silence)
 FM_WAKE_SHADOW=1   # shadow log of check and signal wakes presented by the drain (state/wake-shadow.jsonl, bin/fm-wake-shadow.sh header owns the fields); observational, 0 disables it
 FM_WAKE_SHADOW_MAX_BYTES=4194304   # size at which the shadow log rotates once to wake-shadow.jsonl.1
 FM_WATCH_CYCLE_LOG_MAX_BYTES=262144   # size cap for the arm-owned watcher lifecycle ledger

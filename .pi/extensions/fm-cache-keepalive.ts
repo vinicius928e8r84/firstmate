@@ -11,6 +11,13 @@
 // tokens; a miss costs about eleven times that. The cap on consecutive pings
 // bounds the spend of a long idle night, and any real activity resets it.
 //
+// The same idle hook also resumes a session whose last turn the provider cut
+// with a usage-limit refusal: a "do nothing" ping would burn the first call
+// after the reset on nothing, and the cut work would wait for someone to notice.
+// Such a session is polled cheaply (bin/fm-quota-silence.sh status reads
+// quota-axi, no model call) and, once the limit has lifted, is told to continue
+// the turn that was cut.
+//
 // Only the session that owns the fleet lock pings. The extension is project-
 // local, so it is also loaded in every worker that works on this repository,
 // and those sessions must stay silent.
@@ -39,6 +46,12 @@ const maxConsecutivePings = numberFromEnv("FM_CACHE_KEEPALIVE_MAX_PINGS", 4, 0);
 // Below this much context a miss costs less than the machinery is worth.
 const minContextTokens = numberFromEnv("FM_CACHE_KEEPALIVE_MIN_TOKENS", 30000, 0);
 const enabled = process.env.FM_CACHE_KEEPALIVE !== "0";
+// Seconds-level knobs for the limit resume; the poll is a quota-axi read, not a model call.
+const resumePollMs = numberFromEnv("FM_LIMIT_RESUME_POLL_MS", 5 * 60 * 1000, 1);
+// Model turns spent on resume attempts per cut; a limit that still refuses after these gives up.
+const maxResumeAttempts = numberFromEnv("FM_LIMIT_RESUME_MAX_ATTEMPTS", 4, 0);
+const resumeEnabled = process.env.FM_LIMIT_RESUME !== "0";
+const resumeStatusCommand = process.env.FM_LIMIT_RESUME_STATUS || `${root}/bin/fm-quota-silence.sh`;
 
 function parentPid(pid: string): string {
   const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
@@ -74,6 +87,33 @@ function ownsFleetLock(): boolean {
 }
 
 export const KEEPALIVE_MESSAGE_TYPE = "fm-cache-keepalive";
+export const RESUME_MESSAGE_TYPE = "fm-limit-resume";
+const resumeText =
+  "Resume instruction from the harness, not from the captain or the fleet. " +
+  "The usage limit that cut your previous turn has reset. " +
+  "Continue the work you were doing when it stopped; if that turn had already finished, say so in one line.";
+
+// Provider wordings of an exhausted subscription or usage limit, as carried by an
+// errored assistant message's errorMessage (pi has no typed rate-limit error).
+const usageLimitPattern =
+  /claude rate limit|you(?:'|’)ve (?:hit|reached) your|you(?:'|’)re out of (?:extra )?usage|usage (?:limit|allocation)|(?:weekly|5-hour|five.hour|session) limit/i;
+
+export function isUsageLimitCut(messages: unknown): boolean | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i] as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+    if (!message || message.role !== "assistant") continue;
+    return message.stopReason === "error" && usageLimitPattern.test(String(message.errorMessage ?? ""));
+  }
+  return undefined;
+}
+
+// 0 while the configured account's limit still stands; anything else (clear,
+// unknown, no script) lets the resume go, since a refused attempt is cheap.
+function limitStillStands(): boolean {
+  const result = spawnSync(resumeStatusCommand, ["status"], { encoding: "utf8", timeout: 60000, env: { ...process.env, FM_HOME: fmHome } });
+  return result.status === 0;
+}
 const keepaliveText =
   "Cache keep-alive ping from the harness, not from the captain or the fleet. " +
   "Take no action and call no tool. Reply with exactly: ok";
@@ -82,6 +122,8 @@ export default function (pi: ExtensionAPI) {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let pingInFlight = false;
   let consecutivePings = 0;
+  let cutByLimit = false;
+  let resumeAttempts = 0;
 
   const clear = (): void => {
     if (timer) clearTimeout(timer);
@@ -111,17 +153,51 @@ export default function (pi: ExtensionAPI) {
     timer.unref();
   };
 
+  // Poll until the limit lifts, then continue the cut turn. A session that is not
+  // idle, or does not own the fleet lock, is left alone; the next settle reschedules.
+  const scheduleResume = (ctx: { isIdle?: () => boolean }): void => {
+    clear();
+    if (!resumeEnabled || resumeAttempts >= maxResumeAttempts) return;
+    timer = setTimeout(() => {
+      timer = null;
+      if (!ownsFleetLock()) return;
+      try {
+        if (ctx.isIdle && !ctx.isIdle()) return;
+        if (limitStillStands()) {
+          scheduleResume(ctx);
+          return;
+        }
+        resumeAttempts += 1;
+        pi.sendMessage(
+          { customType: RESUME_MESSAGE_TYPE, content: resumeText, display: false },
+          { triggerTurn: true },
+        );
+      } catch {
+        // A context from a replaced session throws; the next settle schedules afresh.
+      }
+    }, resumePollMs);
+    timer.unref();
+  };
+
   pi.on?.("agent_start", () => {
     clear();
     // A run the ping started keeps the count; anything else is real activity.
     if (!pingInFlight) consecutivePings = 0;
+  });
+  pi.on?.("agent_end", (event) => {
+    const cut = isUsageLimitCut((event as { messages?: unknown } | undefined)?.messages);
+    if (cut === undefined) return;
+    cutByLimit = cut;
+    // A turn that went through ends the cut; the attempt budget starts over.
+    if (!cut) resumeAttempts = 0;
   });
   pi.on?.("agent_settled", (_event, ctx) => {
     if (pingInFlight) {
       pingInFlight = false;
       consecutivePings += 1;
     }
-    schedule(ctx);
+    if (cutByLimit) scheduleResume(ctx);
+    else schedule(ctx);
   });
   pi.on?.("session_shutdown", () => {
     clear();
