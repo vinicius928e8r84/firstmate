@@ -35,4 +35,10 @@ check stale-queue "$(run "$alive")" 1; tail -1 "$T/state/.silent-watcher-alerts"
 run "$alive" >/dev/null; rm -f "$T/state/.silent-watcher.incident"
 # HOLD silences queue check only
 touch "$T/state/HOLD"; check hold-queue "$(run "$alive")" 0; check hold-dead "$(run "$dead")" 1
+# a usage-limit hold keeps wakes queued on purpose: no queue alarm until it ends
+rm -f "$T/state/HOLD" "$T/state/.silent-watcher.incident"
+printf 'until=%s\nchecked=%s\n' $((NOW+3600)) "$NOW" > "$T/state/.quota-silence"
+check quota-hold-queue "$(run "$alive")" 0
+printf 'until=0\nchecked=%s\n' "$NOW" > "$T/state/.quota-silence"
+check quota-hold-over "$(run "$alive")" 1
 exit $fail

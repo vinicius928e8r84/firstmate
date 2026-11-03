@@ -808,6 +808,22 @@ The bound is required rather than cosmetic because churn and pane staleness read
 The flag is a home-local supervision-noise preference and is not inherited by secondmate homes, which run their own crew mix.
 [`architecture.md`](architecture.md) owns the triage contract and `bin/fm-watch.sh`'s `signal_turnend_panes_churned` owns the exact evidence and fail-closed boundaries.
 
+## Usage-limit wake hold (config/quota-silence)
+
+The optional local, gitignored `config/quota-silence` file opts this home's watcher into holding its wake while the supervising session's usage limit is exhausted.
+Its first non-comment line names the account: `<provider>` requires every `quota-axi` row of that provider to be exhausted, and `<provider>/<accountKey>` (schema 6) names one account row.
+With the file absent, empty, or naming a row that is not exhausted, the watcher behaves exactly as before.
+
+Exhausted means the `all_models` scope reads `exhausted_now` or zero percent remaining, and the hold lasts until the earliest reset of the windows limiting it; a reset time already past never holds.
+The wake rows are already queued when the hold starts, so nothing is lost: the watcher keeps its liveness beacon fresh, sleeps, and then delivers the one wake it held, which the drain presents with every row queued meanwhile.
+An away record, an unreadable `quota-axi`, or removing the file ends or skips the hold.
+`state/.quota-silence` caches the verdict (`until=`, `checked=`) and the silent-watcher cron skips its undelivered-wake alarm while it stands.
+`FM_QUOTA_SILENCE_RECHECK` (seconds between `quota-axi` reads while not holding, default `300`) tunes the read rate.
+
+The file is a home-local preference and is not inherited by secondmate homes.
+Point it at the account the supervising session actually runs under: a hold on the wrong account silences a healthy session until that account resets.
+`bin/fm-quota-silence-lib.sh` owns the exact rules.
+
 ## Parked-gate wait deferral (config/wedge-defer-parked-gate)
 
 The optional local, gitignored `config/wedge-defer-parked-gate` presence flag opts this home into a default-off further form of wait evidence in the watcher's wedge timer.

@@ -5,7 +5,8 @@
 #   missing  - no live $FM_HOME/bin/fm-watch.sh process
 #   stale    - state/.last-watcher-beat older than FM_SW_BEAT_MAX (default 900 s = 3x the 300 s guard grace)
 #   queue    - state/.wake-queue has lines and the oldest is older than FM_SW_QUEUE_MAX (default 900 s)
-#              (skipped while state/HOLD is in force: a held fleet is supposed to be quiet)
+#              (skipped while state/HOLD is in force: a held fleet is supposed to be quiet,
+#              and while a usage-limit hold stands in state/.quota-silence)
 # Alert: one per incident (debounced by state/.silent-watcher.incident). The alert is appended to
 #   state/.silent-watcher-alerts (outbox, one line per incident) and registered as a captain ask with
 #   bin/../data/tools/fm-asks.sh add --key silent-watcher (deterministic; the ask shows in the owner's
@@ -29,7 +30,10 @@ if [ -e "$S/.last-watcher-beat" ]; then
   age=$(( NOW - $(stat -c %Y "$S/.last-watcher-beat") ))
   [ "$age" -le "$BEAT_MAX" ] || reasons+=("stale: watcher beat ${age}s old (max ${BEAT_MAX}s)")
 else reasons+=("stale: no state/.last-watcher-beat"); fi
-if [ ! -e "$S/HOLD" ] && [ -s "$S/.wake-queue" ]; then
+# A usage-limit hold (bin/fm-quota-silence-lib.sh) keeps wakes queued on purpose until the reset.
+qs=$(sed -n 's/^until=//p' "$S/.quota-silence" 2>/dev/null | tail -1)
+case "$qs" in ''|*[!0-9]*) qs=0 ;; esac
+if [ ! -e "$S/HOLD" ] && [ "$qs" -le "$NOW" ] && [ -s "$S/.wake-queue" ]; then
   oldest=$(awk -F'\t' '$1 ~ /^[0-9]+$/ {print $1}' "$S/.wake-queue" | sort -n | head -1)
   if [ -n "$oldest" ]; then
     qa=$(( NOW - oldest )); n=$(grep -c . "$S/.wake-queue")

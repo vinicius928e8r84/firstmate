@@ -214,6 +214,8 @@ WATCH_HOME_EXISTED=0
 # runtime needlessly spends per-root CI lint memory while adding no uncovered file.
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/fm-push-transition-lib.sh"
+# shellcheck source=bin/fm-quota-silence-lib.sh
+. "$SCRIPT_DIR/fm-quota-silence-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # Only for the arm-time check on FM_PROCEVENT_LAUNCH_CONFIRM_SECONDS below;

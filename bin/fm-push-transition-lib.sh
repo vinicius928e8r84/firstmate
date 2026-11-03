@@ -91,6 +91,9 @@ triage_log() {
 # Exit after reporting one actionable wake. Tests override this callback.
 wake() {
   local output_status=0
+  # An exhausted usage limit holds the wake until the reset (config/quota-silence,
+  # bin/fm-quota-silence-lib.sh); a no-op where the watcher did not load it.
+  ! declare -F fm_quota_silence_hold >/dev/null || fm_quota_silence_hold "$1"
   case "$1" in
     heartbeat*) echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak" ;;
     *) echo 0 > "$STATE/.heartbeat-streak" ;;
