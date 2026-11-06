@@ -109,7 +109,7 @@ test_stale_enqueue_before_suppressor() {
   # needs-decision: because a stale pane behind done: no longer wakes (tests/fm-wake-gate.test.sh owns that gate).
   printf 'needs-decision: ready for review fm/stale\n' > "$state/stale.status"
   prime_status_seen "$state" "$state/stale.status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(watch_window_key "$window")
   pane_hash=$(hash_text "idle prompt")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -141,7 +141,7 @@ test_not_working_stale_enqueue_before_suppressor() {
   # signal scan does not pre-empt the stale path.
   printf 'working: implementing\n' > "$state/stopped.status"
   prime_status_seen "$state" "$state/stopped.status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(watch_window_key "$window")
   pane_hash=$(hash_text "idle prompt, finished")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
