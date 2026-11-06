@@ -15,7 +15,8 @@
 #   - bin/fm-crew-state.sh reports its current state as done (a status log line is never trusted);
 #   - a scout has its report at data/<id>/report.md; a ship has positive merged evidence: its recorded
 #     pr= reads merged on the forge (open, closed or unreadable keeps it, so bin/fm-pr-merge.sh still has
-#     its record), or - with no pr= recorded - its branch head is already on the project's local default branch;
+#     its record), or - with no pr= recorded - the first PR URL in its status log reads merged the same
+#     way, or - with neither - its branch head is already on the project's local default branch;
 #   - bin/fm-captain-hold.sh `open` says it is not an open captain call (0 and 2 both keep it) and
 #     the status log folds to no open decision.
 # Before closing, the status log, the metadata and the logs under the recorded tasktmp are saved to
@@ -90,10 +91,18 @@ pr_state() {  # <pr-url>
   return "$rc"
 }
 
+# First PR URL in a status log; the same pattern as first_pr_url_in_file in bin/fm-fleet-snapshot.sh,
+# which cannot be sourced (it runs its snapshot on load).
+status_pr_url() {  # <status-file>
+  [ -f "$1" ] || return 1
+  grep -Eo 'https?://[^[:space:])"]+/pull/[0-9]+' "$1" 2>/dev/null | head -1
+}
+
 # 0 when the ship has positive merged evidence; otherwise prints the keep reason and returns 1.
-ship_merge_evidence() {  # <meta>
+ship_merge_evidence() {  # <meta> <status-file>
   local meta=$1 pr project wt default state
   pr=$(meta_value "$meta" pr)
+  [ -n "$pr" ] || pr=$(status_pr_url "$2")
   if [ -n "$pr" ]; then
     state=$(pr_state "$pr") && return 0
     echo "PR not merged (${state:-unknown})"; return 1
@@ -156,7 +165,7 @@ for meta in "$STATE"/*.meta; do
   fi
   if [ "$kind" = scout ]; then
     if [ ! -s "$DATA/$id/report.md" ]; then echo "kept: $id scout has no report"; kept=$((kept + 1)); continue; fi
-  elif ! why=$(ship_merge_evidence "$meta"); then
+  elif ! why=$(ship_merge_evidence "$meta" "$STATE/$id.status"); then
     echo "kept: $id $why"; kept=$((kept + 1)); continue
   fi
   "$hold" open "$id" >/dev/null 2>&1; rc=$?
