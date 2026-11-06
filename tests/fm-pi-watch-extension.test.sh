@@ -2425,9 +2425,9 @@ EOF
 # shell reports a generation mismatch (status 3), so the wake must be
 # delivered with no rejection appendix, nothing may be retired, and the
 # attempt plus the confirm result must land in the bounded extension log.
-# The log assertions run opted in (FM_WATCH_EXTENSION_LOG_KEEP_LINES=50
-# below); the default-off contract lives in
-# test_pi_extension_log_stays_off_unless_opted_in.
+# The log assertions pin the knob (FM_WATCH_EXTENSION_LOG_KEEP_LINES=50
+# below); the default and opt-out contract lives in
+# test_pi_extension_log_is_default_on_with_explicit_opt_out.
 test_pi_superseded_delivery_has_no_rejection_appendix() {
   local repo home plugin log stop out status extension_log
   repo="$TMP_ROOT/pi-handling-superseded-root"
@@ -2614,13 +2614,13 @@ EOF
   pass "Pi superseded handling delivery is offered to the branch like a confirmed one"
 }
 
-# The extension diagnostic log is opt-in and default-off: the same
-# mid-restore supersession that logs when opted in must create no
-# state/.watch-extension.log file with the knob unset, zero, or
-# non-numeric, while the wake is still delivered with no rejection
-# appendix. Each knob value runs in a fresh home because the extension
+# The extension diagnostic log is on by default (2000 rows) and opts out only
+# for an explicit zero or negative knob: the same mid-restore supersession must
+# write state/.watch-extension.log with the knob unset or non-numeric and
+# create no file with zero or a negative value, while the wake is still
+# delivered with no rejection appendix. Each knob value runs in a fresh home because the extension
 # reads the knob once at module load.
-test_pi_extension_log_stays_off_unless_opted_in() {
+test_pi_extension_log_is_default_on_with_explicit_opt_out() {
   local repo driver mode home log stop extension_log knob_value out status
   repo="$TMP_ROOT/pi-extension-log-off-root"
   driver="$TMP_ROOT/pi-extension-log-off-driver.mjs"
@@ -2683,24 +2683,203 @@ if (rows.filter((row) => row.startsWith("superseded ")).length < 1) {
 writeFileSync(process.env.FM_STOP_FILE, "stop\n");
 process.exit(0);
 EOF
-  for mode in unset zero bogus; do
+  for mode in unset zero negative bogus; do
     home="$TMP_ROOT/pi-extension-log-off-home-$mode"
     log="$TMP_ROOT/pi-extension-log-off-$mode.log"
     stop="$TMP_ROOT/pi-extension-log-off-$mode.stop"
     extension_log="$home/state/.watch-extension.log"
     mkdir -p "$home/state" "$home/config"
-    if [ "$mode" = unset ]; then
-      out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" node "$driver" 2>&1)
-    else
-      if [ "$mode" = zero ]; then knob_value=0; else knob_value="not-a-number"; fi
-      out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" FM_WATCH_EXTENSION_LOG_KEEP_LINES="$knob_value" node "$driver" 2>&1)
-    fi
+    case "$mode" in
+      unset) out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" node "$driver" 2>&1) ;;
+      *)
+        case "$mode" in zero) knob_value=0 ;; negative) knob_value=-5 ;; *) knob_value="not-a-number" ;; esac
+        out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" FM_WATCH_EXTENSION_LOG_KEEP_LINES="$knob_value" node "$driver" 2>&1)
+        ;;
+    esac
     status=$?
     expect_code 0 "$status" "Pi superseded delivery must still succeed with the log $mode: $out"
-    [ -z "$out" ] || fail "Pi log-off ($mode) run printed output: $out"
-    [ ! -e "$extension_log" ] || fail "Pi extension wrote its diagnostic log with the knob $mode: $(cat "$extension_log")"
+    [ -z "$out" ] || fail "Pi log run ($mode) printed output: $out"
+    case "$mode" in
+      zero|negative)
+        [ ! -e "$extension_log" ] || fail "Pi extension wrote its diagnostic log with the knob $mode: $(cat "$extension_log")"
+        ;;
+      *)
+        [ -s "$extension_log" ] || fail "Pi extension wrote no default diagnostic log with the knob $mode"
+        ;;
+    esac
   done
-  pass "Pi extension diagnostic log stays off unless opted in"
+  pass "Pi extension diagnostic log is on by default and off only for an explicit zero or negative knob"
+}
+
+# Queue-stall rearm. The stall monitor reads FM_WATCH_STALL_NOW at every tick,
+# so the driver ages the queue by moving that clock instead of waiting ten
+# minutes. No session_start is ever fired, so the generation owns no arm child
+# until the monitor starts one.
+write_pi_stall_driver() {  # <driver-path>
+  cat > "$1" <<'EOF'
+import { existsSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const state = `${process.env.FM_HOME}/state`;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let prompt = "";
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool() {},
+  sendUserMessage: async (message) => {
+    prompt += message;
+  },
+};
+const arms = () => (existsSync(process.env.FM_ARM_LOG)
+  ? readFileSync(process.env.FM_ARM_LOG, "utf8").split("\n").filter((row) => row.startsWith("arm=")).length
+  : 0);
+const stallAttempts = () => {
+  const path = `${state}/.watch-extension.log`;
+  return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter((row) => row.includes("stall rearm attempt=")).length : 0;
+};
+const waitFor = async (what, predicate) => {
+  for (let i = 0; i < 400 && !predicate(); i += 1) await sleep(20);
+  if (!predicate()) throw new Error(`timed out waiting for ${what}`);
+};
+const base = 1800000000;
+const queueRow = (age) => writeFileSync(`${state}/.wake-queue`, `${base - age}\tsignal: queued\n`);
+const beat = (age) => {
+  writeFileSync(`${state}/.last-watcher-beat`, "");
+  utimesSync(`${state}/.last-watcher-beat`, base - age, base - age);
+};
+const setNow = (offset) => {
+  process.env.FM_WATCH_STALL_NOW = String(base + offset);
+};
+writeFileSync(`${state}/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+const scenario = await import(pathToFileURL(process.env.SCENARIO).href);
+await scenario.run({ sleep, arms, stallAttempts, waitFor, queueRow, beat, setNow, prompt: () => prompt, state });
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+process.exit(0);
+EOF
+}
+
+write_pi_stall_arm_stub() {  # <repo>
+  local arm="$1/bin/fm-watch-arm.sh"
+  cat > "$arm" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+if [ "${FM_STUB_MODE:?}" = dies ]; then
+  printf 'watcher: FAILED - synthetic stall arm failure\n' >&2
+  exit 1
+fi
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
+trap 'exit 0' TERM INT
+while [ ! -e "$FM_STOP_FILE" ] && [ -e "$0" ]; do sleep 0.02; done
+SH
+  chmod +x "$arm"
+}
+
+# A queue that has waited past the stall bound with a stale beacon rearms once
+# through the owner path; a young queue, a fresh beacon, and a held fleet do
+# not. While that arm child is live, later ticks are an ownership no-op, so
+# the arm already in flight is never doubled.
+test_pi_queue_stall_rearms_once_and_respects_a_live_arm() {
+  local repo home driver scenario out status
+  repo="$TMP_ROOT/pi-stall-alive-root"
+  home="$TMP_ROOT/pi-stall-alive-home"
+  driver="$TMP_ROOT/pi-stall-alive-driver.mjs"
+  scenario="$TMP_ROOT/pi-stall-alive-scenario.mjs"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  write_pi_stall_arm_stub "$repo"
+  write_pi_stall_driver "$driver"
+  cat > "$scenario" <<'EOF'
+import { writeFileSync, unlinkSync } from "node:fs";
+export async function run({ sleep, arms, stallAttempts, waitFor, queueRow, beat, setNow, state }) {
+  const settle = () => sleep(300);
+  // Younger than the 600 s bound: nothing.
+  setNow(0);
+  queueRow(599);
+  beat(5000);
+  await settle();
+  if (arms() !== 0) throw new Error(`a young queue rearmed: ${arms()}`);
+  // Old queue but a fresh beacon: the watcher is alive.
+  queueRow(700);
+  beat(30);
+  await settle();
+  if (arms() !== 0) throw new Error(`a fresh beacon rearmed: ${arms()}`);
+  // A deliberate fleet hold keeps wakes queued.
+  beat(5000);
+  writeFileSync(`${state}/HOLD`, "hold\n");
+  await settle();
+  if (arms() !== 0) throw new Error(`a held fleet rearmed: ${arms()}`);
+  unlinkSync(`${state}/HOLD`);
+  // Stalled: one rearm, then the live child owns recovery.
+  await waitFor("the stall rearm", () => arms() === 1);
+  await waitFor("the attempt log", () => stallAttempts() === 1);
+  setNow(10000);
+  await settle();
+  if (arms() !== 1) throw new Error(`a live arm child was doubled: ${arms()}`);
+  if (stallAttempts() !== 1) throw new Error(`a live arm child spent another attempt: ${stallAttempts()}`);
+}
+EOF
+  out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" SCENARIO="$scenario" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$TMP_ROOT/pi-stall-alive.log" FM_STOP_FILE="$TMP_ROOT/pi-stall-alive.stop" FM_STUB_MODE=alive FM_WATCH_STALL_CHECK_MS=20 node "$driver" 2>&1)
+  status=$?
+  expect_code 0 "$status" "Pi stall rearm must start exactly one arm and leave a live one alone: $out"
+  [ -z "$out" ] || fail "Pi stall rearm (live arm) printed output: $out"
+  pass "Pi queue stall rearms once and treats a live arm child as an ownership no-op"
+}
+
+# Attempts back off exponentially (60 s, 120 s, 240 s on the injected clock),
+# stop at the limit, and the exhaustion alarm reaches main exactly once.
+test_pi_queue_stall_backs_off_and_alarms_when_exhausted() {
+  local repo home driver scenario out status
+  repo="$TMP_ROOT/pi-stall-dies-root"
+  home="$TMP_ROOT/pi-stall-dies-home"
+  driver="$TMP_ROOT/pi-stall-dies-driver.mjs"
+  scenario="$TMP_ROOT/pi-stall-dies-scenario.mjs"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  write_pi_stall_arm_stub "$repo"
+  write_pi_stall_driver "$driver"
+  cat > "$scenario" <<'EOF'
+export async function run({ sleep, stallAttempts, waitFor, queueRow, beat, setNow, prompt }) {
+  const settle = () => sleep(400);
+  const alarms = () => (prompt().match(/rearmed the watcher/g) || []).length;
+  setNow(0);
+  queueRow(700);
+  beat(5000);
+  await waitFor("attempt 1", () => stallAttempts() === 1);
+  await settle();
+  setNow(59);
+  await settle();
+  if (stallAttempts() !== 1) throw new Error(`attempt 2 ignored the 60 s backoff: ${stallAttempts()}`);
+  setNow(60);
+  await waitFor("attempt 2", () => stallAttempts() === 2);
+  await settle();
+  setNow(179);
+  await settle();
+  if (stallAttempts() !== 2) throw new Error(`attempt 3 ignored the 120 s backoff: ${stallAttempts()}`);
+  setNow(180);
+  await waitFor("attempt 3", () => stallAttempts() === 3);
+  await settle();
+  // The limit is 3: no fourth attempt, and no alarm until the last backoff ends.
+  setNow(419);
+  await settle();
+  if (stallAttempts() !== 3) throw new Error(`a fourth attempt ran past the limit: ${stallAttempts()}`);
+  if (alarms() !== 0) throw new Error(`the alarm fired before the last backoff ended: ${prompt()}`);
+  setNow(420);
+  await waitFor("the exhaustion alarm", () => alarms() === 1);
+  if (!prompt().includes("rearmed the watcher 3 times")) throw new Error(`alarm text is wrong: ${prompt()}`);
+  setNow(100000);
+  await settle();
+  if (alarms() !== 1) throw new Error(`the exhaustion alarm repeated: ${alarms()}`);
+  if (stallAttempts() !== 3) throw new Error(`attempts continued after exhaustion: ${stallAttempts()}`);
+}
+EOF
+  out=$(PLUGIN="$repo/.pi/extensions/fm-primary-pi-watch.ts" SCENARIO="$scenario" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$TMP_ROOT/pi-stall-dies.log" FM_STOP_FILE="$TMP_ROOT/pi-stall-dies.stop" FM_STUB_MODE=dies FM_WATCH_STALL_CHECK_MS=20 FM_WATCH_STALL_ATTEMPT_LIMIT=3 FM_WATCH_REARM_RETRY_LIMIT=1 FM_WATCH_REARM_RETRY_BASE_MS=1 FM_WATCH_REARM_RETRY_MAX_MS=1 FM_WATCH_SELFHEAL_ROUNDS=0 node "$driver" 2>&1)
+  status=$?
+  expect_code 0 "$status" "Pi stall rearm must back off, stop at the limit, and alarm once: $out"
+  [ -z "$out" ] || fail "Pi stall rearm (exhaustion) printed output: $out"
+  pass "Pi queue stall backs off exponentially, stops at the limit, and alarms once"
 }
 
 # A repair call must not no-op on an arm child whose process is already dead
@@ -6281,7 +6460,9 @@ test_pi_confirm_failure_retires_arm_with_distinct_watcher_pid
 test_pi_confirm_failure_spares_a_newer_arm
 test_pi_superseded_delivery_has_no_rejection_appendix
 test_pi_superseded_delivery_is_offered_to_branch
-test_pi_extension_log_stays_off_unless_opted_in
+test_pi_extension_log_is_default_on_with_explicit_opt_out
+test_pi_queue_stall_rearms_once_and_respects_a_live_arm
+test_pi_queue_stall_backs_off_and_alarms_when_exhausted
 test_pi_repair_starts_fresh_arm_over_dead_child
 test_pi_scheduled_retry_starts_fresh_arm_over_dead_child
 test_pi_deferred_close_starts_fresh_arm_over_dead_child

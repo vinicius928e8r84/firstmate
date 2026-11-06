@@ -151,7 +151,7 @@ A failed confirmation is a restoration failure: the adapter classifies the error
 Pi retires the current successor only when the failed token names its exact watcher pid and generation and that pid is no longer alive, while omp and OpenCode retire the current successor whenever the restoration's watcher pid is no longer alive.
 On Pi a generation mismatch means a newer pipeline superseded this delivery mid-restore, so the wake routes like a confirmed delivery, with no failure appendix, and nothing is retired.
 An already-acknowledged episode confirms as a no-op when the confirmation names its generation, because the drain acknowledged it after the successor started but before the confirmation ran.
-The Pi extension diagnostic log is opt-in and off by default: only a positive FM_WATCH_EXTENSION_LOG_KEEP_LINES value appends restore attempts, readiness timeouts, and confirmation targets and results to state/.watch-extension.log, a bounded record that never changes supervision behavior.
+The Pi extension diagnostic log is on by default and bounded: restore attempts, readiness timeouts, confirmation targets and results, and queue-stall rearm attempts append to state/.watch-extension.log, which keeps the newest 2000 rows unless FM_WATCH_EXTENSION_LOG_KEEP_LINES says otherwise, and it never changes supervision behavior.
 docs/configuration.md owns the knob's default and accepted values.
 A failed confirmation is never swallowed.
 
@@ -172,6 +172,17 @@ A wake that already carries an actionable close is never delayed by these rounds
 This is deliberate Option B ordering.
 Whenever restoration succeeds, the fleet is protected before the model handles the wake.
 When restoration does not succeed, the model is never left blind.
+
+### Queue-stall rearm
+
+A watcher that goes silent leaves wakes queued with nothing to deliver them, and `bin/fm-silent-watcher.sh` alarms out of band at 900 seconds but rearms nothing.
+The Pi extension therefore checks every `FM_WATCH_STALL_CHECK_MS` whether the oldest row in `state/.wake-queue` is older than `FM_WATCH_STALL_REARM_SECS` (600) while `state/.last-watcher-beat` is older than `FM_WATCH_STALL_BEACON_FRESH_SECS`.
+A fleet hold in `state/HOLD` and an unexpired `state/.quota-silence` keep wakes queued on purpose, so neither counts as a stall.
+A stall rearms through the same owner path as `fm_watch_arm_pi`, never a second cycle: a live arm child, a scheduled retry, a restore, a self-heal, or an undelivered actionable close already owns recovery, so the check does nothing and spends no attempt.
+Attempts wait `FM_WATCH_STALL_BACKOFF_BASE_SECS` doubling up to `FM_WATCH_STALL_BACKOFF_MAX_SECS`, and each is logged to the extension diagnostic log.
+After `FM_WATCH_STALL_ATTEMPT_LIMIT` attempts and one more backoff with the stall still standing, one typed failure reaches main.
+A drained queue or a fresh beacon ends the stall and resets the count.
+`tests/fm-pi-watch-extension.test.sh` pins both paths with an injected clock (`FM_WATCH_STALL_NOW`).
 
 ### Claude handling successor
 

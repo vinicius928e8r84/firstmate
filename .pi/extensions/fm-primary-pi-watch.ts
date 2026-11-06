@@ -36,7 +36,7 @@
 // consumption changes.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
@@ -121,6 +121,12 @@ type SessionGeneration = {
   deferredClose: { message: string; predecessorArmPid: string } | null;
   // A self-heal sequence is running after the retry ladder was exhausted.
   healing: boolean;
+  // Queue-stall rearm bookkeeping (see stallTick): attempts spent in the
+  // current stall, the epoch second before which no further attempt is made,
+  // and whether the exhaustion alarm was already raised.
+  stallAttempts: number;
+  stallNextAt: number;
+  stallAlarmed: boolean;
 };
 
 function refreshWatchToolShell(
@@ -167,6 +173,18 @@ const retryLimit = positiveInteger("FM_WATCH_REARM_RETRY_LIMIT", 5);
 // minutes recovers without a model turn. Zero disables them.
 const selfHealRounds = nonNegativeInteger("FM_WATCH_SELFHEAL_ROUNDS", 3);
 const selfHealDelayMs = positiveInteger("FM_WATCH_SELFHEAL_DELAY_MS", retryMaxMs * 8);
+// Queue-stall rearm: a wake queue whose oldest row is older than the stall
+// bound while the watcher beacon is not fresh is a silent watcher
+// (bin/fm-silent-watcher.sh raises the out-of-band alarm at 900 s). The
+// extension rearms through its own owner path after 600 s instead of waiting
+// for a model turn. Attempts back off exponentially and are bounded; the
+// exhaustion alarm goes to main. Zero FM_WATCH_STALL_REARM_SECS disables it.
+const stallRearmSecs = nonNegativeInteger("FM_WATCH_STALL_REARM_SECS", 600);
+const stallBeaconFreshSecs = positiveInteger("FM_WATCH_STALL_BEACON_FRESH_SECS", 180);
+const stallCheckMs = positiveInteger("FM_WATCH_STALL_CHECK_MS", 30000);
+const stallBackoffBaseSecs = positiveInteger("FM_WATCH_STALL_BACKOFF_BASE_SECS", 60);
+const stallBackoffMaxSecs = positiveInteger("FM_WATCH_STALL_BACKOFF_MAX_SECS", 900);
+const stallAttemptLimit = positiveInteger("FM_WATCH_STALL_ATTEMPT_LIMIT", 5);
 // 35s on Windows so the budget stays above arm's MSYS confirm default (30s in
 // bin/fm-watch-arm.sh): a slow but successful Git Bash cold start must not be
 // SIGTERMed mid-confirmation. Conditioned on win32 so other platforms keep 12s.
@@ -243,16 +261,17 @@ function positiveInteger(name: string, fallback: number): number {
   return Math.floor(value);
 }
 
-// Opt-in bound for the extension diagnostic log: only a positive
-// FM_WATCH_EXTENSION_LOG_KEEP_LINES enables logging, so the default run
-// writes nothing. Unset, empty, non-numeric, zero, and negative values
-// disable the log entirely instead of falling back to a silent default.
+// Bound for the extension diagnostic log: 2000 newest rows by default.
+// An unset, empty, or non-numeric FM_WATCH_EXTENSION_LOG_KEEP_LINES keeps
+// the default; zero or a negative value is the explicit opt-out and disables
+// the log entirely.
 function extensionLogKeepLines(): number {
+  const extensionLogDefaultKeepLines = 2000;
   const raw = process.env.FM_WATCH_EXTENSION_LOG_KEEP_LINES;
-  if (raw === undefined || raw.trim() === "") return 0;
+  if (raw === undefined || raw.trim() === "") return extensionLogDefaultKeepLines;
   const value = Math.floor(Number(raw));
-  if (!Number.isFinite(value) || value <= 0) return 0;
-  return value;
+  if (!Number.isFinite(value)) return extensionLogDefaultKeepLines;
+  return value > 0 ? value : 0;
 }
 
 // Extra milliseconds a loaded host may need beyond the fixed ready timeout: the
@@ -445,6 +464,48 @@ function appendExtensionLog(detail: string): void {
   }
 }
 
+// Epoch seconds for the stall monitor. FM_WATCH_STALL_NOW (read at every
+// tick) replaces the clock so tests can age the queue without waiting.
+function stallNowSecs(): number {
+  const raw = process.env.FM_WATCH_STALL_NOW;
+  if (raw !== undefined && /^[0-9]+$/.test(raw)) return Number(raw);
+  return Math.floor(Date.now() / 1000);
+}
+
+// Age in seconds of the oldest queued wake once the queue has waited past the
+// stall bound with no fresh watcher beacon, else null. A fleet hold and a
+// usage-limit silence keep wakes queued on purpose, so they are never a stall.
+function stalledQueueAge(nowSecs: number): number | null {
+  if (existsSync(`${state}/HOLD`)) return null;
+  try {
+    const silence = readFileSync(`${state}/.quota-silence`, "utf8").match(/^until=([0-9]+)$/m);
+    if (silence && Number(silence[1]) > nowSecs) return null;
+  } catch {
+    // No silence record.
+  }
+  let queue = "";
+  try {
+    queue = readFileSync(`${state}/.wake-queue`, "utf8");
+  } catch {
+    return null;
+  }
+  let oldest = Infinity;
+  for (const row of queue.split("\n")) {
+    const stamp = row.match(/^([0-9]+)\t/);
+    if (stamp) oldest = Math.min(oldest, Number(stamp[1]));
+  }
+  if (!Number.isFinite(oldest)) return null;
+  const age = nowSecs - oldest;
+  if (age < stallRearmSecs) return null;
+  try {
+    const beatAge = nowSecs - Math.floor(statSync(`${state}/.last-watcher-beat`).mtimeMs / 1000);
+    if (beatAge <= stallBeaconFreshSecs) return null;
+  } catch {
+    // No beacon at all is not fresh.
+  }
+  return age;
+}
+
 function createPendingActionable(message: string, predecessorArmPid: string): PendingActionableClose {
   return {
     version: 1,
@@ -599,6 +660,9 @@ function createGeneration(): SessionGeneration {
     unconsumedWakes: new Map(),
     deferredClose: null,
     healing: false,
+    stallAttempts: 0,
+    stallNextAt: 0,
+    stallAlarmed: false,
   };
 }
 
@@ -1474,6 +1538,40 @@ export default function (pi: ExtensionAPI) {
     appendExtensionLog("selfheal ready=timeout");
     return false;
   }
+
+  // Queue-stall rearm (knobs above). A live arm child, a scheduled retry, a
+  // restore, a self-heal, or an undelivered actionable close already owns
+  // recovery, so the tick does nothing and spends no attempt. Otherwise it rearms through activateOwnedWatch, the same owner
+  // path fm_watch_arm_pi takes, so it can never start a second cycle.
+  function stallTick(): void {
+    const owner = generation;
+    if (stallRearmSecs <= 0 || !generationIsLive(owner)) return;
+    const nowSecs = stallNowSecs();
+    const age = stalledQueueAge(nowSecs);
+    if (age === null) {
+      owner.stallAttempts = 0;
+      owner.stallNextAt = 0;
+      owner.stallAlarmed = false;
+      return;
+    }
+    if (owner.stallAttempts >= stallAttemptLimit) {
+      if (owner.stallAlarmed || nowSecs < owner.stallNextAt) return;
+      owner.stallAlarmed = true;
+      appendExtensionLog(`stall rearm exhausted attempts=${owner.stallAttempts} age=${age}s outcome=hand-to-main`);
+      surfaceFailure(owner, `watcher: FAILED - Pi extension rearmed the watcher ${owner.stallAttempts} times for a wake queue stalled ${age}s with no fresh watcher beacon, and the stall persists`);
+      return;
+    }
+    if (lockOwnership() !== "owned") return;
+    if (liveArmChild(owner) || owner.retryTimer || owner.restoring || owner.healing || owner.pendingActionables.length > 0) return;
+    if (nowSecs < owner.stallNextAt) return;
+    owner.stallAttempts += 1;
+    owner.stallNextAt = nowSecs + Math.min(stallBackoffMaxSecs, stallBackoffBaseSecs * 2 ** (owner.stallAttempts - 1));
+    owner.retryFailures = 0;
+    const result = activateOwnedWatch(owner);
+    appendExtensionLog(`stall rearm attempt=${owner.stallAttempts} age=${age}s start=${result.ok ? `ok pid=${owner.child?.pid ?? "none"}` : "failed"}`);
+  }
+  const stallTimer = setInterval(stallTick, stallCheckMs);
+  stallTimer.unref();
 
   pi.events?.on?.(FM_WATCH_SELFHEAL_EVENT, (data) => {
     const request = data as { accepted?: boolean; settlement?: Promise<boolean> | null };
