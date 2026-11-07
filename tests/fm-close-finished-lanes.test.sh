@@ -229,6 +229,35 @@ SH
   pass "the real PR reader is called with the shape the helper expects"
 }
 
+test_pr_found_only_in_status_line() {
+  make_world statuspr
+  local id n fakebin
+  for id in q1 q2 q3 q4; do add_task "$id" ship "done"; done
+  printf 'done [at=1]: PR https://github.com/octo/repo/pull/71\n' > "$W/home/state/q1.status"
+  printf 'done [at=1]: PR https://github.com/octo/repo/pull/72\n' > "$W/home/state/q2.status"
+  printf 'done [at=1]: finished, no link\n' > "$W/home/state/q3.status"
+  printf 'done [at=1]: PR https://github.com/octo/repo/pull/74\n' > "$W/home/state/q4.status"
+  fakebin=$(fm_fakebin "$W/fakebin")
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *"number=71"*) printf 'state=MERGED\nmerged=true\n' ;;
+  *"number=72"*) printf 'state=OPEN\nmerged=false\n' ;;
+  *"number=74"*) printf 'state=CLOSED\nmerged=false\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/gh"
+  out=$(PATH="$fakebin:$PATH" REAL_PR_READER='' run_close --apply)
+  assert_contains "$out" "closed: q1" "a merged PR found only in the status line closes the lane"
+  assert_contains "$out" "kept: q2 PR not merged (open)" "an open PR from the status line keeps the lane"
+  assert_contains "$out" "kept: q3 no merged PR recorded" "a status line without a PR URL keeps the lane"
+  assert_contains "$out" "kept: q4 PR not merged (closed)" "a PR closed without merge keeps the lane"
+  assert_equals "q1" "$(cat "$W/td.log")" "only the merged lane reached teardown"
+  pass "a PR URL in the status line counts as merged evidence only when merged"
+}
+
 test_usage_error() {
   make_world usage
   run_close --bogus > /dev/null; rc=$?
@@ -246,6 +275,7 @@ test_ship_with_open_or_unreadable_pr_is_kept
 test_prless_ship_needs_branch_on_local_default
 test_archive_copy_failure_keeps_the_lane
 test_real_pr_reader_call_shape
+test_pr_found_only_in_status_line
 test_usage_error
 
 echo '# all fm-close-finished-lanes tests passed'
