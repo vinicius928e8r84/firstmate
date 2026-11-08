@@ -2,7 +2,9 @@
 # Behavior tests for project capacity admission: a project that declares how
 # many workers it admits at once on this machine never gets a fresh worker
 # launched beyond that number (bin/fm-project-capacity-lib.sh owns the
-# contract; bin/fm-spawn.sh runs the check).
+# contract; bin/fm-spawn.sh runs the check). The opt-in lane capacity spawn
+# gate (config/lane-capacity admit-spawns; bin/fm-capacity.sh owns the verdict)
+# is covered here too, because it defers through the same spawn path.
 #
 # Every case drives the real bin/fm-spawn.sh against a real project clone with
 # an origin, fake tmux and treehouse binaries that log every call, and a real
@@ -837,6 +839,64 @@ test_failed_scheduled_spawn_is_recorded_even_when_deferred() {
   pass "a deferred scheduled spawn is recorded for the lane guard and an ordinary deferral is not"
 }
 
+# Adaptive lane budget (bin/fm-capacity.sh auto mode) and the opt-in gate. Both
+# are off unless config/lane-capacity asks: the first line `auto` replaces the
+# fixed cap, and `admit-spawns` asks bin/fm-spawn.sh to consult the verdict.
+test_auto_mode_does_not_apply_the_fixed_ceiling() {
+  local case_dir home out rc=0
+  case_dir=$(make_case lane-auto-no-ceiling task-c)
+  home="$case_dir/home"
+  printf 'auto\n' > "$home/config/lane-capacity"
+  write_live "$home" live-a "$case_dir/project"
+  out=$(spawn_ship "$case_dir" task-c) || rc=$?
+  expect_code 0 "$rc" "auto mode without admit-spawns refused or deferred a spawn: $out"
+  assert_contains "$out" "spawned task-c" "auto mode without admit-spawns did not launch the worker"
+  assert_absent "$home/state/.lane-admission.lock" "a spawn without admit-spawns touched the lane admission lock"
+  pass "auto mode without admit-spawns neither counts a fixed ceiling nor gates a spawn"
+}
+
+test_lane_capacity_gate_defers_without_leaving_anything_behind() {
+  local case_dir home out rc=0 before worktrees
+  case_dir=$(make_case lane-defer task-c)
+  home="$case_dir/home"
+  printf '14\nadmit-spawns\nreserve-flag %s host reserved for the test\n' "$case_dir/reserved.flag" > "$home/config/lane-capacity"
+  : > "$case_dir/reserved.flag"
+  before=$(call_count "$case_dir")
+  worktrees=$(worktree_list "$case_dir")
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "a spawn the lane verdict refuses was not deferred: $out"
+  # The reasons depend on this host's own probes, so only the verdict's owner is asserted.
+  assert_contains "$out" "deferred: lane capacity of this home ($home/config/lane-capacity) does not admit another lane: " \
+    "the deferral did not name the lane capacity verdict"
+  assert_contains "$out" "task task-c was not launched and its backlog item stays queued" "the deferral did not say the task stays queued"
+  assert_nothing_created "$case_dir" "$home" task-c "$before" "$worktrees"
+  assert_absent "$home/state/.lane-admission.lock" "a deferred spawn left the lane admission lock held"
+  rc=0
+  out=$(FM_SPAWN_IGNORE_LANE_CAPACITY=1 spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code "$DEFER_EXIT" "$rc" "an environment variable bypassed the lane capacity verdict: $out"
+  assert_nothing_created "$case_dir" "$home" task-c "$before" "$worktrees"
+  pass "admit-spawns defers a spawn the lane verdict refuses, leaves nothing behind, and nothing in the environment bypasses it"
+}
+
+test_lane_capacity_gate_refuses_an_unreadable_opt_in() {
+  local case_dir home out rc=0 before worktrees
+  case_dir=$(make_case lane-invalid task-c)
+  home="$case_dir/home"
+  printf 'twelve\nadmit-spawns\n' > "$home/config/lane-capacity"
+  before=$(call_count "$case_dir")
+  worktrees=$(worktree_list "$case_dir")
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code 1 "$rc" "an unreadable opted-in lane capacity did not refuse: $out"
+  assert_contains "$out" "lane cap" "the refusal did not name the lane capacity"
+  assert_nothing_created "$case_dir" "$home" task-c "$before" "$worktrees"
+  printf 'auto\nadmit-spawns\nmax-lanes many\n' > "$home/config/lane-capacity"
+  rc=0
+  out=$(spawn_ship "$case_dir" task-c "$case_dir/unused") || rc=$?
+  expect_code 1 "$rc" "a malformed auto lane capacity that asks for the gate did not refuse: $out"
+  assert_nothing_created "$case_dir" "$home" task-c "$before" "$worktrees"
+  pass "a malformed lane capacity that asks for the gate refuses spawns instead of guessing"
+}
+
 test_undeclared_capacity_keeps_dispatch_uncapped
 test_available_capacity_admits_the_worker
 test_exhausted_capacity_defers_without_leaving_anything_behind
@@ -863,3 +923,6 @@ test_scheduled_spawn_keeps_the_memory_floor
 test_invalid_scheduled_reserve_refuses_and_absent_defaults
 test_scheduled_flag_is_limited_to_fresh_lanes
 test_failed_scheduled_spawn_is_recorded_even_when_deferred
+test_auto_mode_does_not_apply_the_fixed_ceiling
+test_lane_capacity_gate_defers_without_leaving_anything_behind
+test_lane_capacity_gate_refuses_an_unreadable_opt_in

@@ -731,7 +731,7 @@ With the file absent nothing changes: the report prints counts and host figures 
 Persistent secondmates hold no lane.
 The file is a per-machine choice and is not inherited by secondmate homes, so each home owns its own numbers.
 
-The first non-comment line is the cap, one non-negative integer, so a file holding only that integer keeps its earlier meaning.
+The first non-comment line is the cap, one non-negative integer, so a file holding only that integer keeps its earlier meaning, or the word `auto` for a measured budget instead of a fixed cap (below).
 Optional lines follow, one key and its value per line, with `#` starting a comment:
 
 ```text
@@ -744,6 +744,7 @@ captain-idle 300       # opt-in, macOS: the captain counts as present when input
 quota-provider claude  # opt-in: publish that provider's quota runway
 max-load1 20           # keep a raw 1-minute load rule while beats replace it
 scheduled-reserve 4    # lanes reserved for scheduled loops, outside the cap (default 4)
+admit-spawns           # opt-in: bin/fm-spawn.sh defers a fresh ship or scout this verdict does not admit
 ```
 
 `pressure-file` and `reserve-flag` may repeat and take an absolute or `~/` path; a `reserve-flag` path may be followed by the label it is reported by.
@@ -754,10 +755,36 @@ A pressure file is any producer of the `lookout.beat` 1.x shape, read by its own
 `captain-idle` reads input idle time locally and publishes only `present`, `idle`, or `away` (an away record), never the idle time itself.
 `quota-provider` is the only key that makes the script reach the network, through `quota-axi`, bounded to five seconds.
 
+### Auto budget
+
+Auto mode is opt-in and off by default: a `config/lane-capacity` without `auto` as its first line keeps the fixed cap, the scheduled-loop reserve, and every existing key exactly as above.
+To turn it on, replace the fixed-cap number on the first line with `auto` (the other keys, including `scheduled-reserve`, stay valid), and add `admit-spawns` if `bin/fm-spawn.sh` should defer fresh ships and scouts the measured budget does not admit; the fixed ceiling in `bin/fm-spawn.sh` does not apply in auto mode, so without `admit-spawns` the auto budget only reports.
+To turn it off again, put the fixed-cap number back as the first line.
+With `auto` on the first line there is no hand-set cap: on every call the script measures this machine's free memory, run queue, and disk, divides each by what one lane is learned to cost, and admits the smallest result, so one file works unchanged on a 16 GB laptop, a 48 GB workstation, a Windows PC under WSL2, and a Git Bash home on Windows itself.
+
+```text
+auto                   # measured budget; no fixed cap
+max-lanes 16           # the one optional ceiling for this machine's lanes
+min-gpu-free-gb 4      # only for work that uses the GPU; agent workers do not
+```
+
+`max-lanes` and `min-gpu-free-gb` are valid only with `auto`; `min-avail-gb`, `min-disk-gb`, and `max-load1` keep their meaning as the captain's safety floor.
+There are no per-lane pins: the script samples each lane's process tree while the watcher publishes, learns the per-lane memory, CPU, and disk cost from this machine's last 30 measured lanes once five are recorded, and keeps that ledger in `state/lane-footprint.json`.
+A lane whose process tree was never attributed is left out of that learning, so a backend that runs its agent outside the recorded worktree cannot teach a near-zero footprint.
+Pressure stall, swap-in rate, macOS memory pressure, thermal limits, battery, and under WSL2 the Windows host's own memory close admission at once and reopen only after three clean readings, and growth after a reopen is damped, so admission does not flap.
+A reading that cannot be taken never counts as clean: a gate that was closed stays closed with its clean count held until a real reading clears it, and a gate that was open stays unknown and is not judged.
+The damped budget is what a spawn is admitted against: lanes started since the last publish count against it, so a burst of spawns between two publishes cannot exceed it.
+A `pressure-file` beat can only lower the memory the budget sees, never raise it above the live reading.
+Memory is the one reading the budget cannot do without: when it is unmeasurable the budget never admits on cpu alone, it falls back to the static `max-lanes` ceiling (or nothing without one), and the verdict's reasons say so.
+Inside WSL2 the Linux view decides how many lanes fit in the VM and the Windows host view, read through `powershell.exe`, can only close admission.
+On Windows itself (Git Bash or MSYS, where `uname -s` is `MINGW*` or `MSYS*`) the same `powershell.exe` view supplies the memory, cores, load, and power readings the MSYS `/proc` lacks.
+The published facts add the budget, the per-lane footprint, the vitals, the gate states, and a ranked reclaim list of idle lanes (finished, no agent, PR handed off, parked, quiet) with their evidence; the list only recommends, and every cleanup or exit still goes through the normal landed-work checks.
+Auto mode needs `jq`, and it never reaches the network.
+
 While the file exists, the watcher runs `bin/fm-capacity.sh --publish` detached at most every 30 seconds, writing this home's lane facts to `state/lane-capacity.json`: its lanes, its cap and limits, its machine's pressure and boots, its watcher's freshness, and its own admission verdict.
 Publishing is best-effort and never changes what the watcher does.
-`bin/fm-capacity.sh --admit` is an advisory check of the same verdict: it exits 0 when the verdict admits or the file is absent, and reports the reasons on stderr with exit 75 when it does not.
-No Firstmate script calls it.
+`bin/fm-capacity.sh --admit` checks the same verdict: it exits 0 when the verdict admits or the file is absent, and reports the reasons on stderr with exit 75 when it does not.
+Only with `admit-spawns` does `bin/fm-spawn.sh` ask it, as `--spawn-gate`, before a fresh ship or scout: a refusal defers the spawn with exit 75 and leaves the task queued, and a malformed file that names `admit-spawns`, or a file that exists but cannot be read, refuses spawns rather than guessing; without that key no spawn reads the verdict, and nothing in the environment skips it.
 The cap itself is a real ceiling: while the file exists, `bin/fm-spawn.sh` defers a fresh ship or scout with one `deferred:` line and exit 75 once `bin/fm-capacity.sh` counts as many ordinary lanes as the cap, before creating anything, so its backlog item stays queued.
 An ordinary worker has no override flag: clean up a lane or raise the number.
 
@@ -771,7 +798,7 @@ A wrapper that declines only because of host load exits 79 and prints `scheduled
 A wrapper that spawns its own lane gets `FM_SCHEDULED_LOOP=<loop>` and passes `--scheduled-loop` to `bin/fm-spawn.sh`, so its lane comes from the reserve; the captain's setting is `scheduled-reserve 1` in `config/lane-capacity`, one scheduled lane beyond the ordinary cap.
 The helper's header owns the exit codes, the line contract, the retry bounds and their environment overrides, and the record formats; `bin/fm-lane-guard.sh` also records a failed scheduled spawn even when its status is the 75 deferral.
 Work that is CPU-heavy and needs none of this home's data can instead go to a remote secondmate with room: `bin/fm-overflow.sh pick` reads each candidate's published `state/lane-capacity.json` (creative-aux and pc-aux2 by default, so those homes need their own `config/lane-capacity`), skips any host without a free lane, with load per core at or over 3, under critical pressure, reserved, or with stale facts, and prints the pick with its reason or `none free`; `bin/fm-overflow.sh send <text...>` hands the text to the pick as a marked routed request through `bin/fm-send.sh` ([remote second mates](remote-secondmates.md)).
-The script's header owns the report line, the published document's fields, the verdict, the beat freshness rules, the host-constraint thresholds, and the probe fallbacks.
+The script's header owns the report line, the published document's fields, the verdict, the auto budget's rules and thresholds, the beat freshness rules, the host-constraint thresholds, and the probe fallbacks; `bin/fm-lane-vitals-lib.sh` owns how each vital is measured.
 
 ## PR-ready line after green (config/ready-after-green)
 

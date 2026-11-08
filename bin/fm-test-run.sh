@@ -397,7 +397,7 @@ family_for_basename() {
     fm-trace-context-spawn.test.sh|fm-spawn-worktree-settle.test.sh|\
     fm-spawn-compact-adviser-disable.test.sh|\
     fm-spawn-compact-adviser-disable-remote.test.sh|\
-    fm-project-capacity.test.sh|\
+    fm-project-capacity.test.sh|fm-lane-capacity-integration.test.sh|\
     fm-teardown-endpoint-safety.test.sh)
       printf '%s\n' backend-dispatch
       ;;
@@ -430,7 +430,7 @@ family_for_basename() {
       printf '%s\n' orca
       ;;
     fm-adapter-limits.test.sh|fm-branch-supervision.test.sh|fm-busy-adapter-wiring.test.sh|\
-    fm-busy-state.test.sh|fm-capacity.test.sh|fm-overflow.test.sh|fm-classify-corr-token.test.sh|\
+    fm-busy-state.test.sh|fm-capacity.test.sh|fm-capacity-auto.test.sh|fm-lane-vitals.test.sh|fm-overflow.test.sh|fm-classify-corr-token.test.sh|\
     fm-close-finished-lanes.test.sh|\
     fm-claude-stop-autoarm.test.sh|fm-cursor-harness.test.sh|\
     fm-dispatch-resolve.test.sh|\
@@ -738,6 +738,7 @@ tests/fm-calm-claude-mod-plugin.test.sh 77
 tests/fm-calm-claude-mod.test.sh 2527
 tests/fm-calm-pi-extension.test.sh 56463
 tests/fm-calm-pi-queue-retention-live-e2e.test.sh 1345
+tests/fm-capacity-auto.test.sh 36243
 tests/fm-check-unregister.test.sh 469
 tests/fm-ci-workflow.test.sh 5833
 tests/fm-classify-corr-token.test.sh 23085
@@ -796,6 +797,8 @@ tests/fm-inactive-reconcile.test.sh 60823
 tests/fm-inbox.test.sh 6062
 tests/fm-jev-mem-guard.test.sh 336
 tests/fm-kimi-harness.test.sh 58917
+tests/fm-lane-capacity-integration.test.sh 48000
+tests/fm-lane-vitals.test.sh 5077
 tests/fm-launch-prompt-signals-live-e2e.test.sh 50
 tests/fm-lint-workflows.test.sh 872
 tests/fm-live-gate.test.sh 7452
@@ -1579,6 +1582,14 @@ families_for_changed_path() {
       ;;
     bin/fm-capacity.sh)
       printf '%s\n' "__script__:fm-capacity.test.sh"
+      printf '%s\n' "__script__:fm-capacity-auto.test.sh"
+      printf '%s\n' "__script__:fm-project-capacity.test.sh"
+      printf '%s\n' "__script__:fm-lane-capacity-integration.test.sh"
+      ;;
+    bin/fm-lane-vitals-lib.sh)
+      printf '%s\n' "__script__:fm-lane-vitals.test.sh"
+      printf '%s\n' "__script__:fm-capacity-auto.test.sh"
+      printf '%s\n' "__script__:fm-lane-capacity-integration.test.sh"
       ;;
     bin/fm-scheduled-spawn.sh)
       printf '%s\n' "__script__:fm-scheduled-spawn.test.sh"
