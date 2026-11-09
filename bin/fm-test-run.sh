@@ -850,6 +850,7 @@ tests/fm-remote-secondmate-parent-binding.test.sh 42294
 tests/fm-remote-secondmate-relaunch.test.sh 879
 tests/fm-remote-secondmate-trace-context.test.sh 74870
 tests/fm-remote-transport-lanes.test.sh 66089
+tests/fm-request-log-retention.test.sh 7000
 tests/fm-review-delta.test.sh 4000
 tests/fm-review-rules.test.sh 500
 tests/fm-rovo-harness.test.sh 15691
@@ -897,6 +898,7 @@ tests/fm-task-inbox.test.sh 31965
 tests/fm-tasks-axi.test.sh 2293
 tests/fm-teardown-endpoint-safety.test.sh 40851
 tests/fm-teardown.test.sh 202132
+tests/fm-temp-sweep.test.sh 28000
 tests/fm-test-fixture-cleanup.test.sh 866
 tests/fm-test-fixtures.test.sh 1802
 tests/fm-test-isolation-proof.test.sh 2866
