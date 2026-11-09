@@ -188,8 +188,9 @@ test_resume_attempts_are_capped_and_a_good_turn_ends_the_cut() {
   local out dir
   dir=$(limit_status cap 1)
   out=$(run_keepalive resume-cap '
+    // The Claude bridge wording since 0.9.3, then the one before it.
+    endRun([{ role: "assistant", stopReason: "error", errorMessage: "Claude quota exceeded — rate limit (seven_day) — resets 6:30:00 PM: refused" }]); settle();
     const cut = [{ role: "assistant", stopReason: "error", errorMessage: "Claude rate limit (five_hour): refused" }];
-    endRun(cut); settle();
     await wait(200);
     start(); endRun(cut); settle();     // the resume was refused again
     await wait(200);

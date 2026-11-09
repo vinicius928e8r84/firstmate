@@ -94,9 +94,10 @@ const resumeText =
   "Continue the work you were doing when it stopped; if that turn had already finished, say so in one line.";
 
 // Provider wordings of an exhausted subscription or usage limit, as carried by an
-// errored assistant message's errorMessage (pi has no typed rate-limit error).
+// errored assistant message's errorMessage (pi has no typed rate-limit error). The
+// Claude bridge leads with "Claude rate limit" before 0.9.3 and "Claude quota exceeded" since.
 const usageLimitPattern =
-  /claude rate limit|you(?:'|’)ve (?:hit|reached) your|you(?:'|’)re out of (?:extra )?usage|usage (?:limit|allocation)|(?:weekly|5-hour|five.hour|session) limit/i;
+  /claude rate limit|claude quota exceeded|you(?:'|’)ve (?:hit|reached) your|you(?:'|’)re out of (?:extra )?usage|usage (?:limit|allocation)|(?:weekly|5-hour|five.hour|session) limit/i;
 
 export function isUsageLimitCut(messages: unknown): boolean | undefined {
   if (!Array.isArray(messages)) return undefined;
