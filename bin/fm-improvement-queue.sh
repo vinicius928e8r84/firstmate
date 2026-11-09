@@ -2,7 +2,7 @@
 # fm-improvement-queue.sh - the audits' improvement queue as an append-only ledger.
 #
 # Usage:
-#   fm-improvement-queue.sh add <title> [--audit YYYYMMDD] [--owner WHO] [--probe NAME]... [--even-if-present] [--due EPOCH|+Nh]
+#   fm-improvement-queue.sh add <title> [--audit YYYYMMDD] [--owner WHO] [--probe NAME]... [--even-if-present] [--due EPOCH|+Nh] [--note TEXT]
 #   fm-improvement-queue.sh set <id> <state> [note] [--due EPOCH|+Nh]
 #   fm-improvement-queue.sh list [--open] [--all-history]
 #   fm-improvement-queue.sh wip
@@ -70,7 +70,7 @@ append() {  # id state owner title note [due]
 
 # due_epoch <EPOCH|+Nh>: the epoch, or exit 2 on anything else.
 due_epoch() {
-  if [[ $1 =~ ^\+([0-9]+)h$ ]]; then echo $(( $(now) + ${BASH_REMATCH[1]} * 3600 ))
+  if [[ $1 =~ ^\+([0-9]+)h$ ]]; then echo $(( $(now) + BASH_REMATCH[1] * 3600 ))
   elif [[ $1 =~ ^[0-9]+$ ]]; then echo "$1"
   else die_usage "bad --due: $1"; fi
 }
@@ -88,13 +88,14 @@ latest_row() {
 }
 
 cmd_add() {
-  local title='' audit='' owner=unassigned force=0 word n id found=0 hit due=''
+  local title='' audit='' owner=unassigned force=0 word n id found=0 hit due='' note=''
   local -a probes=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --audit|--owner|--probe|--due) [ $# -ge 2 ] || die_usage "$1 needs a value" ;;
+      --audit|--owner|--probe|--due|--note) [ $# -ge 2 ] || die_usage "$1 needs a value" ;;
     esac
     case "$1" in
+      --note) note=$2; shift 2 ;;
       --due) due=$(due_epoch "$2") || exit 2; shift 2 ;;
       --audit) audit=$2; shift 2 ;;
       --owner) owner=$2; shift 2 ;;
@@ -123,7 +124,7 @@ cmd_add() {
   fi
   n=$(awk -F'\t' -v p="$audit-" 'index($2, p) == 1 && !seen[$2]++ { c++ } END { print c + 1 }' "$LEDGER" 2>/dev/null || echo 1)
   id="$audit-$n"
-  append "$id" proposed "$owner" "$title" "" "$due"
+  append "$id" proposed "$owner" "$title" "$note" "$due"
   printf '%s\n' "$id"
 }
 
