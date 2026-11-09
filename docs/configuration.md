@@ -1725,7 +1725,18 @@ Every rehearsal closes the test Anki it started, by that Anki's own PID, and nev
 
 `bin/fm-daily-page.sh` builds or refreshes `.lavish/diaria-YYYY-MM-DD.html` in this home from the open captain decisions, one pt-BR card per decision with the recorded recommendation preselected, and prints the page path and its `http://100.96.168.50:4387/session/<id>` URL.
 It reads the decisions from `bin/fm-bearings-snapshot.sh --json` (no new store), gives the same date the same file and URL, and opens a Lavish session only when none is listed for that file.
-It is run on demand and installs no cron line; the script header owns the card markup, the optional `options` and `recommend` fields, and its environment.
+It is run on demand and installs no cron line; the script header owns the card markup, the optional `options`, `context` and `recommend` fields, and its environment.
+It is the standard decision page: while the Lavish session is open it binds the page's source to the keyed-answer intake and arms it with `bin/fm-procevent-lavish.sh arm`, so a submitted answer resolves the held task of the same key.
+
+`bin/fm-decision-page.sh build <decisoes.tsv>` publishes the same page from decisions whose text the model wrote as TSV rows (key, title, context, recommendation, options), refuses malformed rows, and runs `bin/fm-page-check.sh` on the candidate before it replaces the file.
+`bin/fm-decision-page.sh apply <source-id|page.html>` feeds captured answers the runner did not feed to the intake and marks them handled; its header owns the row format.
+
+**Host sweep**
+
+`bin/fm-host-sweep.sh` is the deterministic, model-free cleanup of agents and leftovers on every machine (main VPS, creative VPS, PC WSL, Mac); it defaults to `--dry-run`, lists what it would remove with bytes, and `--apply` removes it and appends each removal with its proof to `data/sweep/removed.tsv`.
+Its first priority is idle agents holding worker slots: finished lanes are closed through `bin/fm-close-finished-lanes.sh` and `bin/fm-teardown.sh` (no `--force`), and a finished agent that stays after `--idle-hours` is exited with `bin/fm-control.sh`.
+It also ends orphan agent and test processes of ended tasks, deletes branches contained in the default branch, frees clean treehouse worktrees, removes ended-task `/tmp` directories and dead pod logs, and removes clean fully pushed old clones outside `projects/`; the Mac sweep never leaves `/tmp` and its listed test folders.
+Machines come from `config/host-sweep.hosts` and extra dead-log globs from `config/host-sweep.conf`; the script header owns the format, every proof, the never-touch list, and the environment.
 
 **Missing or invalid rules**
 

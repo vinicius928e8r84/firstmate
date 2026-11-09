@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # fm-daily-page.sh - build or refresh the day's decision page for the captain.
+# This is the standard decision page: one card per open decision, recommended
+# option marked, answers fed back through the process-event runner.
 #
 # Usage:
 #   fm-daily-page.sh        run on demand (no cron line, no timer)
+#   bin/fm-decision-page.sh build <decisoes.tsv>   same page from text the model wrote
 #
 # Writes <home>/.lavish/diaria-YYYY-MM-DD.html from the open captain decisions
 # and prints two lines:
@@ -14,12 +17,19 @@
 # listed and is never reopened here; the url line then names it and a note on
 # stderr says it ended.
 #
+# While the session is open the page's lavish source is bound to the keyed-answer
+# intake (fm-captain-hold.sh bind) and armed (fm-procevent-lavish.sh arm), exactly
+# as the bearings board does, so a submitted answer resolves the held task with
+# the same key and the output gains `armed: <source-id>`. Arming an already
+# armed page changes nothing. The answer schema is the board's
+# fm-bearings-answer.v1, which that intake reads.
+#
 # Reader (no new store): bin/fm-bearings-snapshot.sh --json, the structured
 # read of the captain-hold backlog and the status decision fold. Its
 # decisions_open[] rows ({id,key,verb,summary,owner}) with verb captain-hold or
 # needs-decision become one card each, in reader order, one per key. A row may
 # also carry `options` ([{value,label,hint}]) and `recommend` (an option
-# value); a `[rec=<value>]` token in the summary is read the same way and
+# value) and `context` (plain text shown under the title); a `[rec=<value>]` token in the summary is read the same way and
 # stripped from the shown text. Without options the card offers Aprovar,
 # Adiar and Recusar. The recommended option, when it names a real option, is
 # preselected and marked "rec".
@@ -27,20 +37,27 @@
 # Each card is the bearings board's decision markup in pt-BR: a form carrying
 # data-lavish-question=<key> with a radio group named `answer`, an optional
 # free-text `note`, and a submit that calls window.lavish.queuePrompt with the
-# selection and note under schema fm-daily-answer.v1.
+# selection and note under schema fm-bearings-answer.v1.
 #
 # Environment:
 #   FM_HOME                 firstmate home (default: the code root)
 #   FM_DAILY_PAGE_DIR       directory for the page (default: $FM_HOME/.lavish)
 #   FM_DAILY_PAGE_DATE      YYYY-MM-DD to build (default: today)
+#   FM_DAILY_PAGE_NAME      file name without .html (default diaria-<date>); a
+#                           different name is a different page and session
+#   FM_DAILY_PAGE_TITLE     page heading (default "Decisões do dia")
+#   FM_DAILY_PAGE_CHECK_CMD command run on the candidate page (path appended) before it
+#                           replaces the file; a nonzero exit leaves the page untouched
+#   FM_DAILY_PAGE_ADAPTER   lavish adapter script (default fm-procevent-lavish.sh)
+#   FM_DAILY_PAGE_HOLD_CMD  keyed-answer intake script (default fm-captain-hold.sh)
 #   FM_DAILY_PAGE_READER    shell command printing the reader's JSON (an object
 #                           with decisions_open[], or a bare array); default is
 #                           the bearings snapshot with FM_BEARINGS_DECISIONS=500
 #   FM_DAILY_PAGE_HOST      host:port written into the url (default
 #                           100.96.168.50:4387; never localhost)
 #
-# Exit status: 0 on success; 1 when the reader, the page write, or the lavish
-# session fails, leaving any existing page untouched.
+# Exit status: 0 on success; 1 when the reader, the page write, the lavish
+# session, or the bind and arm fails, leaving any existing page untouched.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,6 +68,10 @@ DAY="${FM_DAILY_PAGE_DATE:-$(date +%F)}"
 HOST="${FM_DAILY_PAGE_HOST:-100.96.168.50:4387}"
 DEFAULT_READER="FM_BEARINGS_DECISIONS=500 '$SCRIPT_DIR/fm-bearings-snapshot.sh' --json"
 READER="${FM_DAILY_PAGE_READER:-$DEFAULT_READER}"
+NAME="${FM_DAILY_PAGE_NAME:-diaria-$DAY}"
+TITLE="${FM_DAILY_PAGE_TITLE:-Decisões do dia}"
+ADAPTER="${FM_DAILY_PAGE_ADAPTER:-$SCRIPT_DIR/fm-procevent-lavish.sh}"
+HOLD="${FM_DAILY_PAGE_HOLD_CMD:-$SCRIPT_DIR/fm-captain-hold.sh}"
 
 fail() { printf 'fm-daily-page: %s\n' "$*" >&2; exit 1; }
 
@@ -58,9 +79,12 @@ case "$DAY" in
   [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
   *) fail "FM_DAILY_PAGE_DATE must be YYYY-MM-DD, got '$DAY'" ;;
 esac
+case "$NAME" in
+  ''|*[!A-Za-z0-9._-]*|.*) fail "FM_DAILY_PAGE_NAME must be a plain file name, got '$NAME'" ;;
+esac
 command -v jq >/dev/null 2>&1 || fail "jq is not installed"
 
-PAGE="$DIR/diaria-$DAY.html"
+PAGE="$DIR/$NAME.html"
 
 # --- read the open decisions -------------------------------------------------
 raw=$(bash -c "$READER") || fail "the decision reader failed"
@@ -89,10 +113,11 @@ cards=$(printf '%s' "$decisions" | jq -r '
       + "  <div class=\"card-top\"><span class=\"badge\">decisão</span><span class=\"owner\">" + ((.owner // "(main)") | @html) + "</span></div>\n"
       + "  <h2>" + ($title | @html) + "</h2>\n"
       + "  <p class=\"key\">" + ($key | @html) + "</p>\n"
+      + (if (.context // "") != "" then "  <p class=\"context\">" + (.context | tostring | @html) + "</p>\n" else "" end)
       + "  <form data-lavish-question=\"" + ($key | @html) + "\" data-title=\"" + ($title | @html) + "\">\n"
       + "    <div class=\"opts\">\n"
       + ([ $opts[] | "      <label class=\"opt\"><input type=\"radio\" name=\"answer\" value=\"" + (.value | tostring | @html) + "\""
-            + (if .value == $pick then " checked" else "" end) + ">"
+            + (if .value == $pick then " checked data-recommended" else "" end) + ">"
             + "<span class=\"opt-body\"><span class=\"opt-label\">" + ((.label // .value) | tostring | @html) + "</span>"
             + (if (.hint // "") != "" then "<span class=\"opt-hint\">" + (.hint | @html) + "</span>" else "" end)
             + "</span>"
@@ -115,6 +140,7 @@ else
   sub="$count decisões aguardam resposta"
 fi
 
+title_html=$(printf '%s' "$TITLE" | jq -Rr @html)
 day_br="${DAY:8:2}/${DAY:5:2}/${DAY:0:4}"
 
 html=$(cat <<EOF
@@ -123,7 +149,7 @@ html=$(cat <<EOF
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Decisões do dia - $DAY</title>
+<title>$title_html - $DAY</title>
 <style>
   :root { color-scheme: light dark; --bg:#f6f5f1; --fg:#1d1d1b; --muted:#6b6a64; --card:#fff; --line:#dcdad2; --accent:#2f5d50; --gold:#b8860b; }
   @media (prefers-color-scheme: dark) { :root { --bg:#16171a; --fg:#ececea; --muted:#9a9a94; --card:#1f2024; --line:#34353b; --accent:#6fb59f; --gold:#d9a93a; } }
@@ -138,6 +164,7 @@ html=$(cat <<EOF
   .badge { background:var(--accent); color:#fff; border-radius:999px; padding:.1rem .6rem; font-size:.75rem; text-transform:uppercase; letter-spacing:.04em; }
   .owner { color:var(--muted); font-size:.85rem; overflow-wrap:anywhere; }
   .card h2 { margin:.6rem 0 .2rem; font-size:1.15rem; overflow-wrap:anywhere; }
+  .context { margin:.2rem 0 1rem; white-space:pre-line; overflow-wrap:anywhere; }
   .key { margin:0 0 1rem; color:var(--muted); font:.8rem ui-monospace, monospace; overflow-wrap:anywhere; }
   .opts { display:grid; gap:.5rem; }
   .opt { display:flex; gap:.6rem; align-items:flex-start; border:1px solid var(--line); border-radius:.5rem; padding:.6rem .75rem; cursor:pointer; min-width:0; }
@@ -158,7 +185,7 @@ html=$(cat <<EOF
 <body>
 <main>
   <header>
-    <h1>Decisões do dia</h1>
+    <h1>$title_html</h1>
     <p>$day_br · $sub</p>
   </header>
 $cards
@@ -187,7 +214,7 @@ $cards
         window.lavish.queuePrompt(
           "Resposta à decisão - " + title + ": " + shown,
           { tag: "choice", text: title + " -> " + shown, element: form,
-            data: { schema: "fm-daily-answer.v1", question: form.getAttribute("data-lavish-question"),
+            data: { schema: "fm-bearings-answer.v1", question: form.getAttribute("data-lavish-question"),
                     selection: value || "", note: note } }
         );
       }
@@ -203,9 +230,15 @@ EOF
 
 # --- write the page (only when it changed) ---------------------------------------
 mkdir -p "$DIR" || fail "cannot create $DIR"
-PAGE_REAL="$(cd "$DIR" && pwd -P)/diaria-$DAY.html"
+PAGE_REAL="$(cd "$DIR" && pwd -P)/$NAME.html"
 if [ ! -f "$PAGE" ] || [ "$(cat "$PAGE")" != "$html" ]; then
   tmp=$(mktemp "$DIR/.diaria-$DAY.XXXXXX") || fail "cannot write in $DIR"
+  if [ -n "${FM_DAILY_PAGE_CHECK_CMD:-}" ]; then
+    printf '%s\n' "$html" > "$tmp" || { rm -f "$tmp"; fail "cannot write $PAGE"; }
+    if ! chk=$(bash -c "$FM_DAILY_PAGE_CHECK_CMD \"\$1\"" _ "$tmp" 2>&1); then
+      rm -f "$tmp"; printf '%s\n' "$chk" >&2; fail "the page check failed; the page was not published"
+    fi
+  fi
   if ! printf '%s\n' "$html" > "$tmp" || ! mv -f "$tmp" "$PAGE"; then
     rm -f "$tmp"
     fail "cannot write $PAGE"
@@ -245,3 +278,12 @@ sid=$(printf '%s\n' "${row#* }" | sed -n 's|.*session/\([A-Za-z0-9]*\).*|\1|p')
 
 printf 'page: %s\n' "$PAGE_REAL"
 printf 'url: http://%s/session/%s\n' "$HOST" "$sid"
+
+# --- bind the answers to the keyed-answer intake and arm the process event ----------
+# Only a live session is armed: an ended page has nothing left to listen to.
+if [ "$status" = open ]; then
+  psid=$("$ADAPTER" source-id "$PAGE_REAL") || fail "cannot derive the page source id"
+  "$HOLD" bind "$psid" >/dev/null || fail "cannot bind the page source to the keyed-answer intake"
+  "$ADAPTER" arm "$PAGE_REAL" >/dev/null || fail "cannot arm the page as a process-event source"
+  printf 'armed: %s\n' "$psid"
+fi

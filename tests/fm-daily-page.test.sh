@@ -12,7 +12,11 @@
 #      does not rewrite an unchanged page;
 #   4. an ended session is reported and never reopened;
 #   5. the URL carries the tailnet host, never localhost; an empty list still
-#      builds a page; a failing reader leaves the page alone and exits 1.
+#      builds a page; a failing reader leaves the page alone and exits 1;
+#   6. a live session is bound to the keyed-answer intake and armed through the
+#      lavish adapter (stubbed), an ended one is not, and the answer schema is
+#      the one that intake reads; FM_DAILY_PAGE_NAME/TITLE make a second page
+#      and a decision `context` shows under its title.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -47,6 +51,20 @@ fi
 SH
 chmod +x "$FAKEBIN/lavish-axi"
 
+ARM_LOG="$TMP_ROOT/arm.log"; : > "$ARM_LOG"
+cat > "$TMP_ROOT/adapter.sh" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  source-id) printf 'lavish-%s\n' "$(basename "$2" .html)" ;;
+  arm) printf 'arm %s\n' "$2" >> "${ARM_LOG:?}"; [ -z "${ARM_FAIL:-}" ] || exit 1; printf 'armed: x\n' ;;
+esac
+SH
+cat > "$TMP_ROOT/hold.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'hold %s\n' "$*" >> "${ARM_LOG:?}"
+SH
+chmod +x "$TMP_ROOT/adapter.sh" "$TMP_ROOT/hold.sh"
+
 READER_JSON="$TMP_ROOT/reader.json"
 cat > "$TMP_ROOT/reader.sh" <<SH
 #!/usr/bin/env bash
@@ -59,7 +77,8 @@ run_page() {  # <home-name> [env...]
   local name=$1; shift
   env HOME="$HOME_DIR" PATH="$FAKEBIN:$PATH" SESSIONS="$SESSIONS" LAVISH_LOG="$LAVISH_LOG" \
     FM_HOME="$TMP_ROOT/$name" FM_DAILY_PAGE_DATE=2026-10-29 FM_SW_NO_NOTIFY=1 \
-    FM_DAILY_PAGE_READER="$TMP_ROOT/reader.sh" "$@" bash "$TOOL" 2>"$TMP_ROOT/err"
+    FM_DAILY_PAGE_READER="$TMP_ROOT/reader.sh" ARM_LOG="$ARM_LOG" \
+    FM_DAILY_PAGE_ADAPTER="$TMP_ROOT/adapter.sh" FM_DAILY_PAGE_HOLD_CMD="$TMP_ROOT/hold.sh" "$@" bash "$TOOL" 2>"$TMP_ROOT/err"
 }
 
 write_decisions '{"decisions_open":[
@@ -166,5 +185,41 @@ assert_equals "$(cat "$TMP_ROOT/before.html")" "$(cat "$TMP_ROOT/w3/.lavish/diar
 run_page w3 FM_DAILY_PAGE_DATE=hoje >/dev/null; CODE=$?
 expect_code 1 "$CODE" "a malformed date exits 1"
 pass "daily-page: a failing reader or bad date exits 1 and leaves the page alone"
+
+# Bind and arm: a live session is bound then armed once per run; the answer schema is the intake's.
+: > "$SESSIONS"; : > "$ARM_LOG"
+write_decisions '{"decisions_open":[{"key":"solo","verb":"captain-hold","summary":"Um","context":"Contexto <b>longo</b>"}]}'
+OUT5=$(run_page w4); CODE=$?
+expect_code 0 "$CODE" "a run that binds and arms succeeds"
+P4="$(cd "$TMP_ROOT/w4/.lavish" && pwd -P)/diaria-2026-10-29.html"
+assert_contains "$OUT5" "armed: lavish-diaria-2026-10-29" "the armed source id is printed"
+assert_equals "hold bind lavish-diaria-2026-10-29
+arm $P4" "$(cat "$ARM_LOG")" "the source is bound before it is armed"
+assert_contains "$(cat "$P4")" 'schema: "fm-bearings-answer.v1"' "the answer schema is the keyed intake's"
+assert_not_contains "$(cat "$P4")" 'fm-daily-answer' "the old schema is gone"
+assert_contains "$(cat "$P4")" '<p class="context">Contexto &lt;b&gt;longo&lt;/b&gt;</p>' "a decision context shows, escaped"
+pass "daily-page: a live page is bound to the keyed-answer intake and armed, with a readable schema"
+
+# A named page is a second page with its own title and session.
+OUT6=$(run_page w4 FM_DAILY_PAGE_NAME=decisoes-teste FM_DAILY_PAGE_TITLE='Decisões <teste>'); CODE=$?
+expect_code 0 "$CODE" "a named page builds"
+assert_present "$TMP_ROOT/w4/.lavish/decisoes-teste.html" "the named page has its own file"
+assert_contains "$(cat "$TMP_ROOT/w4/.lavish/decisoes-teste.html")" '<h1>Decisões &lt;teste&gt;</h1>' "the title is the given one, escaped"
+assert_not_equals "$(printf '%s\n' "$OUT5" | sed -n 's/^url: //p')" "$(printf '%s\n' "$OUT6" | sed -n 's/^url: //p')" "the named page has its own URL"
+run_page w4 FM_DAILY_PAGE_NAME='../x' >/dev/null; CODE=$?
+expect_code 1 "$CODE" "a path in the page name is refused"
+pass "daily-page: a named page is separate, and its name cannot leave the directory"
+
+# An ended session is not armed; an arm failure exits 1 but leaves the page written.
+: > "$ARM_LOG"
+sed -i 's/,open,/,user-ended,/' "$SESSIONS"
+run_page w4 >/dev/null; CODE=$?
+expect_code 0 "$CODE" "an ended page still prints"
+assert_equals "" "$(cat "$ARM_LOG")" "an ended session is neither bound nor armed"
+: > "$SESSIONS"
+run_page w5 ARM_FAIL=1 >/dev/null; CODE=$?
+expect_code 1 "$CODE" "an arm failure exits 1"
+assert_contains "$(cat "$TMP_ROOT/err")" "cannot arm" "the arm failure is named"
+pass "daily-page: only a live session is armed, and an arm failure is reported"
 
 printf '# all fm-daily-page tests passed\n'
