@@ -278,7 +278,7 @@ case "${1:-} ${2:-}" in
             ;;
           *filename*)
             case "$*" in
-              *"...main "*|*"...main") cat "${FM_TEST_GH_COMPARE:-/dev/null}.basefiles" 2>/dev/null || exit 1 ;;
+              *"...main?"*|*"...main "*|*"...main") cat "${FM_TEST_GH_COMPARE:-/dev/null}.basefiles" 2>/dev/null || exit 1 ;;
               *) cat "${FM_TEST_GH_COMPARE:-/dev/null}.prfiles" 2>/dev/null || exit 1 ;;
             esac
             exit 0
@@ -3440,6 +3440,17 @@ test_away_behind_head_admitted_only_when_low_risk_and_disjoint() {
   assert_grep 'catalog/voz/ids.json' "$case_dir/stderr" "away-behind-shared: the registry file was not named"
   assert_no_grep 'pr merge' "$case_dir/gh.log" "away-behind-shared: gh pr merge ran"
 
+  # The registry key matches case-insensitively and a CRLF line end is tolerated.
+  case_dir=$(setup_away_behind_case away-behind-shared-crlf "$head" 'catalog/voz/ids.json\n' 'src/other.ts\n')
+  printf 'Example/Repo catalog/voz/*\r\n' > "$case_dir/home/config/shared-registries"
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" --risk baixa \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "away-behind-shared-crlf: a differently cased key and CRLF line must still protect the registry"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "away-behind-shared-crlf: gh pr merge ran"
+
   case_dir=$(setup_away_behind_case away-behind-other-project "$head" 'catalog/voz/ids.json\n' 'src/other.ts\n')
   printf '%s\n' 'someone/else catalog/voz/*' > "$case_dir/home/config/shared-registries"
   run_pr_merge "$case_dir" task-x1 "$url" --risk baixa \
@@ -3487,6 +3498,52 @@ test_away_behind_head_admitted_only_when_low_risk_and_disjoint() {
   set -e
   expect_code 2 "$rc" "bad-risk: an unknown --risk value is a usage error"
   pass "fm-pr-merge admits a behind head while away only for low or medium risk with no crossing and no shared registry"
+}
+
+# Two merge runs for two tasks whose PRs edit the same file, each behind the base
+# by an unrelated commit, are both admitted by the pre-lock read. The decision is
+# taken again under the merge lock against the base the first merge left, so
+# exactly one lands; the fake base grows by the merged PR's files, as main would.
+test_away_behind_admission_is_decided_again_under_the_merge_lock() {
+  local case_dir head rc_a=0 rc_b=0 pid_a pid_b merges
+  head=efefefefefefefefefefefefefefefefefefefef
+  case_dir=$(setup_away_behind_case away-behind-concurrent "$head" 'voices/cat.json\n' 'src/other.ts\n')
+  cp "$case_dir/state/task-x1.meta" "$case_dir/state/task-x2.meta"
+  sed -i.bak 's/^window=.*/window=fm-task-x2/' "$case_dir/state/task-x2.meta"
+  mv "$case_dir/fakebin/gh" "$case_dir/fakebin/gh.real"
+  cat > "$case_dir/fakebin/gh" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  *"...main?"*filename*)
+    out=\$("$case_dir/fakebin/gh.real" "\$@") || exit 1
+    # Both runs read the base before either one merges.
+    sleep 3
+    printf '%s\\n' "\$out"
+    exit 0
+    ;;
+  "pr merge"*)
+    printf 'voices/cat.json\\n' >> "$case_dir/github-compare.basefiles"
+    ;;
+esac
+exec "$case_dir/fakebin/gh.real" "\$@"
+SH
+  chmod +x "$case_dir/fakebin/gh"
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/95 --risk baixa \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" &
+  pid_a=$!
+  run_pr_merge "$case_dir" task-x2 https://github.com/example/repo/pull/96 --risk baixa \
+    > "$case_dir/stdout2" 2> "$case_dir/stderr2" &
+  pid_b=$!
+  wait "$pid_a" || rc_a=$?
+  wait "$pid_b" || rc_b=$?
+  merges=$(grep -c '^pr merge' "$case_dir/gh.log" || true)
+  [ "$merges" -eq 1 ] || fail "away-behind-concurrent: expected exactly one merge, got $merges (rc $rc_a/$rc_b)"
+  [ $((rc_a + rc_b)) -eq 1 ] || fail "away-behind-concurrent: expected one success and one refusal, got $rc_a/$rc_b"
+  cat "$case_dir/stderr" "$case_dir/stderr2" > "$case_dir/stderr-all"
+  assert_grep 'refused under the merge lock' "$case_dir/stderr-all" "away-behind-concurrent: the second run was not refused under the lock"
+  assert_grep 'voices/cat.json' "$case_dir/stderr-all" "away-behind-concurrent: the crossing file was not named"
+  [ "$(grep -c . "$case_dir/state/behind-merges.pending")" -eq 1 ] || fail "away-behind-concurrent: expected one notice line"
+  pass "fm-pr-merge decides a behind admission again under the merge lock, so concurrent same-file merges cannot both land"
 }
 
 # A draft cannot be merged, and neither can a pull request whose draft state the
@@ -4918,4 +4975,5 @@ test_allow_missing_refused_on_forgejo
 test_allow_no_pipeline_merges_only_a_null_head_pipeline
 test_github_head_behind_base_refuses_and_allow_behind_waives
 test_away_behind_head_admitted_only_when_low_risk_and_disjoint
+test_away_behind_admission_is_decided_again_under_the_merge_lock
 test_allow_no_pipeline_is_attended_only_and_gitlab_only

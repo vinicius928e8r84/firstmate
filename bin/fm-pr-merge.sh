@@ -1218,7 +1218,6 @@ EOF
           elif behind_summary=$(fm_behind_gate "$PR_OWNER" "$PR_REPO" "$base" "$live_head" "$RISK" "$FM_HOME/config/shared-registries"); then
             FM_PR_BEHIND_ADMITTED=true
             FM_PR_BEHIND_BASE=$base
-            printf '%s\n' "$behind_summary" >&2
           else
             behind_reason=$behind_summary
           fi
@@ -1819,6 +1818,19 @@ case "$PROVIDER" in
     require_current_away_authority || away_status=$?
     [ "$away_status" -eq 0 ] || exit "$away_status"
     refuse_github_queue_while_away || exit 2
+    # The admission above was read outside this lock, so a merge that landed
+    # since then may have changed the base under it. Every away merge takes this
+    # one lock, so deciding again here, against the base the previous merge left,
+    # makes each admission see the merges before it.
+    if [ "$FM_PR_BEHIND_ADMITTED" = true ]; then
+      behind_summary=
+      if ! behind_summary=$(fm_behind_gate "$PR_OWNER" "$PR_REPO" "$FM_PR_BEHIND_BASE" "$FM_PR_MERGE_HEAD" "$RISK" "$FM_HOME/config/shared-registries"); then
+        printf 'error: refusing to merge %s\n  - parallel merge while away refused under the merge lock: %s; join it with bin/fm-pr-merge-main.sh and re-test the delta\n' \
+          "$URL" "$behind_summary" >&2
+        exit 1
+      fi
+      printf '%s\n' "$behind_summary" >&2
+    fi
     merge_status=0
     merge_output=$(gh pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" \
       --match-head-commit "$FM_PR_MERGE_HEAD" \

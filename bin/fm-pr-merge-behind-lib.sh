@@ -36,20 +36,29 @@ fm_behind_risk_valid() {
 }
 
 # fm_behind_registry_globs <file> <owner/repo> <repo-name> - print the matching
-# project's globs, one per line. Returns 1 when the file exists but is unreadable.
+# project's globs, one per line (the key matches case-insensitively and CRLF line
+# ends are tolerated). Returns 1 when the file exists but is unreadable, and
+# warns on stderr when it exists with no line for the project.
 fm_behind_registry_globs() {
-  local file=$1 slug=$2 name=$3 line fields glob
+  local file=$1 slug=$2 name=$3 line fields glob key matched=false
+  slug=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')
+  name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
   [ -e "$file" ] || return 0
   [ -f "$file" ] && [ -r "$file" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
     case "$line" in '' | '#'*) continue ;; esac
     read -ra fields <<<"$line"
     [ "${#fields[@]}" -gt 1 ] || continue
-    [ "${fields[0]}" = "$slug" ] || [ "${fields[0]}" = "$name" ] || continue
+    key=$(printf '%s' "${fields[0]}" | tr '[:upper:]' '[:lower:]')
+    [ "$key" = "$slug" ] || [ "$key" = "$name" ] || continue
+    matched=true
     for glob in "${fields[@]:1}"; do
       printf '%s\n' "$glob"
     done
   done <"$file"
+  [ "$matched" = true ] \
+    || echo "warning: $file has no line for $slug, so no shared registry protects this project" >&2
 }
 
 # fm_behind_gate <owner> <repo> <base> <head> <risk> <registry-file>
@@ -58,6 +67,7 @@ fm_behind_registry_globs() {
 fm_behind_gate() {
   local owner=$1 repo=$2 base=$3 head=$4 risk=$5 registry=$6
   local merge_base pr_files base_files globs file glob crossed shared
+  local files_jq='if (.files | type) == "array" then .files[] | .filename, (.previous_filename // empty) else error("no files array") end'
 
   if ! fm_behind_risk_valid "$risk"; then
     echo "no risk level was given; a behind head is admitted while away only with --risk baixa|media"
@@ -74,14 +84,17 @@ fm_behind_gate() {
     echo "the merge-base of $base and $head could not be read"
     return 1
   fi
-  if ! pr_files=$(gh api --paginate "repos/$owner/$repo/compare/$merge_base...$head" \
-      --jq '.files[]? | .filename, (.previous_filename // empty)' 2>/dev/null) \
+  # GitHub returns the comparison's files (up to 300) on the first page only, so
+  # one unpaginated read with the commit page kept small is the whole list; a
+  # payload without a files array is an unreadable list, never an empty one.
+  if ! pr_files=$(gh api "repos/$owner/$repo/compare/$merge_base...$head?per_page=1" \
+      --jq "$files_jq" 2>/dev/null) \
     || [ -z "$pr_files" ]; then
     echo "the files changed by the PR could not be read"
     return 1
   fi
-  if ! base_files=$(gh api --paginate "repos/$owner/$repo/compare/$merge_base...$base" \
-      --jq '.files[]? | .filename, (.previous_filename // empty)' 2>/dev/null); then
+  if ! base_files=$(gh api "repos/$owner/$repo/compare/$merge_base...$base?per_page=1" \
+      --jq "$files_jq" 2>/dev/null); then
     echo "the files changed on $base since the merge-base could not be read"
     return 1
   fi

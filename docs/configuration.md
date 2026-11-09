@@ -168,6 +168,7 @@ A hand-settled merge is not a clean main merge, so the review pin still declines
 While the away-posture record exists, `bin/fm-pr-merge.sh` still refuses a GitHub head that does not contain the base tip, unless `bin/fm-pr-merge-behind-lib.sh` admits it.
 Admission is decided by code and needs all of: the caller's `--risk baixa|media` (`alta` always joins and merges serially), no file the PR changes also changed on the base since the PR's merge-base, no PR file matching the project's registered shared registries, and every required check green at the exact head.
 Any unreadable list, missing `--risk`, or other doubt keeps the refusal and its join command.
+The whole decision is taken again under the away-record lock immediately before the merge, against the base the previous merge left, so two concurrent merges cannot both be admitted on a stale view.
 The risk level comes from the classifier that scored the PR, since no task record stores it.
 Attended merges are unchanged, and `--risk` never waives the base-tip rule while attended.
 
