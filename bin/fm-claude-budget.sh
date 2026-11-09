@@ -12,7 +12,10 @@
 # a day (CEILING below), so a large remainder never licenses a large day. The
 # end date is, in order: --end,
 # $FM_CLAUDE_BUDGET_END, the first non-comment line of config/claude-budget-end,
-# else 2026-11-01T22:00:00Z.
+# else the renewal quota-axi reports (resetsAt of the window limiting the
+# Claude all_models scope; the latest one when several limit it). No override
+# and no readable renewal means no end date, which is a no-quota run: no date
+# is ever invented.
 #
 # The day's allowance is fixed at the first run of each UTC day (the baseline:
 # remaining% and days left at that moment, so a day's allowance does not shrink
@@ -20,6 +23,14 @@
 # baseline exceeds the allowance. A run with no readable quota keeps the
 # previous record (its flag ages out through --flag) and notes status=no-quota;
 # a run after the end date records status=end-passed and above_budget=0.
+#
+# Going above budget also wakes the supervising session once per UTC day: one
+# `check` row in the durable wake queue (bin/fm-wake-lib.sh) naming the spend,
+# the renewal, and the instruction to hold new Claude batches. The flag itself
+# is read by bin/fm-dispatch-resolve.sh (see below); this script adds no other
+# gate. A zero remainder raises no budget wake: bin/fm-silent-watcher.sh owns
+# the single exhausted-quota notice, and the dispatch resolver already refuses
+# Claude candidates at 0%.
 #
 # Records (both under this home, written atomically or appended):
 #   state/claude-budget.state   key=value, the flag the dispatch step reads
@@ -54,7 +65,6 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 STATE_FILE="$STATE/claude-budget.state"
 LOG_FILE="$DATA/claude-budget.log"
-DEFAULT_END=2026-11-01T22:00:00Z
 CEILING=10   # points a day: the most any day's budget or allowance may be
 MAX_AGE=${FM_CLAUDE_BUDGET_MAX_AGE:-7200}
 case "$MAX_AGE" in ''|*[!0-9]*) MAX_AGE=7200 ;; esac
@@ -117,30 +127,55 @@ done
 command -v jq >/dev/null 2>&1 || die "jq is required"
 
 END=$END_ARG
+END_SOURCE=override
 [ -n "$END" ] || END=${FM_CLAUDE_BUDGET_END:-}
 if [ -z "$END" ] && [ -f "$CONFIG/claude-budget-end" ]; then
   END=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$CONFIG/claude-budget-end" | sed -n '/./{p;q;}')
 fi
-[ -n "$END" ] || END=$DEFAULT_END
-printf '%s' "$END" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' ||
-  die "end date '$END' is not YYYY-MM-DDTHH:MM:SSZ"
-END_EPOCH=$(jq -nr --arg e "$END" '$e | fromdateiso8601' 2>/dev/null) || die "end date '$END' is not a real date"
+if [ -n "$END" ]; then
+  printf '%s' "$END" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' ||
+    die "end date '$END' is not YYYY-MM-DDTHH:MM:SSZ"
+  jq -nr --arg e "$END" '$e | fromdateiso8601' >/dev/null 2>&1 || die "end date '$END' is not a real date"
+fi
 
 NOW=$(now_epoch)
 TODAY=$(jq -nr --argjson n "$NOW" '$n | todate | .[0:10]')
 
-# The Claude all_models remaining percent, or empty when quota-axi is missing,
-# fails, or does not know it (a stale or rate-limited read has no number).
-read_remaining() {
+# The Claude all_models remaining percent and the resetsAt of the windows
+# limiting it (comma-separated), tab-separated; empty when quota-axi is missing,
+# fails, or does not know the number (a stale or rate-limited read has none).
+read_quota() {
   local json
   command -v quota-axi >/dev/null 2>&1 || return 0
   json=$(quota-axi --json 2>/dev/null </dev/null) || return 0
   printf '%s' "$json" | jq -r '
-    [.providers[]? | select(.provider == "claude")
-     | .quotaSemantics.effectiveAvailability[]?
-     | select(.scope == "all_models" and .status == "known")
-     | .effectivePercentRemaining
-     | select(type == "number")] | first // empty' 2>/dev/null
+    [.providers[]? | select(.provider == "claude") as $p
+     | $p.quotaSemantics.effectiveAvailability[]?
+     | select(.scope == "all_models" and .status == "known" and (.effectivePercentRemaining | type) == "number")
+     | {pct: .effectivePercentRemaining,
+        resets: [(.limitingWindowIds // [])[] as $id | $p.windows[]? | select(.id == $id) | .resetsAt // empty] | join(",")}]
+    | first // empty | [.pct, .resets] | @tsv' 2>/dev/null
+}
+
+# renewal_epoch <comma-separated ISO times>: the latest valid one as an epoch.
+renewal_epoch() {
+  local t e best=''
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    e=$(date -d "$t" +%s 2>/dev/null) || continue
+    if [ -z "$best" ] || [ "$e" -gt "$best" ]; then best=$e; fi
+  done <<EOF
+$(printf '%s\n' "$1" | tr ',' '\n')
+EOF
+  printf '%s' "$best"
+}
+
+# wake_main <line>: one `check` row in the durable wake queue, the existing way
+# a cron job reaches the supervising session (bin/fm-wake-lib.sh owns the queue).
+wake_main() {
+  FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE bash -c \
+    '. "$1/fm-wake-lib.sh" && fm_wake_append check "$2" "$3"' _ "$SCRIPT_DIR" "claude-budget-$TODAY" "$1" ||
+    { echo "claude-budget: could not queue the above-budget wake" >&2; return 1; }
 }
 
 write_state() {  # key=value lines on stdin
@@ -155,9 +190,18 @@ write_state() {  # key=value lines on stdin
 
 prev_above=$(state_get above_budget)
 [ "$prev_above" = 1 ] || prev_above=0
-REMAINING=$(read_remaining)
+IFS=$'\t' read -r REMAINING RESETS <<EOF
+$(read_quota)
+EOF
+if [ -z "$END" ] && [ -n "$REMAINING" ]; then
+  RENEWAL=$(renewal_epoch "${RESETS:-}")
+  if [ -n "$RENEWAL" ]; then
+    END=$(date -u -d "@$RENEWAL" +%Y-%m-%dT%H:%M:%SZ)
+    END_SOURCE=quota-axi
+  fi
+fi
 
-if [ -z "$REMAINING" ]; then
+if [ -z "$REMAINING" ] || [ -z "$END" ]; then
   # Keep the last computed record (and its computed_epoch, so --flag still ages
   # out) and only note the failed attempt.
   {
@@ -165,12 +209,18 @@ if [ -z "$REMAINING" ]; then
     if [ -f "$STATE_FILE" ]; then
       sed -e '/^schema=/d' -e '/^status=/d' -e '/^attempt_epoch=/d' "$STATE_FILE"
     else
-      printf 'end=%s\nabove_budget=0\n' "$END"
+      printf 'end=%s\nabove_budget=0\n' "${END:-unknown}"
     fi
   } | write_state
-  echo "claude-budget: no readable Claude quota; kept above_budget=$prev_above"
+  if [ -z "$REMAINING" ]; then
+    echo "claude-budget: no readable Claude quota; kept above_budget=$prev_above"
+  else
+    echo "claude-budget: no end date (no override, no renewal from quota-axi); kept above_budget=$prev_above"
+  fi
   exit 0
 fi
+
+END_EPOCH=$(jq -nr --arg e "$END" '$e | fromdateiso8601')
 
 DAYS=$(awk -v e="$END_EPOCH" -v n="$NOW" 'BEGIN { d = (e - n) / 86400; if (d < 0) d = 0; printf "%.4f", d }')
 if awk -v d="$DAYS" 'BEGIN { exit(d > 0 ? 1 : 0) }'; then
@@ -179,6 +229,7 @@ schema=fm-claude-budget.v1
 status=end-passed
 computed_epoch=$NOW
 end=$END
+end_source=$END_SOURCE
 remaining_pct=$REMAINING
 above_budget=0
 EOF
@@ -197,19 +248,28 @@ if [ "$BASE_DAY" != "$TODAY" ] || [ -z "$BASE_REMAINING" ] || [ -z "$BASE_DAYS" 
 fi
 
 read -r BUDGET DAY_BUDGET SPENT ABOVE <<EOF
-$(awk -v r="$REMAINING" -v d="$DAYS" -v br="$BASE_REMAINING" -v bd="$BASE_DAYS" -v c="$CEILING" 'BEGIN {
+$(awk -v r="$REMAINING" -v d="$DAYS" -v br="$BASE_REMAINING" -v bdays="$BASE_DAYS" -v c="$CEILING" 'BEGIN {
   budget = r / d; if (budget > c) budget = c
-  day_budget = (bd > 0) ? br / bd : budget; if (day_budget > c) day_budget = c
+  day_budget = (bdays > 0) ? br / bdays : budget; if (day_budget > c) day_budget = c
   spent = br - r; if (spent < 0) spent = 0
   printf "%.2f %.2f %.2f %d\n", budget, day_budget, spent, (spent > day_budget) ? 1 : 0
 }')
 EOF
+
+# Going above budget wakes the supervising session once per UTC day, and a zero
+# remainder is left to the exhausted-quota notice (see the header).
+ALARM_DAY=$(state_get alarm_day)
+if [ "$ABOVE" = 1 ] && [ "$ALARM_DAY" != "$TODAY" ] && [ "$REMAINING" != 0 ]; then
+  wake_main "check: claude-budget above_budget - Claude gastou ${SPENT}% hoje, acima da cota de ${DAY_BUDGET}% do dia (restam ${REMAINING}% ate a renovacao em $(TZ=America/Fortaleza date -d "$END" '+%d/%m %H:%M') de Fortaleza). Segurar novos lotes que gastam Claude; sessao nova se o MAIN estiver ocioso." &&
+    ALARM_DAY=$TODAY
+fi
 
 write_state <<EOF
 schema=fm-claude-budget.v1
 status=ok
 computed_epoch=$NOW
 end=$END
+end_source=$END_SOURCE
 remaining_pct=$REMAINING
 days_left=$DAYS
 budget_pct_per_day=$BUDGET
@@ -219,6 +279,7 @@ day_start_days_left=$BASE_DAYS
 day_budget_pct=$DAY_BUDGET
 spent_today_pct=$SPENT
 above_budget=$ABOVE
+alarm_day=$ALARM_DAY
 EOF
 mkdir -p "$DATA" 2>/dev/null &&
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NOW" "$REMAINING" "$DAYS" "$BUDGET" "$SPENT" "$ABOVE" >> "$LOG_FILE" 2>/dev/null || true

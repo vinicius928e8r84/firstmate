@@ -16,7 +16,11 @@
 #      the end date records end-passed;
 #   5. --flag goes `unknown` when the record is older than two hourly runs;
 #   6. the script runs with the minimal environment cron provides and appends
-#      one log row per run.
+#      one log row per run;
+#   7. with no override the end is the renewal (resetsAt) quota-axi reports,
+#      an override still wins, and no renewal means no end and no invented date;
+#   8. going above budget queues one wake for the supervising session per UTC
+#      day, never on a zero remainder.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -39,11 +43,16 @@ cat "${QUOTA_AXI_FIXTURE:?}"
 SH
 chmod +x "$FAKEBIN/quota-axi"
 
+# QUOTA_RESETS is the resetsAt the weekly window carries ("none" omits the
+# window, as a quota-axi that does not know the renewal does).
+QUOTA_RESETS=2026-11-01T22:00:00.194505+00:00
 write_quota() {  # <path> <claude all_models remaining percent> [status]
+  local windows='[ { "id": "seven_day", "kind": "weekly", "resetsAt": "'"$QUOTA_RESETS"'", "percentRemaining": '"$2"' } ]'
+  [ "$QUOTA_RESETS" != none ] || windows='[]'
   cat > "$1" <<JSON
 { "generatedAt": "2026-10-27T22:00:00Z", "schemaVersion": 5, "providers": [
-  { "provider": "claude", "quotaSemantics": { "status": "${3:-known}", "effectiveAvailability": [
-    { "scope": "all_models", "status": "${3:-known}", "effectivePercentRemaining": $2 },
+  { "provider": "claude", "windows": $windows, "quotaSemantics": { "status": "${3:-known}", "effectiveAvailability": [
+    { "scope": "all_models", "status": "${3:-known}", "effectivePercentRemaining": $2, "limitingWindowIds": ["seven_day"] },
     { "scope": "model:fable", "status": "known", "effectivePercentRemaining": 7 } ] } },
   { "provider": "codex", "quotaSemantics": { "status": "known", "effectiveAvailability": [
     { "scope": "all_models", "status": "known", "effectivePercentRemaining": 99 } ] } } ] }
@@ -154,5 +163,52 @@ expect_code 0 "$CODE" "a cron-style run succeeds with a minimal environment"
 [ "$(wc -l < "$HOME_DIR/data/claude-budget.log")" = 1 ] || fail "one log row per run"
 assert_equals "$T0	52	5.0000	10.00	0.00	0" "$(cat "$HOME_DIR/data/claude-budget.log")" "the log row carries the numbers"
 pass "budget: runs from a minimal cron environment and appends one log row"
+
+# 7. The end comes from quota-axi's renewal; an override wins; no renewal, no end.
+rm -f "$STATE/claude-budget.state"
+QUOTA_RESETS=2026-10-30T22:00:00.194505+00:00
+run_budget "$T0" 52
+assert_equals ok "$(state_val status)" "a readable renewal gives a budget run"
+assert_equals 2026-10-30T22:00:00Z "$(state_val end)" "the end is the renewal quota-axi reported, to the second"
+assert_equals quota-axi "$(state_val end_source)" "the record says where the end came from"
+assert_equals 3.0000 "$(state_val days_left)" "three days to the renewal"
+rm -f "$STATE/claude-budget.state"
+run_budget "$T0" 52 --end 2026-10-29T22:00:00Z
+assert_equals 2026-10-29T22:00:00Z "$(state_val end)" "--end still beats the renewal quota-axi reported"
+assert_equals override "$(state_val end_source)" "an override is recorded as one"
+rm -f "$STATE/claude-budget.state"
+QUOTA_RESETS=none
+run_budget "$T0" 52
+expect_code 0 "$CODE" "no renewal is not a failure of the hourly job"
+assert_equals no-quota "$(state_val status)" "no renewal and no override is a no-quota run"
+assert_equals unknown "$(state_val end)" "no end date is invented"
+assert_equals 0 "$(state_val above_budget)" "the kept flag defaults to within budget"
+assert_contains "$OUT" 'no end date' "the run says why it enforced nothing"
+QUOTA_RESETS=2026-11-01T22:00:00.194505+00:00
+pass "budget: the end is the quota-axi renewal, overridable, and absent when quota-axi has none"
+
+# 8. Above budget queues one wake per UTC day, never on a zero remainder.
+rm -f "$STATE/claude-budget.state" "$STATE/.wake-queue" "$STATE/.wake-queue.seq"
+queued() { cat "$STATE/.wake-queue" 2>/dev/null | awk '/claude-budget/ { n++ } END { print n + 0 }'; }
+run_budget "$T1" 52
+run_budget "$((T1 + HOUR))" 50
+assert_equals 0 "$(queued)" "within budget queues no wake"
+run_budget "$((T1 + 2 * HOUR))" 40
+assert_equals 1 "$(state_val above_budget)" "above budget"
+assert_equals 1 "$(queued)" "going above budget queues one wake"
+assert_contains "$(cat "$STATE/.wake-queue")" "check	claude-budget-2026-10-27	check: claude-budget above_budget" "the row is a check wake keyed by the day"
+assert_contains "$(cat "$STATE/.wake-queue")" "Segurar novos lotes" "the row tells the session what to hold"
+assert_contains "$(cat "$STATE/.wake-queue")" "de Fortaleza" "the row names the renewal in Fortaleza time"
+run_budget "$((T1 + 3 * HOUR))" 38
+assert_equals 1 "$(queued)" "staying above budget queues no second wake the same day"
+run_budget "$((T1 + 86400))" 40
+run_budget "$((T1 + 86400 + 2 * HOUR))" 28
+assert_equals 2 "$(queued)" "a new UTC day above budget queues a fresh wake"
+rm -f "$STATE/claude-budget.state" "$STATE/.wake-queue" "$STATE/.wake-queue.seq"
+run_budget "$T1" 12
+run_budget "$((T1 + HOUR))" 0
+assert_equals 1 "$(state_val above_budget)" "an exhausted quota is above budget"
+assert_equals 0 "$(queued)" "a zero remainder leaves the notice to the exhausted-quota watcher"
+pass "budget: above budget queues one wake per UTC day and none on a zero remainder"
 
 printf '# all fm-claude-budget tests passed\n'

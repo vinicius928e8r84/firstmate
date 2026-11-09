@@ -12,7 +12,13 @@
 #   bin/../data/tools/fm-asks.sh add --key silent-watcher (deterministic; the ask shows in the owner's
 #   pending list and in fm-asks diff). Recovery clears the incident and closes the ask.
 # No self-heal: re-arming the watcher belongs to the captain's session (fm-watch-arm.sh is session-bound).
-# Env: FM_HOME, FM_SW_NOW (epoch, tests), FM_SW_PGREP (command, tests), FM_SW_ASKS (fm-asks path, tests).
+# Also, independent of watcher health: when bin/fm-quota-silence.sh status reports the Claude weekly quota
+#   exhausted, ONE captain ask (--key quota-zero) names the renewal in Fortaleza time, and a webhook notice goes with
+#   it. state/.quota-exhausted-notified holds the renewal epoch it was raised for, so later runs stay silent until the
+#   quota is read as clear again (the renewal), which also closes the ask. An unreadable quota changes nothing. While
+#   exhausted, bin/fm-dispatch-resolve.sh already refuses Claude candidates, so the fleet runs on the rest.
+# Env: FM_HOME, FM_SW_NOW (epoch, tests), FM_SW_PGREP (command, tests), FM_SW_ASKS (fm-asks path, tests),
+#   FM_SW_QUOTA_STATUS (command printing the quota status line, tests), FM_SW_NO_NOTIFY (skip the webhook, tests).
 # Exit: 0 healthy, 1 unhealthy (alerted or already alerted).
 set -uo pipefail
 F=${FM_HOME:-/home/factory/firstmate}; S=$F/state
@@ -23,6 +29,27 @@ INC=$S/.silent-watcher.incident; OUT=$S/.silent-watcher-alerts; LOG=$S/.silent-w
 exec 9>"$S/.silent-watcher.lock"; flock -n 9 || exit 0
 log() { echo "$(date -u -d "@$NOW" +%FT%TZ) $*" >> "$LOG"; }
 notify() { local u k; u=$(cat "$HOME/.config/fm/watcher-webhook.url" 2>/dev/null); k=$(cat "$HOME/.config/fm/watcher-webhook.key" 2>/dev/null); { [ -n "$u" ] && [ -n "$k" ] && [ -z "${FM_SW_NO_NOTIFY:-}" ]; } || return 0; local m; m=$(printf %s "$2" | tr -d '"\\'); timeout 20 curl -fsS -X POST "$u" -H "Authorization: Bearer $k" -H "Content-Type: application/json" --data "{\"event\":\"$1\",\"message\":\"$m\"}" >/dev/null 2>&1 || log "notify failed"; }
+quota_status() {
+  if [ -n "${FM_SW_QUOTA_STATUS:-}" ]; then $FM_SW_QUOTA_STATUS; else FM_HOME=$F "$(dirname "${BASH_SOURCE[0]}")/fm-quota-silence.sh" status; fi
+}
+QMARK=$S/.quota-exhausted-notified
+qline=$(quota_status 2>/dev/null </dev/null | head -1)
+case "$qline" in
+  "exhausted "[0-9]*)
+    qreset=${qline#exhausted }; qlast=$(cat "$QMARK" 2>/dev/null)
+    case "$qlast" in ''|*[!0-9]*) qlast=0 ;; esac
+    if [ $(( qreset - qlast )) -gt 3600 ]; then
+      qmsg="A cota semanal do Claude zerou. Renova em $(TZ=America/Fortaleza date -d "@$qreset" '+%d/%m às %H:%M') (Fortaleza). Até lá a frota segue só com o que não gasta Claude."
+      echo "$qreset" > "$QMARK"
+      log "QUOTA $qmsg"; notify quota "$qmsg"
+      [ -x "$ASKS" ] && FM_HOME=$F "$ASKS" add --key quota-zero "$qmsg" >/dev/null 2>&1
+    fi ;;
+  clear)
+    if [ -e "$QMARK" ]; then
+      rm -f "$QMARK"; log "quota back"
+      [ -x "$ASKS" ] && FM_HOME=$F "$ASKS" 'done' quota-zero >/dev/null 2>&1
+    fi ;;
+esac
 reasons=()
 if [ -n "${FM_SW_PGREP:-}" ]; then pids=$($FM_SW_PGREP); else pids=$(pgrep -f "^bash $F/bin/fm-watch.sh\$" || true); fi
 [ -n "$pids" ] || reasons+=("missing: no fm-watch.sh process")
@@ -43,7 +70,7 @@ fi
 if [ ${#reasons[@]} -eq 0 ]; then
   if [ -e "$INC" ]; then
     log "recovered (incident $(head -1 "$INC"))"; rm -f "$INC"; notify recovered "Vigia do captain voltou ao normal."
-    [ -x "$ASKS" ] && FM_HOME=$F "$ASKS" done silent-watcher >/dev/null 2>&1
+    [ -x "$ASKS" ] && FM_HOME=$F "$ASKS" 'done' silent-watcher >/dev/null 2>&1
   fi
   exit 0
 fi

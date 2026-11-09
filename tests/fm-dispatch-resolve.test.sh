@@ -1095,7 +1095,7 @@ printf '# Task\nThis is a SCOUT task: the deliverable is a written report, not a
 budget_epoch() { jq -nr --arg t "$1" '$t | fromdateiso8601'; }
 run_budget_at() {  # <epoch> <claude remaining percent>
   jq --argjson p "$2" '(.providers[] | select(.provider == "claude").quotaSemantics.effectiveAvailability[] | select(.scope == "all_models")).effectivePercentRemaining = $p' "$QUOTA" > "$BUDGET_QUOTA"
-  PATH="$FAKEBIN:$BASE_PATH" FM_HOME="$HOME_DIR" FM_CLAUDE_BUDGET_NOW="$1" QUOTA_AXI_FIXTURE="$BUDGET_QUOTA" "$BUDGET_TOOL" >/dev/null
+  PATH="$FAKEBIN:$BASE_PATH" FM_HOME="$HOME_DIR" FM_CLAUDE_BUDGET_NOW="$1" FM_CLAUDE_BUDGET_END=2026-11-01T22:00:00Z QUOTA_AXI_FIXTURE="$BUDGET_QUOTA" "$BUDGET_TOOL" >/dev/null
 }
 B1=$(budget_epoch 2026-10-27T01:00:00Z)
 rm -f "$HOME_DIR/state/claude-budget.state"
