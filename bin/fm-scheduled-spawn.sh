@@ -16,7 +16,16 @@
 # webhook, data/tools/fm-asks.sh when present), writes state/scheduled-loops/<loop>.pending so the tick runs it
 # again, and exits with the spawn's last status. A later success clears the pending record and the alert.
 # Durable record: state/scheduled-loops/<loop>.last, key=value lines: loop, at (epoch), at_utc, exit (the last
-# command's status), attempts, result (ok | failed | deferred-load | queued | expired), detail.
+# command's status), attempts, result (ok | failed | deferred-load | deferred | deferred-lane | deferred-quota | queued |
+# expired), detail. state/scheduled-loops/<loop>.success is the last SUCCESS only (at, at_utc, detail): a later refusal
+# rewrites .last but never .success, so "when did this loop last really run" survives a bad streak. `status` prints it.
+# Deferrals are not failures. A spawn or wrapper that exits 75 (lane or project capacity) or 76 (memory floor), or a
+# wrapper that exits 78 after printing `scheduled-deferred reason=<text>` (state/HOLD, a held lock), is queued for the
+# tick without using one of its FM_SCHEDULED_MAX_TRIES. It is retried every tick until it runs, is replaced by a newer
+# run of the loop, or ages out after FM_SCHEDULED_PENDING_MAX_DAYS; the once-a-day alert of a spawn that did not start
+# still fires. While a usage-limit hold stands (`until=` in state/.quota-silence, written by bin/fm-quota-silence-lib.sh
+# when config/quota-silence names the account) a run is queued instead of started and the tick waits for the hold to
+# end plus FM_SCHEDULED_QUOTA_GRACE_SEC (300).
 # Load contract for the private wrappers (the "refused by load" deferral). A wrapper that declines to run only
 # because the host load average is over its own gate exits 79 and prints, on stdout or stderr, one line:
 #   scheduled-load-refused load1=<X> max=<Y>
@@ -30,7 +39,8 @@
 # record. The pending record is plain text: queued_at, day, kind, reason, max_load, load1, tries, alerted, eod_alerted
 # and one arg= line per argument of the command (an argument with a newline cannot be queued).
 # Alerts use bin/fm-lane-guard.sh's key lane-guard-scheduled-<loop>.
-# Exit: spawn mode = the spawn's last status; wrap = the wrapper's status (79 for a load deferral); queue 0; tick 0;
+# Exit: spawn mode = the spawn's last status; wrap = the wrapper's status (79 for a load deferral, 78 for a deferral);
+#   a quota deferral exits 78; queue 0; tick 0;
 #   64 usage; 75 another instance is already running that loop.
 # Env: FM_HOME FM_STATE_OVERRIDE FM_CONFIG_OVERRIDE; FM_SCHEDULED_NOW (epoch, tests), FM_SCHEDULED_LOAD1 (tests),
 #   FM_SCHEDULED_SPAWN_BIN (tests), FM_SCHEDULED_DEFAULT_MAX_LOAD (threshold when a wrapper prints none, 8).
@@ -48,7 +58,9 @@ MAX_TRIES=${FM_SCHEDULED_MAX_TRIES:-6}
 EOD_LEAD=${FM_SCHEDULED_EOD_LEAD_SEC:-3600}
 PENDING_MAX_DAYS=${FM_SCHEDULED_PENDING_MAX_DAYS:-7}
 DEFAULT_MAX_LOAD=${FM_SCHEDULED_DEFAULT_MAX_LOAD:-8}
-for v in "$ATTEMPTS" "$BACKOFF" "$MAX_TRIES" "$EOD_LEAD" "$PENDING_MAX_DAYS"; do
+DEFER_EXIT=78
+QUOTA_GRACE=${FM_SCHEDULED_QUOTA_GRACE_SEC:-300}
+for v in "$ATTEMPTS" "$BACKOFF" "$MAX_TRIES" "$EOD_LEAD" "$PENDING_MAX_DAYS" "$QUOTA_GRACE"; do
   [[ $v =~ ^[0-9]+$ ]] || { echo "fm-scheduled-spawn: the FM_SCHEDULED_* numbers must be non-negative integers (got '$v')" >&2; exit 64; }
 done
 [ "$ATTEMPTS" -ge 1 ] || ATTEMPTS=1
@@ -63,6 +75,16 @@ guard() { FM_HOME=$F FM_STATE_OVERRIDE=$S FM_CONFIG_OVERRIDE=$C FM_LG_NOW=$(now)
 alert() { guard alert "scheduled-$1" "$2"; echo "scheduled loop $1: ALERT: $2" >&2; }
 clear_alert() { guard clear-alert "scheduled-$1"; }
 fget() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+# The epoch a usage-limit hold ends (state/.quota-silence until=), 0 when none stands.
+quota_until() {
+  local u; u=$(sed -n 's/^until=//p' "$S/.quota-silence" 2>/dev/null | tail -1)
+  [[ $u =~ ^[0-9]+$ ]] || u=0
+  echo "$u"
+}
+# True while a usage-limit hold stands (plus the grace after it).
+quota_held() { local u; u=$(quota_until); [ "$u" -gt 0 ] && [ "$(now)" -lt $((u + QUOTA_GRACE)) ]; }
+# A refusal that waits for capacity, not a failure: 75 lane/project capacity, 76 memory floor, 78 the deferral contract.
+is_deferral_rc() { case $1 in 75|76|"$DEFER_EXIT") return 0 ;; *) return 1 ;; esac; }
 
 write_last() { # <loop> <exit> <attempts> <result> <detail>
   local at; at=$(now); mkdir -p "$DIR" || return 0
@@ -105,9 +127,14 @@ carry_pending() {
     CARRY_QUEUED=$(now) CARRY_TRIES=0 CARRY_ALERTED='' CARRY_EOD=''
   fi
 }
+write_success() { # <loop> <attempts>
+  local at; at=$(now); mkdir -p "$DIR" || return 0
+  printf 'loop=%s\nat=%s\nat_utc=%s\nattempts=%s\ndetail=ran\n' "$1" "$at" "$(utc "$at")" "$2" > "$DIR/$1.success.tmp" && mv "$DIR/$1.success.tmp" "$DIR/$1.success"
+}
 resolve_run() { # <loop> <exit> <attempts>: the run succeeded
   rm -f "$(pending_file "$1")"
   write_last "$1" "$2" "$3" ok "ran"
+  write_success "$1" "$3"
   clear_alert "$1"
 }
 
@@ -115,6 +142,16 @@ lock_loop() { # <loop>: one instance per loop; 75 when another holds it
   mkdir -p "$DIR" || return 0
   exec 8>"$DIR/$1.lock"
   flock -n 8 || { echo "fm-scheduled-spawn: another run of scheduled loop $1 is in progress" >&2; exit 75; }
+}
+
+# A run that meets a usage-limit hold is queued, not started and not lost.
+defer_quota() { # <loop> <spawn|wrap> <args...>
+  local loop=$1 kind=$2 u
+  shift 2
+  u=$(quota_until)
+  write_last "$loop" "$DEFER_EXIT" 0 deferred-quota "usage-limit hold until $(utc "$u"); queued for the tick"
+  write_pending "$loop" "$kind" quota-hold '' '' "$CARRY_TRIES" "$CARRY_QUEUED" "$CARRY_ALERTED" "$CARRY_EOD" "$@" || true
+  echo "scheduled loop $loop: usage-limit hold until $(utc "$u"); queued for the tick"
 }
 
 # ---- spawn mode
@@ -139,6 +176,10 @@ spawn_loop() { # <loop> <spawn args...>
   local loop=$1 rc tries at
   shift
   carry_pending "$loop"
+  if quota_held && [ "${SCHEDULED_FROM_TICK:-0}" != 1 ]; then
+    defer_quota "$loop" spawn "$@"
+    return "$DEFER_EXIT"
+  fi
   run_spawn "$loop" "$@"
   rc=$SPAWN_RC tries=$SPAWN_TRIES
   if [ "$rc" -eq 0 ]; then
@@ -146,6 +187,14 @@ spawn_loop() { # <loop> <spawn args...>
     return 0
   fi
   at=$(now)
+  if is_deferral_rc "$rc"; then
+    write_last "$loop" "$rc" "$tries" deferred-lane "spawn exited $rc (capacity); the tick retries it every hour"
+    write_pending "$loop" spawn lane-deferred '' '' "$CARRY_TRIES" "$CARRY_QUEUED" "$(day_of "$CARRY_QUEUED")" "$CARRY_EOD" "$@" || true
+    if [ "$CARRY_ALERTED" != "$(day_of "$CARRY_QUEUED")" ]; then
+      alert "$loop" "scheduled loop $loop did not start: the spawn exited $rc (capacity) after $tries attempt(s) at $(utc "$at"); it is retried hourly until it runs"
+    fi
+    return "$rc"
+  fi
   write_last "$loop" "$rc" "$tries" failed "spawn refused or failed; the tick retries it"
   write_pending "$loop" spawn spawn-failed '' '' $((CARRY_TRIES + 1)) "$CARRY_QUEUED" "$(day_of "$CARRY_QUEUED")" "$CARRY_EOD" "$@" || true
   if [ "$CARRY_ALERTED" != "$(day_of "$CARRY_QUEUED")" ]; then
@@ -164,11 +213,15 @@ parse_load_line() { # <output file>: sets REFUSED_LOAD1 REFUSED_MAX; returns 1 w
   [ -n "$REFUSED_MAX" ] || REFUSED_MAX=$DEFAULT_MAX_LOAD
 }
 wrap_loop() { # <loop> <command...>
-  local loop=$1 rc out at
+  local loop=$1 rc out at reason
   shift
   carry_pending "$loop"
+  if quota_held && [ "${SCHEDULED_FROM_TICK:-0}" != 1 ]; then
+    defer_quota "$loop" wrap "$@"
+    return "$DEFER_EXIT"
+  fi
   out=$(mktemp "${TMPDIR:-/tmp}/fm-scheduled.XXXXXX") || exit 1
-  "$@" 2>&1 | tee "$out"
+  FM_SCHEDULED_WRAP=1 "$@" 2>&1 | tee "$out"
   rc=${PIPESTATUS[0]}
   if [ "$rc" -eq 0 ]; then
     resolve_run "$loop" 0 1
@@ -181,6 +234,13 @@ wrap_loop() { # <loop> <command...>
     write_pending "$loop" wrap load "$REFUSED_MAX" "${REFUSED_LOAD1:-}" "$CARRY_TRIES" "$CARRY_QUEUED" "$CARRY_ALERTED" "$CARRY_EOD" "$@" || true
     rm -f "$out"
     return "$LOAD_EXIT"
+  fi
+  if is_deferral_rc "$rc"; then
+    reason=$(sed -n 's/^scheduled-deferred reason=//p' "$out" | tail -1)
+    rm -f "$out"
+    write_last "$loop" "$rc" 1 deferred "${reason:-capacity}; re-queued for the tick"
+    write_pending "$loop" wrap deferred '' '' "$CARRY_TRIES" "$CARRY_QUEUED" "$CARRY_ALERTED" "$CARRY_EOD" "$@" || true
+    return "$rc"
   fi
   rm -f "$out"
   write_last "$loop" "$rc" 1 failed "the command exited $rc; the tick retries it"
@@ -221,11 +281,16 @@ tick_loop() { # <loop>
     return 0
   fi
   maxl=${PENDING_MAX_LOAD:-$DEFAULT_MAX_LOAD}
+  local held=0
+  ! quota_held || held=1
   local args=("${PENDING_ARGS[@]}") queued=$PENDING_QUEUED eod=$PENDING_EOD tries=$PENDING_TRIES reason=$PENDING_REASON
-  if [ "${#args[@]}" -gt 0 ]; then
-    # Only a load deferral waits on the load; a failed run or spawn is retried whatever it is, a bounded number of times.
+  if [ "${#args[@]}" -gt 0 ] && [ "$held" = 0 ]; then
+    # Only a load deferral waits on the load; a capacity deferral is retried every tick without limit; a failed run or
+    # spawn is retried a bounded number of times.
     if [ "$reason" = load ] || [ "$reason" = queued ]; then
       ! load_allows "$maxl" || try_pending "$loop" "$kind" "${args[@]}"
+    elif [ "$reason" = lane-deferred ] || [ "$reason" = deferred ] || [ "$reason" = quota-hold ]; then
+      try_pending "$loop" "$kind" "${args[@]}"
     elif [ "$tries" -lt "$MAX_TRIES" ]; then
       try_pending "$loop" "$kind" "${args[@]}"
     fi
@@ -244,6 +309,7 @@ try_pending() { # <loop> <kind> <args...>
   local loop=$1 kind=$2
   shift 2
   ( lock_loop "$loop"
+    SCHEDULED_FROM_TICK=1
     if [ "$kind" = spawn ]; then
       ATTEMPTS=1
       spawn_loop "$loop" "$@"
@@ -270,7 +336,7 @@ status() {
   for f in "$DIR"/*.last; do
     [ -e "$f" ] || continue
     loop=$(basename "$f" .last)
-    printf '%s: %s at %s exit=%s attempts=%s' "$loop" "$(fget "$f" result)" "$(fget "$f" at_utc)" "$(fget "$f" exit)" "$(fget "$f" attempts)"
+    printf '%s: %s at %s exit=%s attempts=%s last_success=%s' "$loop" "$(fget "$f" result)" "$(fget "$f" at_utc)" "$(fget "$f" exit)" "$(fget "$f" attempts)" "$(fget "$DIR/$loop.success" at_utc | grep . || echo never)"
     if read_pending "$loop"; then printf ' pending=%s since %s tries=%s' "$PENDING_REASON" "$(utc "$PENDING_QUEUED")" "$PENDING_TRIES"; fi
     printf '\n'
   done

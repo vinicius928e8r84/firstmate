@@ -81,7 +81,7 @@ test_persistent_failure_alerts_and_a_later_success_clears() {
   out=$(sched "$home" daily-audit audit-1 /proj --scout) || rc=$?
   expect_code 75 "$rc" "the final refusal status was not returned: $out"
   assert_equals 3 "$(calls "$home/spawn.calls")" "the retry was not bounded to three attempts"
-  assert_equals "failed|3|75" "$(last "$home" daily-audit result)|$(last "$home" daily-audit attempts)|$(last "$home" daily-audit exit)" \
+  assert_equals "deferred-lane|3|75" "$(last "$home" daily-audit result)|$(last "$home" daily-audit attempts)|$(last "$home" daily-audit exit)" \
     "the durable record did not show the failed run"
   assert_equals 1 "$(alert_count "$home")" "the final failure did not raise exactly one alert"
   assert_contains "$(cat "$home/state/.lane-guard-alerts")" "scheduled loop daily-audit did not start" "the alert did not name the loop"
@@ -206,12 +206,100 @@ test_usage_and_loop_names() {
 test_status_lists_each_loop() {
   local home out
   home=$(make_home status)
-  printf '%s\n' 75 75 75 > "$home/spawn.script"
+  printf '%s\n' 1 1 1 > "$home/spawn.script"
   sched "$home" daily-audit audit-1 /proj --scout >/dev/null || true
   out=$(sched "$home" status)
   assert_contains "$out" "daily-audit: failed" "status did not show the failed loop"
   assert_contains "$out" "pending=spawn-failed" "status did not show the pending retry"
+  assert_contains "$out" "last_success=never" "status did not show that the loop never succeeded"
   pass "status shows each loop's last result and any pending run"
+}
+
+test_capacity_deferral_is_never_lost_and_does_not_use_up_the_tries() {
+  local home i rc=0
+  home=$(make_home capacity)
+  printf '%s\n' 75 75 75 > "$home/spawn.script"
+  FM_SCHEDULED_NOW=$(date -u -d '2026-11-09 08:00:00' +%s) sched "$home" daily-audit audit-1 /proj --scout >/dev/null || rc=$?
+  expect_code 75 "$rc" "the capacity refusal status was not returned"
+  assert_equals deferred-lane "$(last "$home" daily-audit result)" "a capacity refusal was recorded as a failure"
+  assert_contains "$(cat "$home/state/scheduled-loops/daily-audit.pending")" "reason=lane-deferred" "the run was not kept as a capacity deferral"
+  # Ten hourly ticks that all meet a full lane: a failure would stop after FM_SCHEDULED_MAX_TRIES (6), a deferral never does.
+  printf '%s\n' 75 75 75 75 75 75 75 75 75 75 > "$home/spawn.script"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    FM_SCHEDULED_NOW=$(date -u -d "2026-11-09 08:00:00 + $i hour" +%s) sched "$home" tick >/dev/null
+  done
+  assert_equals 13 "$(calls "$home/spawn.calls")" "the tick stopped retrying a capacity deferral"
+  assert_contains "$(cat "$home/state/scheduled-loops/daily-audit.pending")" "tries=0" "a capacity deferral used up a retry"
+  : > "$home/spawn.script"
+  FM_SCHEDULED_NOW=$(date -u -d '2026-11-09 19:00:00' +%s) sched "$home" tick >/dev/null
+  assert_absent "$home/state/scheduled-loops/daily-audit.pending" "the run did not complete once the lane freed"
+  assert_equals ok "$(last "$home" daily-audit result)" "the late run was not recorded"
+  pass "a capacity refusal is retried every tick without using up the bounded tries, and the run lands when the lane frees"
+}
+
+test_last_success_survives_a_later_failure() {
+  local home out
+  home=$(make_home success)
+  : > "$home/spawn.script"
+  FM_SCHEDULED_NOW=$(date -u -d '2026-11-08 08:00:00' +%s) sched "$home" weekly-arch arch-1 /proj --scout >/dev/null
+  assert_equals 2026-11-08T08:00:00Z "$(sed -n 's/^at_utc=//p' "$home/state/scheduled-loops/weekly-arch.success")" "the success time was not recorded"
+  printf '%s\n' 1 1 1 > "$home/spawn.script"
+  FM_SCHEDULED_NOW=$(date -u -d '2026-11-09 08:00:00' +%s) sched "$home" weekly-arch arch-2 /proj --scout >/dev/null || true
+  assert_equals failed "$(last "$home" weekly-arch result)" "the second run did not fail"
+  assert_equals 2026-11-08T08:00:00Z "$(sed -n 's/^at_utc=//p' "$home/state/scheduled-loops/weekly-arch.success")" "a failure overwrote the last success"
+  out=$(sched "$home" status)
+  assert_contains "$out" "last_success=2026-11-08T08:00:00Z" "status did not show the last success"
+  pass "the last success is recorded per loop and a later failure does not overwrite it"
+}
+
+test_wrapper_deferral_exit_is_queued_without_using_tries() {
+  local home i rc=0
+  home=$(make_home wrapdefer)
+  printf '%s\n' 78 > "$home/wrap.script"
+  cat > "$home/bin/hold-wrapper" <<'SH'
+#!/usr/bin/env bash
+echo "$*" >> "$FM_HOME/wrap.calls"
+echo "wrapflag=${FM_SCHEDULED_WRAP:-}" >> "$FM_HOME/wrap.env"
+rc=$(head -1 "$FM_HOME/wrap.script" 2>/dev/null); [ -n "$rc" ] || rc=0
+sed -i 1d "$FM_HOME/wrap.script" 2>/dev/null
+[ "$rc" != 78 ] || echo "scheduled-deferred reason=state/HOLD exists"
+exit "$rc"
+SH
+  chmod +x "$home/bin/hold-wrapper"
+  FM_SCHEDULED_NOW=$(date -u -d '2026-11-09 11:07:00' +%s) sched "$home" wrap weekly-retro -- "$home/bin/hold-wrapper" --apply >/dev/null || rc=$?
+  expect_code 78 "$rc" "a wrapper deferral was not passed through"
+  assert_equals deferred "$(last "$home" weekly-retro result)" "the durable record did not show the deferral"
+  assert_contains "$(sed -n 's/^detail=//p' "$home/state/scheduled-loops/weekly-retro.last")" "state/HOLD" "the deferral reason was lost"
+  assert_equals wrapflag=1 "$(head -1 "$home/wrap.env")" "the wrapper was not told it runs under the scheduler"
+  printf '%s\n' 78 78 78 78 78 78 78 > "$home/wrap.script"
+  for i in 1 2 3 4 5 6 7; do
+    FM_SCHEDULED_NOW=$(date -u -d "2026-11-09 11:07:00 + $i hour" +%s) sched "$home" tick >/dev/null
+  done
+  assert_equals 8 "$(calls "$home/wrap.calls")" "the tick stopped retrying a deferred wrapper"
+  : > "$home/wrap.script"
+  FM_SCHEDULED_NOW=$(date -u -d '2026-11-09 20:00:00' +%s) sched "$home" tick >/dev/null
+  assert_absent "$home/state/scheduled-loops/weekly-retro.pending" "the deferred wrapper never completed"
+  assert_equals ok "$(last "$home" weekly-retro result)" "the late wrapper run was not recorded"
+  pass "a wrapper deferral (78) is queued, retried every tick without limit, and completes when it can"
+}
+
+test_usage_limit_hold_queues_a_run_and_the_tick_waits_for_the_end() {
+  local home rc=0 until_epoch
+  home=$(make_home quota)
+  until_epoch=$(date -u -d '2026-11-09 15:00:00' +%s)
+  printf 'until=%s\nchecked=%s\n' "$until_epoch" "$until_epoch" > "$home/state/.quota-silence"
+  FM_SCHEDULED_NOW=$(date -u -d '2026-11-09 08:00:00' +%s) sched "$home" daily-audit audit-1 /proj --scout >/dev/null || rc=$?
+  expect_code 78 "$rc" "a run during a usage-limit hold was not deferred"
+  assert_equals 0 "$(calls "$home/spawn.calls")" "a run during a usage-limit hold reached the spawn"
+  assert_equals deferred-quota "$(last "$home" daily-audit result)" "the hold deferral was not recorded"
+  assert_contains "$(cat "$home/state/scheduled-loops/daily-audit.pending")" "reason=quota-hold" "the run was not kept for the tick"
+  FM_SCHEDULED_NOW=$(date -u -d '2026-11-09 15:03:00' +%s) sched "$home" tick >/dev/null
+  assert_equals 0 "$(calls "$home/spawn.calls")" "the tick retried inside the grace after the hold ended"
+  FM_SCHEDULED_NOW=$(date -u -d '2026-11-09 15:10:00' +%s) sched "$home" tick >/dev/null
+  assert_equals 1 "$(calls "$home/spawn.calls")" "the tick did not retry once the hold and its grace were over"
+  assert_absent "$home/state/scheduled-loops/daily-audit.pending" "the run left a pending record after it ran"
+  assert_present "$home/state/scheduled-loops/daily-audit.success" "the late run recorded no success"
+  pass "a usage-limit hold queues the run, and the tick starts it only after the hold plus its grace"
 }
 
 test_transient_failure_retries_quietly
@@ -223,5 +311,9 @@ test_wrapper_failure_alerts_and_is_bounded
 test_queue_requeues_a_lost_run_and_stale_ones_expire
 test_usage_and_loop_names
 test_status_lists_each_loop
+test_capacity_deferral_is_never_lost_and_does_not_use_up_the_tries
+test_last_success_survives_a_later_failure
+test_wrapper_deferral_exit_is_queued_without_using_tries
+test_usage_limit_hold_queues_a_run_and_the_tick_waits_for_the_end
 
 echo '# all fm-scheduled-spawn tests passed'
