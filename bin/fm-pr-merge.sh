@@ -50,6 +50,13 @@
 # a re-test. An unreadable comparison refuses too. An attended --allow-behind
 # waives only this condition for one merge; it applies to GitHub only and is
 # refused while the away-posture record exists.
+# While the away-posture record exists a behind head is instead admitted by
+# code, never by a model, when bin/fm-pr-merge-behind-lib.sh finds the caller's
+# --risk baixa|media (alta always joins serially), no file the PR changes also
+# changed on the base since the PR's merge-base, and no file in the project's
+# config/shared-registries; any doubt keeps the refusal above. That library owns
+# the rule and the registry format, and an admitted merge appends one line to
+# state/behind-merges.pending for firstmate to check the base branch's CI.
 # The verified head is then passed to gh as
 # --match-head-commit, so a push that lands between that read and the merge
 # fails the merge instead of landing commits nothing verified. Reading that
@@ -188,7 +195,7 @@
 # between the caller's check and this read is never merged on the caller's word.
 # An unusable value is a usage error (exit 2) before any state is recorded.
 #
-# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [--allow-behind] [--expected-head <commit-id>] [-- <extra forge merge args>]
+# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [--allow-behind] [--risk baixa|media|alta] [--expected-head <commit-id>] [-- <extra forge merge args>]
 #
 # On GitLab, this script confirms the MR is actually merged before reporting it;
 # an auto-merge-queued or unconfirmed request leaves the poll armed and records
@@ -213,6 +220,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-merge-authority-lib.sh"
 # shellcheck source=bin/fm-afk-contract.sh
 . "$SCRIPT_DIR/fm-afk-contract.sh"
+# shellcheck source=bin/fm-pr-merge-behind-lib.sh
+. "$SCRIPT_DIR/fm-pr-merge-behind-lib.sh"
 
 if [ "$#" -lt 2 ]; then
   echo "error: invalid PR merge request" >&2
@@ -249,6 +258,7 @@ shift 2
 ATTENDED_OVERRIDE=false
 ALLOW_NO_PIPELINE=false
 ALLOW_BEHIND=false
+RISK=
 EXPECTED_HEAD=
 ALLOW_RED=()
 ALLOW_MISSING=()
@@ -298,6 +308,16 @@ while [ "$#" -gt 0 ]; do
       echo "error: --allow-behind takes no value" >&2
       exit 2
       ;;
+    --risk)
+      [ -z "$RISK" ] || { echo "error: --risk may be specified only once" >&2; exit 2; }
+      RISK=${2:-}
+      fm_behind_risk_valid "$RISK" || { echo "error: --risk requires baixa, media or alta" >&2; exit 2; }
+      shift 2
+      ;;
+    --risk=*)
+      echo "error: --risk requires a separate value argument" >&2
+      exit 2
+      ;;
     --expected-head)
       [ -z "$EXPECTED_HEAD" ] || { echo "error: --expected-head may be specified only once" >&2; exit 2; }
       EXPECTED_HEAD=${2:-}
@@ -336,6 +356,10 @@ fi
 # combined status have no such state to waive, so it is refused there too.
 if [ "$ALLOW_BEHIND" = true ] && [ "$PROVIDER" != github ]; then
   echo "error: --allow-behind applies only to GitHub, the only provider whose merge checks that the head contains the base" >&2
+  exit 2
+fi
+if [ -n "$RISK" ] && [ "$PROVIDER" != github ]; then
+  echo "error: --risk applies only to GitHub, the only provider whose merge checks that the head contains the base" >&2
   exit 2
 fi
 if [ "$ALLOW_NO_PIPELINE" = true ] && [ "$PROVIDER" != gitlab ]; then
@@ -480,6 +504,8 @@ if [ "$PROVIDER" = gitlab ]; then
   done
 fi
 FM_PR_AWAY_POSTURE=false
+FM_PR_BEHIND_ADMITTED=false
+FM_PR_BEHIND_BASE=
 
 fm_backlog_directory_present "$STATE" "state directory" || {
   echo "error: PR merge refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
@@ -1057,6 +1083,8 @@ github_required_checks_missing() {
 github_verify_mergeable() {
   local json fields line red name covered missing unreported producers runs
   local total=0 named=0 refusals='' mergeable_refusal='' relation=''
+  local behind_reason='' behind_summary=''
+  FM_PR_BEHIND_ADMITTED=false
   local state='' draft='' mergeable='' merge_state='' live_head='' base=''
 
   if ! json=$(gh pr view "$URL" --json state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup 2>/dev/null) \
@@ -1184,12 +1212,26 @@ EOF
       "ahead "*|"identical "*) ;;
       "behind "*|"diverged "*)
         if [ "$ALLOW_BEHIND" != true ]; then
-          case "$relation" in
-            behind\ *) relation="behind $base by ${relation#* }" ;;
-            *) relation="diverged from $base and is behind it by ${relation#* }" ;;
-          esac
-          refusals="$refusals  - the head is $relation commit(s), so it was tested on a base that has moved; join it with bin/fm-pr-merge-main.sh and re-test the delta (or pass --allow-behind, attended only)
+          behind_reason=
+          if ! fm_afk_contract_away_present "$STATE"; then
+            behind_reason="not away"
+          elif behind_summary=$(fm_behind_gate "$PR_OWNER" "$PR_REPO" "$base" "$live_head" "$RISK" "$FM_HOME/config/shared-registries"); then
+            FM_PR_BEHIND_ADMITTED=true
+            FM_PR_BEHIND_BASE=$base
+            printf '%s\n' "$behind_summary" >&2
+          else
+            behind_reason=$behind_summary
+          fi
+          if [ -n "$behind_reason" ]; then
+            case "$relation" in
+              behind\ *) relation="behind $base by ${relation#* }" ;;
+              *) relation="diverged from $base and is behind it by ${relation#* }" ;;
+            esac
+            refusals="$refusals  - the head is $relation commit(s), so it was tested on a base that has moved; join it with bin/fm-pr-merge-main.sh and re-test the delta (or pass --allow-behind, attended only)
 "
+            [ "$behind_reason" = "not away" ] || refusals="$refusals  - parallel merge while away refused: $behind_reason
+"
+          fi
         fi
         ;;
       *)
@@ -1504,6 +1546,10 @@ require_current_away_authority() {
   if [ "$FM_PR_AWAY_POSTURE" = true ] && [ "$ALLOW_BEHIND" = true ]; then
     echo "error: --allow-behind is attended-only; while the away-posture record exists the head must contain the base tip" >&2
     return 2
+  fi
+  if [ "$FM_PR_AWAY_POSTURE" != true ] && [ "$FM_PR_BEHIND_ADMITTED" = true ]; then
+    echo "error: the behind head was admitted under away authority, which no longer exists; nothing was merged" >&2
+    return 1
   fi
   if [ "$FM_PR_AWAY_POSTURE" = true ] && [ "$ALLOW_NO_PIPELINE" = true ]; then
     echo "error: --allow-no-pipeline is attended-only; while the away-posture record exists a GitLab merge requires a successful head pipeline" >&2
@@ -1906,6 +1952,10 @@ esac
 # Reached only after the forge confirmed the merge landed: set -e exits on a
 # refused or failed merge above, and a queued forge merge exits without an
 # outcome while its existing poll remains armed.
+if [ "$FM_PR_BEHIND_ADMITTED" = true ]; then
+  fm_behind_notice "$STATE" "$ID" "$URL" "$FM_PR_BEHIND_BASE" "$RISK" \
+    || printf 'actionable: merged %s behind its base but could not write state/behind-merges.pending; check the base branch CI\n' "$URL" >&2
+fi
 outcome_rc=0
 fm_merge_outcome_report "$FM_HOME" "$STATE" "$ID" "$URL" self \
   "${FM_PR_MERGE_AUTHORITY:-}" || outcome_rc=$?

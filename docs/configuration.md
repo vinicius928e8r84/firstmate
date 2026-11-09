@@ -163,6 +163,23 @@ Only a content conflict (both sides changed or both added) is eligible, and the 
 A project with no rule file or no matching line therefore never gets a mechanical resolution.
 A hand-settled merge is not a clean main merge, so the review pin still declines to carry a clean review across it; the queue then stops at `bin/fm-merge-pr.sh`'s refusal.
 
+## Parallel merges while away (config/shared-registries)
+
+While the away-posture record exists, `bin/fm-pr-merge.sh` still refuses a GitHub head that does not contain the base tip, unless `bin/fm-pr-merge-behind-lib.sh` admits it.
+Admission is decided by code and needs all of: the caller's `--risk baixa|media` (`alta` always joins and merges serially), no file the PR changes also changed on the base since the PR's merge-base, no PR file matching the project's registered shared registries, and every required check green at the exact head.
+Any unreadable list, missing `--risk`, or other doubt keeps the refusal and its join command.
+The risk level comes from the classifier that scored the PR, since no task record stores it.
+Attended merges are unchanged, and `--risk` never waives the base-tip rule while attended.
+
+Optional gitignored `config/shared-registries` lists files where entries must be unique or whose content is derived, such as text catalogs, version indexes, binary bundles, indexes, and lockfiles.
+One line per project: `<owner/repo | repo-name> <glob> [<glob>...]`, globs separated by spaces; blank lines and `#` comments are ignored.
+Globs use shell pattern matching on the repository relative path, where `*` also crosses `/`.
+An absent file or a project without a line registers nothing, and a file that exists but cannot be read refuses.
+
+Each admitted merge appends `<epoch> task=<id> base=<branch> risk=<level> <url>` to `state/behind-merges.pending`.
+After a batch, firstmate checks the base branch's CI and then clears the lines it has handled; the merge's ordinary outcome notification is the only wake.
+Merges admitted this way were tested on a base that has since moved, so that CI check is the safety net for an interaction the file comparison cannot see.
+
 ## Calm preference (config/calm)
 
 The Pi Calm extension and the Claude Code Calm mod share the local, gitignored `config/calm` preference under the effective Firstmate home.

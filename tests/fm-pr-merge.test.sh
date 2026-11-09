@@ -268,6 +268,22 @@ case "${1:-} ${2:-}" in
         if [ -f "${FM_TEST_GH_COMPARE_FAIL:-}" ]; then
           exit 1
         fi
+        # The away-posture behind gate's reads: the merge-base, then the files
+        # the PR changed (merge-base...head) and the files the base changed
+        # (merge-base...base). Each is a fixture file, absent meaning unreadable.
+        case "$*" in
+          *merge_base_commit*)
+            cat "${FM_TEST_GH_COMPARE:-/dev/null}.mergebase" 2>/dev/null || exit 1
+            exit 0
+            ;;
+          *filename*)
+            case "$*" in
+              *"...main "*|*"...main") cat "${FM_TEST_GH_COMPARE:-/dev/null}.basefiles" 2>/dev/null || exit 1 ;;
+              *) cat "${FM_TEST_GH_COMPARE:-/dev/null}.prfiles" 2>/dev/null || exit 1 ;;
+            esac
+            exit 0
+            ;;
+        esac
         cat "${FM_TEST_GH_COMPARE:-/dev/null}" 2>/dev/null || printf 'ahead 0\n'
         exit 0
         ;;
@@ -3346,6 +3362,133 @@ test_github_head_behind_base_refuses_and_allow_behind_waives() {
   pass "fm-pr-merge refuses a head behind its base, names the join, and waives only with an attended --allow-behind"
 }
 
+# While away, a behind head is admitted without the serial join only when code
+# proves it low or medium risk, crossing no file the base changed since the
+# merge-base, and touching no registered shared registry; every other reading
+# keeps the refusal, and an admitted merge leaves a CI-check notice for main.
+setup_away_behind_case() {
+  local name=$1 head=$2 risk_files=$3 base_files=$4
+  local case_dir
+  case_dir=$(make_case "$name")
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" "$head"
+  printf 'behind 3\n' > "$case_dir/github-compare"
+  printf '%s\n' 0123456789abcdef0123456789abcdef01234567 > "$case_dir/github-compare.mergebase"
+  printf '%b' "$risk_files" > "$case_dir/github-compare.prfiles"
+  printf '%b' "$base_files" > "$case_dir/github-compare.basefiles"
+  write_away_record "$case_dir" --words 'merge task-x1 when green'
+  printf '%s\n' "$case_dir"
+}
+
+test_away_behind_head_admitted_only_when_low_risk_and_disjoint() {
+  local case_dir rc head url
+  head=efefefefefefefefefefefefefefefefefefefef
+  url=https://github.com/example/repo/pull/95
+
+  case_dir=$(setup_away_behind_case away-behind-ok "$head" 'src/a.ts\ndocs/a.md\n' 'src/other.ts\n')
+  run_pr_merge "$case_dir" task-x1 "$url" --risk baixa \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "away-behind-ok: a disjoint low-risk behind head should merge"
+  assert_logged_gh_merge "$case_dir" 95 example/repo --squash
+  assert_grep 'behind head admitted while away: risk baixa' "$case_dir/stderr" "away-behind-ok: admission was not reported"
+  assert_grep "task=task-x1 base=main risk=baixa $url" "$case_dir/state/behind-merges.pending" "away-behind-ok: no CI-check notice was written"
+
+  case_dir=$(setup_away_behind_case away-behind-media "$head" 'src/a.ts\n' 'src/other.ts\n')
+  run_pr_merge "$case_dir" task-x1 "$url" --risk media \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "away-behind-media: a disjoint medium-risk behind head should merge"
+  assert_logged_gh_merge "$case_dir" 95 example/repo --squash
+
+  case_dir=$(setup_away_behind_case away-behind-cross "$head" 'src/a.ts\nsrc/b.ts\n' 'src/b.ts\nsrc/c.ts\n')
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" --risk baixa \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "away-behind-cross: a crossing file must refuse"
+  assert_grep 'also changed since the merge-base: src/b.ts' "$case_dir/stderr" "away-behind-cross: crossing file was not named"
+  assert_grep 'bin/fm-pr-merge-main.sh' "$case_dir/stderr" "away-behind-cross: the join was not named"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "away-behind-cross: gh pr merge ran"
+  [ ! -e "$case_dir/state/behind-merges.pending" ] || fail "away-behind-cross: a notice was written for a refused merge"
+
+  case_dir=$(setup_away_behind_case away-behind-alta "$head" 'src/a.ts\n' 'src/other.ts\n')
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" --risk alta \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "away-behind-alta: a high-risk PR must refuse"
+  assert_grep 'high risk (alta)' "$case_dir/stderr" "away-behind-alta: the risk refusal was not named"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "away-behind-alta: gh pr merge ran"
+
+  case_dir=$(setup_away_behind_case away-behind-norisk "$head" 'src/a.ts\n' 'src/other.ts\n')
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "away-behind-norisk: a missing --risk must refuse"
+  assert_grep 'no risk level was given' "$case_dir/stderr" "away-behind-norisk: the missing risk was not named"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "away-behind-norisk: gh pr merge ran"
+
+  case_dir=$(setup_away_behind_case away-behind-shared "$head" 'src/a.ts\ncatalog/voz/ids.json\n' 'src/other.ts\n')
+  printf '%s\n' '# registries' 'example/repo catalog/*.lock catalog/voz/*' > "$case_dir/home/config/shared-registries"
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" --risk baixa \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "away-behind-shared: a shared-registry file must refuse"
+  assert_grep 'catalog/voz/ids.json' "$case_dir/stderr" "away-behind-shared: the registry file was not named"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "away-behind-shared: gh pr merge ran"
+
+  case_dir=$(setup_away_behind_case away-behind-other-project "$head" 'catalog/voz/ids.json\n' 'src/other.ts\n')
+  printf '%s\n' 'someone/else catalog/voz/*' > "$case_dir/home/config/shared-registries"
+  run_pr_merge "$case_dir" task-x1 "$url" --risk baixa \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "away-behind-other-project: another project's registry must not block"
+  assert_logged_gh_merge "$case_dir" 95 example/repo --squash
+
+  case_dir=$(setup_away_behind_case away-behind-unreadable "$head" 'src/a.ts\n' 'src/other.ts\n')
+  rm -f "$case_dir/github-compare.basefiles"
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" --risk baixa \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "away-behind-unreadable: an unreadable file list must refuse"
+  assert_grep 'could not be read' "$case_dir/stderr" "away-behind-unreadable: the failed read was not named"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "away-behind-unreadable: gh pr merge ran"
+
+  case_dir=$(setup_away_behind_case away-behind-no-mergebase "$head" 'src/a.ts\n' 'src/other.ts\n')
+  rm -f "$case_dir/github-compare.mergebase"
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" --risk baixa \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "away-behind-no-mergebase: an unreadable merge-base must refuse"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "away-behind-no-mergebase: gh pr merge ran"
+
+  # Attended, --risk grants nothing: the head must still contain the base tip.
+  case_dir=$(make_case attended-behind-risk)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" "$head"
+  printf 'behind 3\n' > "$case_dir/github-compare"
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" --risk baixa \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "attended-behind-risk: --risk must not admit a behind head while attended"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "attended-behind-risk: gh pr merge ran"
+
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$url" --risk urgente \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "bad-risk: an unknown --risk value is a usage error"
+  pass "fm-pr-merge admits a behind head while away only for low or medium risk with no crossing and no shared registry"
+}
+
 # A draft cannot be merged, and neither can a pull request whose draft state the
 # forge did not report as a boolean; both refuse before any merge call.
 test_github_draft_or_unreadable_draft_state_refuses() {
@@ -4774,4 +4917,5 @@ test_allow_red_refused_on_forgejo
 test_allow_missing_refused_on_forgejo
 test_allow_no_pipeline_merges_only_a_null_head_pipeline
 test_github_head_behind_base_refuses_and_allow_behind_waives
+test_away_behind_head_admitted_only_when_low_risk_and_disjoint
 test_allow_no_pipeline_is_attended_only_and_gitlab_only
