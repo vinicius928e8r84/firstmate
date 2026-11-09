@@ -3035,6 +3035,7 @@ FM_CACHE_KEEPALIVE_MIN_TOKENS=30000   # context size under which a cache miss is
 FM_LIMIT_RESUME=1   # the same extension continues a turn the provider cut with a usage-limit refusal once `bin/fm-quota-silence.sh status` reports the limit lifted, instead of the do-nothing keep-alive; 0 disables it
 FM_LIMIT_RESUME_POLL_MS=300000   # interval between those no-model-call limit checks while a cut turn waits (5 minutes)
 FM_LIMIT_RESUME_MAX_ATTEMPTS=4   # resume turns spent per cut; a turn that goes through starts the count over
+FM_COMPACT_SHAPE=   # Pi primary compaction shape (.pi/extensions/fm-compact-shape.ts, whose header owns what the summarizer receives, the 8000-byte summary cap and the fallback to Pi's default): 1 on, 0 off; unset is on except for a claude-bridge model, because bridge releases before 0.9.3 summarize in their own hook first. Only the session that owns the fleet lock shapes
 FM_QUOTA_SILENCE_RECHECK=300   # seconds between quota-axi reads while the watcher is not holding its wake for a usage limit (config/quota-silence)
 FM_WAKE_SHADOW=1   # shadow log of check and signal wakes presented by the drain (state/wake-shadow.jsonl, bin/fm-wake-shadow.sh header owns the fields); observational, 0 disables it
 FM_WAKE_SHADOW_MAX_BYTES=4194304   # size at which the shadow log rotates once to wake-shadow.jsonl.1
