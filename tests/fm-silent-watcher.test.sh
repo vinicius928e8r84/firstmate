@@ -11,7 +11,7 @@ echo "$*" >> "$FM_HOME/asks.calls"
 A
 chmod +x "$T/data/tools/fm-asks.sh"
 NOW=2000000000; fail=0
-export FM_SW_NO_NOTIFY=1 FM_SW_QUOTA_STATUS="echo unknown"
+export FM_SW_NO_NOTIFY=1 FM_SW_QUOTA_STATUS="echo unknown"   # the first runs must never reach the real webhook; the webhook section below lifts it for a fake curl
 run() { FM_HOME=$T FM_SW_NOW=$NOW FM_SW_PGREP="$1" bash "$SW"; echo $?; }
 alive="echo 123"; dead="true"
 setbeat() { touch -d "@$1" "$T/state/.last-watcher-beat"; }
@@ -59,4 +59,44 @@ export FM_SW_QUOTA_STATUS="echo clear"
 run "$alive" >/dev/null; grep -q '^done quota-zero' "$T/asks.calls"; check quota-clear-closes-ask $? 0
 export FM_SW_QUOTA_STATUS="echo exhausted $((RENEW+604800))"
 run "$alive" >/dev/null; check quota-next-week-asks-again "$(asks_n)" 2
+
+# --- the webhook notice: failure status is logged, a streak falls back to ONE inbox note, success clears it
+W=$(mktemp -d); trap 'rm -rf "$T" "$W"' EXIT
+mkdir -p "$W/home/.config/fm" "$W/bin"
+printf 'https://hooks.example.test/automations/webhook/6a797cf0-1404-5ea3-b2e6-f36749c0c971' > "$W/home/.config/fm/watcher-webhook.url"
+printf 'crs_secretkeyvalue' > "$W/home/.config/fm/watcher-webhook.key"
+cat > "$W/bin/curl" <<'C'
+#!/usr/bin/env bash
+out=; while [ $# -gt 0 ]; do case $1 in -o) out=$2; shift ;; esac; shift; done
+printf '%s' "${FAKE_BODY:-}" > "$out"; printf '%s' "${FAKE_CODE:-200}"; [ "${FAKE_CODE:-200}" -lt 300 ]
+C
+cat > "$W/inbox.sh" <<'I'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$FM_HOME/inbox.notes"
+I
+chmod +x "$W/bin/curl" "$W/inbox.sh"
+nrun() { # <now> <pgrep>: one watcher run with the fake webhook; FAKE_CODE/FAKE_BODY select the reply
+  setbeat $(($1 - 60))
+  HOME=$W/home PATH=$W/bin:$PATH FM_HOME=$T FM_SW_NOW=$1 FM_SW_PGREP="$2" FM_SW_QUOTA_STATUS="echo unknown" FM_NOTIFY_INBOX=$W/inbox.sh FM_NOTIFY_FALLBACK_GAP=3600 env -u FM_SW_NO_NOTIFY bash "$SW" >/dev/null; }
+notes() { [ -f "$T/inbox.notes" ] && wc -l < "$T/inbox.notes" || echo 0; }
+rm -f "$T/state/.silent-watcher.incident" "$T/state/HOLD" "$T/state/.quota-silence" "$T/state/.silent-watcher.log" "$T/inbox.notes"
+setbeat $((NOW-60)); : > "$T/state/.wake-queue"
+export FAKE_CODE=400 FAKE_BODY='{"success":false,"error":"Automation 6a797cf0-1404-5ea3-b2e6-f36749c0c971 is disabled"}'
+nrun $NOW "$dead"                                  # alert: failure 1
+grep -q 'notify failed http=400 .*is disabled' "$T/state/.silent-watcher.log"; check fail-logs-status $? 0
+check fail-1-no-note "$(notes)" 0
+nrun $((NOW+300)) "$alive"                         # recovered notice: failure 2
+nrun $((NOW+600)) "$dead"                          # alert: failure 3 -> degraded, one note
+check fail-3-one-note "$(notes)" 1
+grep -q 'falhou 3 vezes' "$T/inbox.notes"; check note-says-streak $? 0
+nrun $((NOW+900)) "$alive"; nrun $((NOW+1200)) "$dead"   # inside the one-hour gap: no second note
+check gap-no-second-note "$(notes)" 1
+nrun $((NOW+4500)) "$alive"; nrun $((NOW+4800)) "$dead"  # past the gap: the next alert is also queued
+check gap-over-note "$(notes)" 2
+grep -q 'Alerta do vigia \[alert\]' "$T/inbox.notes"; check fallback-carries-alert $? 0
+! grep -rq 'secretkey\|6a797cf0' "$T/state" "$T/inbox.notes"; check no-secret-or-id-leak $? 0
+export FAKE_CODE=200 FAKE_BODY=''
+nrun $((NOW+5100)) "$alive"                        # a delivered notice clears the streak
+[ ! -e "$T/state/.webhook-notify.fails" ] && [ ! -e "$T/state/.webhook-notify.degraded" ]; check success-clears-streak $? 0
+grep -q 'notify recovered' "$T/state/.silent-watcher.log"; check success-logs-recovery $? 0
 exit $fail

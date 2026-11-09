@@ -11,6 +11,8 @@
 #   state/.silent-watcher-alerts (outbox, one line per incident) and registered as a captain ask with
 #   bin/../data/tools/fm-asks.sh add --key silent-watcher (deterministic; the ask shows in the owner's
 #   pending list and in fm-asks diff). Recovery clears the incident and closes the ask.
+# The webhook notice (bin/fm-webhook-notify-lib.sh) logs the HTTP status of a failure and, after repeated failures,
+#   falls back to a bin/fm-inbox.sh note so the captain's channel cannot stay silently dead.
 # No self-heal: re-arming the watcher belongs to the captain's session (fm-watch-arm.sh is session-bound).
 # Also, independent of watcher health: when bin/fm-quota-silence.sh status reports the Claude weekly quota
 #   exhausted, ONE captain ask (--key quota-zero) names the renewal in Fortaleza time, and a webhook notice goes with
@@ -21,6 +23,7 @@
 #   FM_SW_QUOTA_STATUS (command printing the quota status line, tests), FM_SW_NO_NOTIFY (skip the webhook, tests).
 # Exit: 0 healthy, 1 unhealthy (alerted or already alerted).
 set -uo pipefail
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 F=${FM_HOME:-/home/factory/firstmate}; S=$F/state
 NOW=${FM_SW_NOW:-$(date +%s)}
 BEAT_MAX=${FM_SW_BEAT_MAX:-900}; QUEUE_MAX=${FM_SW_QUEUE_MAX:-900}
@@ -28,7 +31,9 @@ ASKS=${FM_SW_ASKS:-$F/data/tools/fm-asks.sh}
 INC=$S/.silent-watcher.incident; OUT=$S/.silent-watcher-alerts; LOG=$S/.silent-watcher.log
 exec 9>"$S/.silent-watcher.lock"; flock -n 9 || exit 0
 log() { echo "$(date -u -d "@$NOW" +%FT%TZ) $*" >> "$LOG"; }
-notify() { local u k; u=$(cat "$HOME/.config/fm/watcher-webhook.url" 2>/dev/null); k=$(cat "$HOME/.config/fm/watcher-webhook.key" 2>/dev/null); { [ -n "$u" ] && [ -n "$k" ] && [ -z "${FM_SW_NO_NOTIFY:-}" ]; } || return 0; local m; m=$(printf %s "$2" | tr -d '"\\'); timeout 20 curl -fsS -X POST "$u" -H "Authorization: Bearer $k" -H "Content-Type: application/json" --data "{\"event\":\"$1\",\"message\":\"$m\"}" >/dev/null 2>&1 || log "notify failed"; }
+# shellcheck source=bin/fm-webhook-notify-lib.sh
+. "$HERE/fm-webhook-notify-lib.sh"
+notify() { fm_webhook_notify "$@" || true; }
 quota_status() {
   if [ -n "${FM_SW_QUOTA_STATUS:-}" ]; then $FM_SW_QUOTA_STATUS; else FM_HOME=$F "$(dirname "${BASH_SOURCE[0]}")/fm-quota-silence.sh" status; fi
 }

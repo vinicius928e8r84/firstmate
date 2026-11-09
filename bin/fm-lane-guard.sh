@@ -50,14 +50,9 @@ USAGE_KIND=
 trap 'fm_usage_record fm-lane-guard "${USAGE_OUTCOME:-exit-$?}" - "${USAGE_KIND:-run}"' EXIT
 
 log() { mkdir -p "$S"; echo "$(date -u -d "@$(now)" +%FT%TZ) $*" >> "$LOG"; }
-notify() { # <event> <message>; same webhook and opt-out as bin/fm-silent-watcher.sh
-  local u k m
-  u=$(cat "$HOME/.config/fm/watcher-webhook.url" 2>/dev/null); k=$(cat "$HOME/.config/fm/watcher-webhook.key" 2>/dev/null)
-  { [ -n "$u" ] && [ -n "$k" ] && [ -z "${FM_SW_NO_NOTIFY:-}" ]; } || return 0
-  m=$(printf %s "$2" | tr -d '"\\')
-  timeout 20 curl -fsS -X POST "$u" -H "Authorization: Bearer $k" -H "Content-Type: application/json" \
-    --data "{\"event\":\"$1\",\"message\":\"$m\"}" >/dev/null 2>&1 || log "notify failed"
-}
+# shellcheck source=bin/fm-webhook-notify-lib.sh
+. "$HERE/fm-webhook-notify-lib.sh"
+notify() { fm_webhook_notify "$@" || true; } # <event> <message>; same webhook, fallback and opt-out as bin/fm-silent-watcher.sh
 alert() { # <key> <ask:0|1> <message>
   local key=$1 ask=$2 msg=$3
   mkdir -p "$S"
