@@ -161,7 +161,7 @@ run_spawn() { # <loop> <spawn args...>; ATTEMPTS bounds the tries. Sets SPAWN_RC
   SPAWN_RC=1 SPAWN_TRIES=0
   for ((i = 1; i <= ATTEMPTS; i++)); do
     SPAWN_TRIES=$i
-    FM_SCHEDULED_SPAWN_HELPER=1 "$SPAWN" "$@" --scheduled-loop "$loop"
+    FM_SCHEDULED_SPAWN_HELPER=1 "$SPAWN" "$@" --scheduled-loop "$loop" 8>&-   # a lane it starts must not inherit the loop lock
     SPAWN_RC=$?
     [ "$SPAWN_RC" -ne 0 ] || return 0
     echo "fm-scheduled-spawn: scheduled loop $loop spawn attempt $i of $ATTEMPTS exited $SPAWN_RC" >&2
@@ -221,7 +221,7 @@ wrap_loop() { # <loop> <command...>
     return "$DEFER_EXIT"
   fi
   out=$(mktemp "${TMPDIR:-/tmp}/fm-scheduled.XXXXXX") || exit 1
-  FM_SCHEDULED_WRAP=1 "$@" 2>&1 | tee "$out"
+  FM_SCHEDULED_WRAP=1 "$@" 8>&- 2>&1 | tee "$out"   # a lane the wrapper starts must not inherit the loop lock
   rc=${PIPESTATUS[0]}
   if [ "$rc" -eq 0 ]; then
     resolve_run "$loop" 0 1

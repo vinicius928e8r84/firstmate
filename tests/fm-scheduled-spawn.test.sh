@@ -302,6 +302,23 @@ test_usage_limit_hold_queues_a_run_and_the_tick_waits_for_the_end() {
   pass "a usage-limit hold queues the run, and the tick starts it only after the hold plus its grace"
 }
 
+test_a_lane_started_by_the_wrapper_does_not_keep_the_loop_lock() {
+  local home rc=0
+  home=$(make_home lockfd)
+  cat > "$home/bin/lane-wrapper" <<'SH'
+#!/usr/bin/env bash
+# stands in for a wrapper whose spawn leaves a long-lived lane behind
+setsid -f sleep 4 </dev/null >/dev/null 2>&1
+exit 0
+SH
+  chmod +x "$home/bin/lane-wrapper"
+  sched "$home" wrap weekly-bench -- "$home/bin/lane-wrapper" >/dev/null || rc=$?
+  expect_code 0 "$rc" "the first wrapper run failed"
+  sched "$home" wrap weekly-bench -- "$home/bin/lane-wrapper" >/dev/null || rc=$?
+  expect_code 0 "$rc" "a lane left behind by the first run kept the loop lock (exit 75)"
+  pass "a lane started by a wrapper does not inherit and hold the loop lock"
+}
+
 test_transient_failure_retries_quietly
 test_persistent_failure_alerts_and_a_later_success_clears
 test_other_failure_codes_are_retried_too
@@ -315,5 +332,6 @@ test_capacity_deferral_is_never_lost_and_does_not_use_up_the_tries
 test_last_success_survives_a_later_failure
 test_wrapper_deferral_exit_is_queued_without_using_tries
 test_usage_limit_hold_queues_a_run_and_the_tick_waits_for_the_end
+test_a_lane_started_by_the_wrapper_does_not_keep_the_loop_lock
 
 echo '# all fm-scheduled-spawn tests passed'
