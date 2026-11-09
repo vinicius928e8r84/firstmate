@@ -29,7 +29,7 @@ fm_webhook_notify() { # <event> <message>
   u=$(cat "$HOME/.config/fm/watcher-webhook.url" 2>/dev/null); k=$(cat "$HOME/.config/fm/watcher-webhook.key" 2>/dev/null)
   { [ -n "$u" ] && [ -n "$k" ] && [ -z "${FM_SW_NO_NOTIFY:-}" ]; } || return 0
   now=$(fm_notify_now); max=${FM_NOTIFY_FAIL_MAX:-3}; gap=${FM_NOTIFY_FALLBACK_GAP:-3600}
-  m=$(printf %s "$msg" | tr -d '"\\')
+  m=$(printf %s "$msg" | tr -d "\"\\\\")
   body=$(mktemp "${TMPDIR:-/tmp}/fm-webhook.XXXXXX") || return 1
   code=$(timeout "${FM_NOTIFY_CURL_MAX:-20}" curl -sS -X POST "$u" -H "Authorization: Bearer $k" -H "Content-Type: application/json" \
     --data "{\"event\":\"$event\",\"message\":\"$m\"}" -o "$body" -w '%{http_code}' 2>/dev/null) || code=${code:-000}

@@ -24,9 +24,9 @@ check healthy "$(run "$alive")" 0; check healthy-no-alert "$(alerts)" 0
 check dead "$(run "$dead")" 1; check dead-alert "$(alerts)" 1
 grep -q missing "$T/state/.silent-watcher-alerts"; check dead-reason $? 0
 check debounce "$(run "$dead")" 1; check debounce-no-spam "$(alerts)" 1
-grep -c '^add --key silent-watcher' "$T/asks.calls" | { read c; check ask-once "$c" 1; }
+grep -c '^add --key silent-watcher' "$T/asks.calls" | { read -r c; check ask-once "$c" 1; }
 # recovery closes incident + ask
-check recover "$(run "$alive")" 0; [ -e "$T/state/.silent-watcher.incident" ]; check incident-cleared $? 1
+check recover "$(run "$alive")" 0; [ -e "$T/state/.silent-watcher.incident" ] && inc=0 || inc=1; check incident-cleared "$inc" 1
 grep -q '^done silent-watcher' "$T/asks.calls"; check ask-done $? 0
 # stale beat, process alive (hung)
 setbeat $((NOW-3600)); check stale-beat "$(run "$alive")" 1; check stale-alert "$(alerts)" 2
