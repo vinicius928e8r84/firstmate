@@ -126,7 +126,7 @@ test_signal_annotation_surfaces_every_unread_note_not_only_the_newest() {
     || fail "the signal annotation dropped the buried answer note: $(cat "$out")"
   grep -F 'latest wake-EVENT observed at drain, not current state: task4.status: note: re-read acknowledgement' "$out" >/dev/null \
     || fail "the signal annotation dropped the newest routine note: $(cat "$out")"
-  grep "$(printf '\tsignal\ttask4.status\t')" "$out" >/dev/null \
+  grep "$(printf '^[0-9]*\tsignal\ttask4.status$')" "$out" >/dev/null \
     || fail "surfacing unread notes hid the authoritative raw wake row"
   pass "a queued status signal annotates every unread note, not only the newest"
 }
@@ -447,6 +447,33 @@ test_routine_working_and_covered_done_stay_silent_on_the_empty_queue() {
   fi
   [ ! -s "$out" ] || fail "the empty-queue covered routine case was not silent: $(cat "$out")"
   pass "routine working and branch-covered done lines print nothing on an empty-queue drain"
+}
+
+test_wake_rows_print_each_reason_once_with_only_seq_kind_and_file() {
+  local dir state out reason
+  dir=$(make_case grouped-rows)
+  state="$dir/state"
+  out="$dir/drain.out"
+  reason="signal: ta.status tb.status tc.status td.status"
+  for f in ta tb tc td; do
+    printf 'working: step\n' > "$state/$f.status"
+    append_wake "$state" signal "$f.status" "$reason" || fail "queueing $f failed"
+  done
+  append_wake "$state" check lane-guard "check: lane-guard: a different reason" || fail "queueing the check failed"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" 2> "$dir/drain.err" || fail "drain failed"
+  [ "$(grep -cF "reason: $reason" "$out")" -eq 1 ] || fail "the shared reason was not printed exactly once: $(cat "$out")"
+  for f in ta tb tc td; do
+    grep -E "^[0-9]+$(printf '\t')signal$(printf '\t')$f.status$" "$out" >/dev/null || fail "row for $f lost its seq, kind, file: $(cat "$out")"
+  done
+  grep -F 'reason: check: lane-guard: a different reason' "$out" >/dev/null || fail "a different reason did not start its own group: $(cat "$out")"
+  grep -E "^[0-9]+$(printf '\t')check$(printf '\t')lane-guard$" "$out" >/dev/null || fail "the check row lost its seq, kind, file: $(cat "$out")"
+  grep -F 'WAKE_ACK_REQUIRED' "$dir/drain.err" >/dev/null || fail "the acknowledgement line changed"
+
+  # The machine-reader form is still the full five-field row.
+  FM_STATE_OVERRIDE="$state" FM_WAKE_DRAIN_ROWS=full "$DRAIN" > "$out" 2>/dev/null || fail "full-row drain failed"
+  [ "$(grep -cF "$reason" "$out")" -ge 4 ] || fail "the full form did not keep the reason on every row: $(cat "$out")"
+  pass "wake rows print each reason once, then only seq, kind and file; full rows stay available"
 }
 
 test_incident_note_answer_buried_under_routine_note_surfaces_both

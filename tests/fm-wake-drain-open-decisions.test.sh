@@ -135,10 +135,49 @@ test_open_decision_surfaces_even_with_an_unrelated_queued_wake() {
 
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed with a mixed fleet"
 
-  grep "$(printf '\tsignal\ttask7.status\t')" "$out" >/dev/null || fail "task7's own raw row is missing"
+  grep "$(printf '^[0-9]*\tsignal\ttask7.status$')" "$out" >/dev/null || fail "task7's own raw row is missing"
   grep -F 'task6' "$out" | grep -F '[key=migration]' >/dev/null \
     || fail "task6's buried decision was not surfaced even though only task7 queued a wake"
   pass "the open-decision section is fleet-wide, not scoped to this drain's own queued records"
+}
+
+test_unchanged_decisions_are_counted_not_repeated() {
+  local dir state out
+  dir=$(make_case delta)
+  state="$dir/state"
+  out="$dir/drain.out"
+  printf 'needs-decision [key=api-shape]: pick REST or RPC\n' > "$state/task9.status"
+  printf 'blocked [key=creds]: waiting on credentials\n' > "$state/task10.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "first drain failed"
+  grep -F 'pick REST or RPC' "$out" >/dev/null || fail "first presentation omitted a new decision"
+  grep -F 'waiting on credentials' "$out" >/dev/null || fail "first presentation omitted the second decision"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "second drain failed"
+  if grep -F 'pick REST or RPC' "$out" >/dev/null; then fail "an unchanged decision was repeated: $(cat "$out")"; fi
+  grep -F 'OPEN DECISIONS: 2 more unchanged' "$out" >/dev/null || fail "the unchanged decisions were not counted: $(cat "$out")"
+
+  # A changed note, and a brand-new decision, are listed; the rest stay counted.
+  printf 'blocked [key=creds]: still waiting, now on the vendor\n' >> "$state/task10.status"
+  printf 'needs-decision [key=fresh]: a brand new ask\n' > "$state/task11.status"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "third drain failed"
+  grep -F 'now on the vendor' "$out" >/dev/null || fail "a changed decision was not re-listed: $(cat "$out")"
+  grep -F 'a brand new ask' "$out" >/dev/null || fail "a new decision was not listed: $(cat "$out")"
+  grep -F 'OPEN DECISIONS: 1 more unchanged' "$out" >/dev/null || fail "the one unchanged decision was not counted: $(cat "$out")"
+
+  # The explicit views list everything: a session start (all) and a peek.
+  FM_OPEN_DECISIONS_VIEW=all FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "all-view drain failed"
+  grep -F 'pick REST or RPC' "$out" >/dev/null || fail "the all view did not list an already-shown decision"
+  FM_OPEN_DECISIONS_VIEW=peek FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "peek drain failed"
+  grep -F 'pick REST or RPC' "$out" >/dev/null || fail "the peek view did not list an already-shown decision"
+
+  # A closed decision that later reopens is listed again.
+  printf 'resolved [key=api-shape]: use REST\n' >> "$state/task9.status"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain after the close failed"
+  printf 'needs-decision [key=api-shape]: pick REST or RPC\n' >> "$state/task9.status"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain after the reopen failed"
+  grep -F 'pick REST or RPC' "$out" >/dev/null || fail "a reopened decision was not listed again: $(cat "$out")"
+  pass "OPEN DECISIONS lists only new or changed decisions and counts the rest"
 }
 
 test_buried_decision_surfaces_on_the_empty_queue_fast_path() {
@@ -222,5 +261,6 @@ test_later_unrelated_terminal_line_does_not_close_it
 test_reserved_key_namespace_is_owned_by_its_library
 test_no_open_decisions_prints_nothing
 test_open_decision_surfaces_even_with_an_unrelated_queued_wake
+test_unchanged_decisions_are_counted_not_repeated
 test_buried_decision_surfaces_on_the_empty_queue_fast_path
 test_status_symlink_is_not_followed

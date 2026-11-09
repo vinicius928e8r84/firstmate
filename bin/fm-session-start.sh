@@ -175,6 +175,9 @@
 # may be. Both bounds are safe because the section prints every task's full
 # status log path, and AGENTS.md section 8 treats a status line as a wake EVENT
 # rather than current state - bin/fm-crew-state.sh owns current state.
+# ORPHAN STATUS LOGS (no matching .meta) print a tail only while they hold an
+# open decision or their newest event is inside FM_SESSION_START_ORPHAN_DAYS
+# (default 3); every older one is counted in a single line.
 #
 # RUNTIME BOUND: the digest is now executed through a native session-open
 # adapter (see bin/fm-sessionstart-run.sh), which blocks either hook-driven
@@ -230,12 +233,16 @@
 #             session lock records AGENTS.md's SHA-256 baseline only after the
 #             digest completion record is published, keyed to that lock's
 #             harness pid. No resume, clear, reset, compact, or other rebuild
-#             creates or replaces it. Pi and pi-signed compaction are the only
+#             creates or replaces it, except by the age proof below. Pi and pi-signed compaction are the only
 #             supported stale-cache rebuild pair: a missing baseline, a baseline
 #             for another harness pid, or a changed hash causes the complete
 #             current AGENTS.md to print before the bulky digest. The baseline
 #             remains immutable so every later drifted compaction refreshes
-#             again, while an equal baseline emits no instruction refresh.
+#             again, while an equal baseline emits no instruction refresh. A
+#             process with no baseline of its own whose start is later than
+#             AGENTS.md's last change already read the current file at start,
+#             so it gets no refresh and that file becomes its baseline; a file
+#             changed after the process started is still delivered.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -373,6 +380,8 @@ PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-classify-lib.sh
+. "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-line-cap-lib.sh
 . "$SCRIPT_DIR/fm-line-cap-lib.sh"
 # shellcheck source=bin/fm-hold-reason-lib.sh
@@ -392,6 +401,8 @@ TASKS_AXI_CHECK_REASON=$(fm_tasks_axi_check_reason)
 
 STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-5}
 case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
+ORPHAN_DAYS=${FM_SESSION_START_ORPHAN_DAYS:-3}
+case "$ORPHAN_DAYS" in ''|*[!0-9]*) ORPHAN_DAYS=3 ;; esac
 QUEUED_LIMIT=${FM_SESSION_START_QUEUED_LIMIT:-20}
 case "$QUEUED_LIMIT" in ''|*[!0-9]*|0) QUEUED_LIMIT=20 ;; esac
 # One per-task endpoint read may never outlive this bound: a hung backend CLI
@@ -629,15 +640,45 @@ write_agents_baseline() {  # <lock-pid> <agents-hash>
   return 1
 }
 
+# Seconds since the epoch at which <pid> started, or nothing when ps cannot say.
+fm_pid_start_epoch() {  # <pid>
+  local lstart
+  lstart=$(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || return 1
+  [ -n "$lstart" ] || return 1
+  date -d "$lstart" +%s 2>/dev/null || LC_ALL=C date -j -f '%a %b %e %T %Y' "$lstart" +%s 2>/dev/null
+}
+
+fm_file_mtime_epoch() {  # <file>
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+# True (0) when the AGENTS.md this process started with may differ from the file
+# now. A baseline recorded for this very process decides by hash. With none for
+# it (resumed with --continue, helm taken by hand, a new pid after a restart),
+# the process read AGENTS.md when it started, so a file older than the process
+# cannot have drifted: that file becomes this process's baseline (never written
+# by a read-only session, which is not the lock owner), and a mid-process change
+# - a local landing - is still delivered once because the file is then newer
+# than the process. Anything unprovable counts as drifted.
 agents_baseline_drifted() {  # <rebuilding-session-pid>
-  local lock_pid=$1 baseline_pid baseline_hash current_hash
-  [ -f "$AGENTS_BASELINE_FILE" ] && [ ! -L "$AGENTS_BASELINE_FILE" ] || return 0
-  baseline_pid=$(sed -n '1p' "$AGENTS_BASELINE_FILE" 2>/dev/null || true)
-  baseline_hash=$(sed -n '2p' "$AGENTS_BASELINE_FILE" 2>/dev/null || true)
+  local lock_pid=$1 baseline_pid='' baseline_hash='' current_hash started mtime
   current_hash=$(hash_file_sha256 "$FM_ROOT/AGENTS.md" 2>/dev/null || true)
   [ -n "$current_hash" ] || return 0
-  [ "$baseline_pid" = "$lock_pid" ] && [ "$baseline_hash" = "$current_hash" ] && return 1
-  return 0
+  if [ -f "$AGENTS_BASELINE_FILE" ] && [ ! -L "$AGENTS_BASELINE_FILE" ]; then
+    baseline_pid=$(sed -n '1p' "$AGENTS_BASELINE_FILE" 2>/dev/null || true)
+    baseline_hash=$(sed -n '2p' "$AGENTS_BASELINE_FILE" 2>/dev/null || true)
+  fi
+  if [ -n "$lock_pid" ] && [ "$baseline_pid" = "$lock_pid" ]; then
+    [ "$baseline_hash" = "$current_hash" ] && return 1
+    return 0
+  fi
+  [ -n "$lock_pid" ] || return 0
+  started=$(fm_pid_start_epoch "$lock_pid") || return 0
+  mtime=$(fm_file_mtime_epoch "$FM_ROOT/AGENTS.md") || return 0
+  case "$started$mtime" in *[!0-9]*) return 0 ;; esac
+  [ "$mtime" -lt "$started" ] || return 0
+  [ "${READ_ONLY:-0}" -ne 0 ] || write_agents_baseline "$lock_pid" "$current_hash" || true
+  return 1
 }
 
 # Only run-tier source pairs with both a stale native instruction cache and a
@@ -823,7 +864,7 @@ else
       printf '%s\n' "$BRANCH_REPLAY_OUT"
     fi
   fi
-  DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
+  DRAIN_OUT=$(FM_OPEN_DECISIONS_VIEW=all "$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
   if [ -n "$DRAIN_OUT" ]; then
     printf '%s\n' "$DRAIN_OUT"
   else
@@ -972,16 +1013,36 @@ done
 [ "$META_FOUND" -eq 1 ] || printf '(none)\n'
 
 subsection "Orphan status logs (state/*.status without matching .meta)"
+# A log with no task behind it matters only while it holds an open decision or a
+# recent event; the rest is history, summarised by one count line. Recent means
+# the newest line's own time tag (file mtime when untagged) is inside
+# FM_SESSION_START_ORPHAN_DAYS days.
 ORPHAN_STATUS_FOUND=0
+ORPHAN_STATUS_OMITTED=0
+ORPHAN_NOW=$(date +%s 2>/dev/null || printf 0)
 for status in "$STATE"/*.status; do
   [ -f "$status" ] || continue
   id=$(basename "$status" .status)
   [ -f "$STATE/$id.meta" ] && continue
+  orphan_last=$(tail -n 1 "$status" 2>/dev/null || true)
+  orphan_at=$(status_line_at_epoch "$orphan_last" 2>/dev/null || true)
+  [ -n "$orphan_at" ] || orphan_at=$(_fm_status_file_mtime "$status" 2>/dev/null || true)
+  orphan_open=$(status_open_decisions "$status" 2>/dev/null || true)
+  if [ -z "$orphan_open" ] && [ -n "$orphan_at" ] && [ "$ORPHAN_NOW" -gt 0 ] \
+    && [ $((ORPHAN_NOW - orphan_at)) -gt $((ORPHAN_DAYS * 86400)) ]; then
+    ORPHAN_STATUS_OMITTED=$((ORPHAN_STATUS_OMITTED + 1))
+    continue
+  fi
   ORPHAN_STATUS_FOUND=1
   printf '\n--- %s ---\n' "$id"
   print_status_tail "$status"
 done
-[ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
+if [ "$ORPHAN_STATUS_OMITTED" -gt 0 ]; then
+  printf '\n%s older orphan status log(s) with no open decision omitted (idle more than %s day(s); logs in %s).\n' \
+    "$ORPHAN_STATUS_OMITTED" "$ORPHAN_DAYS" "$STATE"
+elif [ "$ORPHAN_STATUS_FOUND" -ne 1 ]; then
+  printf '(none)\n'
+fi
 
 subsection "AFK"
 # The away posture is the record (bin/fm-afk-contract.sh); the legacy flag

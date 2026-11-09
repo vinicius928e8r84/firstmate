@@ -15,6 +15,11 @@ set -u
 
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
+# These tests assert the fold and cursor across many drains, so every drain
+# lists every open decision; the changed-only presentation has its own tests in
+# tests/fm-wake-drain-open-decisions.test.sh.
+export FM_OPEN_DECISIONS_VIEW=peek
+
 TMP_ROOT=$(fm_test_tmproot fm-wake-drain-open-decisions-cursor-tests)
 
 # Append <count> harmless filler lines (routine working: notes, never a

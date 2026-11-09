@@ -1974,6 +1974,9 @@ EOF
 # whole and prints one tab-separated row per PR, oldest first: task, first
 # MERGE-READY epoch (0 when no line carries [at=]), label (full URL when the line
 # names one, else "PR <n>"), and the newest MERGE-READY note.
+# Only a done or needs-decision line can report a PR ready - a working line that
+# mentions MERGE-READY is progress prose - and "no MERGE-READY" or "not
+# MERGE-READY" negates it.
 # The PR is identified from the line (a /pull/<n> or /merge_requests/<n> URL,
 # "PR <n>", "#<n>", or a leading "<n>"); a report naming none is kept only
 # until a later merge-word line of the same task. A later line retires a report
@@ -2015,7 +2018,8 @@ EOF
       t = 0
       if (match(line, /\[at=[0-9]+\]/)) t = substr(line, RSTART + 4, RLENGTH - 5) + 0
       note = line; sub(/^[A-Za-z-]+( \[[^]]*\])*:[ \t]*/, "", note)
-      if (line ~ /MERGE-READY/ && line !~ /([Nn]ot|NOT|no longer|n[ãa]o) +(yet +)?MERGE-READY/) {
+      if (line ~ /^(done|needs-decision)[ \[:]/ && line ~ /MERGE-READY/ \
+          && line !~ /(^|[^A-Za-z])([Nn]o|[Nn]ot|NOT|no longer|n[ãa]o) +(yet +)?MERGE-READY/) {
         url = ""
         n = pr_number(note)
         if (match(note, /https?:\/\/[^ )]*\/(pull|pulls|merge_requests)\/[0-9]+/)) url = substr(note, RSTART, RLENGTH)
@@ -2049,6 +2053,114 @@ EOF
         printf "%s\t%d\t%s\t%s\n", last_task[key], first_t[key], label[key], out
       }
     }' "${files[@]}" | sort -t "$(printf '\t')" -k2,2n
+}
+
+# Every PR URL the local records already prove merged, one per line, with no
+# network read. Four records count: the merge-notified markers a merge leaves
+# beside its task (including parked ones, read back to a URL through the task's
+# poll data when it survives), the poll data of a parked stand-in, a
+# "check: merge landed" row still in the wake queue, and a saved contribution
+# observation whose state is merged. The merge-ready section subtracts this set
+# from what scan_merge_ready_waiting reports, so a PR the fleet has already
+# landed stops being listed on every wake. A missing record or jq only shrinks
+# the set; it never errors.
+merged_pr_urls_local() {  # <state> [<data>]
+  local state=$1 data=${2:-} marker dir id provider host path number url sep
+  local files=()
+  [ -d "$state" ] || return 0
+  for marker in "$state"/*.pr-poll-merge-notified "$state"/*/*.pr-poll-merge-notified; do
+    [ -f "$marker" ] && [ ! -L "$marker" ] || continue
+    dir=${marker%/*}
+    id=${marker##*/}
+    id=${id%.pr-poll-merge-notified}
+    {
+      IFS= read -r _
+      IFS= read -r provider
+      IFS= read -r host
+      IFS= read -r path
+      IFS= read -r number
+    } < "$marker" 2>/dev/null || continue
+    url=
+    if [ -f "$dir/$id.pr-poll" ]; then
+      url=$(sed -n '2p' "$dir/$id.pr-poll" 2>/dev/null || true)
+      case "$url" in *"/$number") ;; *) url= ;; esac
+    fi
+    if [ -z "$url" ]; then
+      case "$provider" in
+        github) sep=pull ;;
+        gitlab) sep=-/merge_requests ;;
+        *) continue ;;
+      esac
+      url="https://$host/$path/$sep/$number"
+    fi
+    printf '%s\n' "$url"
+  done
+  for marker in "$state"/*parked*/*.pr-poll; do
+    [ -f "$marker" ] && [ ! -L "$marker" ] || continue
+    sed -n '2p' "$marker" 2>/dev/null || true
+  done
+  if [ -f "$state/.wake-queue" ]; then
+    grep -o 'check: merge landed: [^ ]* [^ ]*' "$state/.wake-queue" 2>/dev/null | awk '{ print $5 }' || true
+  fi
+  if [ -n "$data" ] && [ -d "$data" ] && command -v jq >/dev/null 2>&1; then
+    for marker in "$data"/*/contributions.json; do
+      [ -f "$marker" ] && [ ! -L "$marker" ] && files+=("$marker")
+    done
+    if [ "${#files[@]}" -gt 0 ]; then
+      jq -r '.records[]? | select((.observation.state // "") == "merged") | .url // empty' \
+        "${files[@]}" 2>/dev/null || true
+    fi
+  fi
+}
+
+# The repository names a task works on: the `projects=` list of its meta (a
+# secondmate's registered clones), else the basename of its `project=` path.
+# One name per line; nothing when the meta is absent.
+merge_ready_task_repos() {  # <state> <task>
+  local meta="$1/$2.meta" projects project
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 0
+  projects=$(sed -n 's/^projects=//p' "$meta" | head -n 1)
+  if [ -n "$projects" ]; then
+    printf '%s\n' "$projects" | tr ',' ' ' | tr -s ' ' '\n' | sed '/^$/d'
+    return 0
+  fi
+  project=$(sed -n 's/^project=//p' "$meta" | head -n 1)
+  [ -z "$project" ] || printf '%s\n' "${project##*/}"
+}
+
+# 0 when the local merged-PR set already proves a MERGE-READY row merged.
+# <label> is the row's label from scan_merge_ready_waiting: a full URL matches
+# the set exactly. A bare "PR <n>" label names no repository, so it is matched
+# by number inside the repositories the sending task works on
+# (merge_ready_task_repos), and only when the row's own text does not name some
+# other repository the set knows (a task can report a sibling project's PR with
+# the same number). <merged-urls> is merged_pr_urls_local's output.
+merge_ready_row_merged_locally() {  # <state> <task> <label> <note> <merged-urls>
+  local state=$1 task=$2 label=$3 note=$4 merged=$5 number repo repos other
+  [ -n "$merged" ] || return 1
+  case "$label" in
+    http*) printf '%s\n' "$merged" | grep -Fxq -- "$label"; return ;;
+    "PR "[0-9]*) number=${label#PR } ;;
+    *) return 1 ;;
+  esac
+  case "$number" in ''|*[!0-9]*) return 1 ;; esac
+  repos=$(merge_ready_task_repos "$state" "$task")
+  [ -n "$repos" ] || return 1
+  # Any other repository named in the row's text makes the number ambiguous.
+  while IFS= read -r other; do
+    [ -n "$other" ] || continue
+    printf '%s\n' "$repos" | grep -Fxq -- "$other" && continue
+    case "$note" in *"$other"*) return 1 ;; esac
+  done <<EOF
+$(printf '%s\n' "$merged" | sed -n 's#^https\{0,1\}://[^/]*/.*/\([^/]*\)/\(-/merge_requests\|pull\)/[0-9]*$#\1#p' | sort -u)
+EOF
+  while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    printf '%s\n' "$merged" | grep -Eq -- "/$repo/(pull|-/merge_requests)/$number$" && return 0
+  done <<EOF
+$repos
+EOF
+  return 1
 }
 
 # --- unread status lines since the presentation cursor ----------------------

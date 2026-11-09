@@ -17,6 +17,11 @@
 # cover a race, and the phrase list is a product contract worth a dedicated test.
 set -u
 
+# This suite asserts what the watcher queued by reading the drain's presented
+# rows, so it drains in the five-field row form (bin/fm-wake-drain.sh header).
+# The default grouped form has its own tests in tests/fm-wake-drain-unread-status.test.sh.
+export FM_WAKE_DRAIN_ROWS=full
+
 # shellcheck source=tests/wake-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
 

@@ -243,11 +243,15 @@ case "$*" in
   *"args="*)
     if [ -z "${FM_FAKE_HARNESS_PID:-}" ] || [ "$pid" = "$FM_FAKE_HARNESS_PID" ] \
       || [ "$pid" = "${FM_FAKE_LIVE_HOLDER_PID:-}" ]; then
-      printf '%s\n' "$harness"
+      printf '%s\n' "${FM_FAKE_HARNESS_ARGS:-$harness}"
     else
       printf 'bash\n'
     fi
     exit 0
+    ;;
+  *"lstart="*)
+    # Process start time is real: the fixture's harness pid is a real process.
+    exec /bin/ps -o lstart= -p "$pid"
     ;;
   *"ppid="*)
     [ -n "${FM_FAKE_HARNESS_PID:-}" ] || exit 1
@@ -1325,6 +1329,38 @@ EOF
   pass "orphan status logs are printed once with bounded tails"
 }
 
+test_old_orphan_status_logs_collapse_to_a_count_unless_decision_open() {
+  local rec root home fakebin out now old
+  rec=$(new_world orphan-old)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  now=$(date +%s)
+  old=$((now - 10 * 86400))
+
+  printf 'done [at=%s]: stale finished\n' "$old" > "$home/state/orph-stale.status"
+  printf 'working [at=%s]: stale worker\n' "$old" > "$home/state/orph-stale2.status"
+  printf 'needs-decision [at=%s] [key=k1]: old but unanswered\n' "$old" > "$home/state/orph-open.status"
+  printf 'working [at=%s]: fresh orphan\n' "$((now - 3600))" > "$home/state/orph-fresh.status"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_not_contains "$out" "--- orph-stale ---" "an idle orphan log with no open decision was still listed"
+  assert_not_contains "$out" "--- orph-stale2 ---" "a second idle orphan log was still listed"
+  assert_not_contains "$out" "stale worker" "an idle orphan tail was printed"
+  assert_contains "$out" "--- orph-open ---" "an orphan log with an open decision was omitted"
+  assert_contains "$out" "--- orph-fresh ---" "a recent orphan log was omitted"
+  assert_contains "$out" "2 older orphan status log(s) with no open decision omitted" \
+    "the omitted orphan logs were not counted"
+
+  out=$(FM_SESSION_START_ORPHAN_DAYS=30 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "--- orph-stale ---" "the configurable window did not widen"
+  assert_not_contains "$out" "older orphan status log(s)" "a widened window still printed a count"
+
+  pass "orphan logs older than the window collapse to a count unless a decision is open"
+}
+
 # --- session-start secondmate recovery boundary -----------------------------
 
 test_session_start_relaunches_missing_pi_secondmate() {
@@ -1731,8 +1767,9 @@ EOF
   assert_contains "$out" "lock acquired: harness pid" "fm-lock.sh's real output did not appear (composition, not reimplementation)"
   # fm-bootstrap.sh's own exact MISSING-tool line format.
   assert_contains "$out" "MISSING: node (install:" "fm-bootstrap.sh's real detect line did not appear verbatim"
-  # fm-wake-drain.sh's real drained record (raw tab-separated queue line).
-  assert_contains "$out" "$(printf 'signal\ttask-z.status\tneeds-decision: pick a library')" "fm-wake-drain.sh's real drained record did not appear"
+  # fm-wake-drain.sh's real drained record: the reason once, then seq, kind, file.
+  assert_contains "$out" "reason: needs-decision: pick a library" "fm-wake-drain.sh's real drained reason did not appear"
+  assert_contains "$out" "$(printf 'signal\ttask-z.status')" "fm-wake-drain.sh's real drained record did not appear"
   assert_contains "$out" "wake annotation: latest wake-EVENT observed at drain, not current state: task-z.status: needs-decision: pick a library" "fm-session-start.sh did not preserve the drain's separate annotation line"
 
   pass "fm-session-start.sh composes the real fm-lock.sh, fm-bootstrap.sh, and fm-wake-drain.sh output verbatim"
@@ -2627,6 +2664,76 @@ $(hash_file_for_test "$root/AGENTS.md")" ] \
   pass "true-start AGENTS baselines stay immutable while every drifted Pi compact re-emits the current contract"
 }
 
+test_agents_older_than_the_process_needs_no_refresh_and_a_newer_one_is_delivered() {
+  local rec root home fakebin older_out newer_out baseline pid
+  rec=$(new_world agents-refresh-age)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_harness "$fakebin" pi
+  printf '%s\n' 'AGE_TEST_INSTRUCTION=original' > "$root/AGENTS.md"
+  FM_FAKE_HARNESS=pi run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --source startup >/dev/null
+
+  # A different pid owns the recorded baseline (a restart, or --continue), but the
+  # file is older than this process: it read the current file when it started.
+  printf 'AGE_TEST_INSTRUCTION=updated\n' > "$root/AGENTS.md"
+  touch -d '2000-01-01 00:00:00' "$root/AGENTS.md"
+  printf 'some-other-pid\n%s\n' "$(hash_file_for_test "$root/AGENTS.md")" > "$home/state/.session-start-agents-baseline"
+  older_out=$(FM_FAKE_HARNESS=pi run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --reemit --source compact)
+  assert_contains "$older_out" "SESSION START (CONTEXT RE-EMIT)" "the age-proved compact lost the re-emit"
+  assert_not_contains "$older_out" "CURRENT AGENTS.md - INSTRUCTION REFRESH" \
+    "an AGENTS.md older than the process was repeated to it"
+  assert_not_contains "$older_out" "AGE_TEST_INSTRUCTION=updated" "the age-proved compact printed the AGENTS.md text"
+  pid=$(sed -n '1p' "$home/state/.session-start-agents-baseline")
+  [ "$pid" != some-other-pid ] || fail "the age proof did not record this process's baseline"
+
+  # Now a mid-process change: the file is newer than the process, so the next
+  # compact delivers it once, and a baseline of this pid with another hash does too.
+  printf 'AGE_TEST_INSTRUCTION=landed-later\n' > "$root/AGENTS.md"
+  newer_out=$(FM_FAKE_HARNESS=pi run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --reemit --source compact)
+  assert_contains "$newer_out" "AGE_TEST_INSTRUCTION=landed-later" \
+    "an AGENTS.md changed after the process started was not delivered"
+
+  # A baseline for another pid with a file newer than the process is also refreshed.
+  printf 'some-other-pid\n%s\n' "$(hash_file_for_test "$root/AGENTS.md")" > "$home/state/.session-start-agents-baseline"
+  baseline=$(cat "$home/state/.session-start-agents-baseline")
+  newer_out=$(FM_FAKE_HARNESS=pi run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --reemit --source compact)
+  assert_contains "$newer_out" "AGE_TEST_INSTRUCTION=landed-later" \
+    "a newer-than-process file with another pid's baseline was not delivered"
+  [ "$(cat "$home/state/.session-start-agents-baseline")" = "$baseline" ] \
+    || fail "a refresh rewrote the baseline"
+
+  pass "an AGENTS.md older than the process needs no refresh and becomes its baseline, a newer one is still delivered"
+}
+
+test_age_proof_never_writes_a_baseline_from_a_read_only_session() {
+  local rec root home fakebin holder_pid out before
+  rec=$(new_world agents-refresh-age-ro)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_harness "$fakebin" pi
+  printf '%s\n' 'AGE_RO=current' > "$root/AGENTS.md"
+  touch -d '2000-01-01 00:00:00' "$root/AGENTS.md"
+  FM_FAKE_HARNESS=pi run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --source startup >/dev/null
+  sleep 300 &
+  holder_pid=$!
+  printf '%s\n%s\n' "$holder_pid" "$(hash_file_for_test "$root/AGENTS.md")" > "$home/state/.session-start-agents-baseline"
+  printf '%s\n' "$holder_pid" > "$home/state/.lock"
+  before=$(cat "$home/state/.session-start-agents-baseline")
+  out=$(FM_FAKE_HARNESS=pi FM_FAKE_LIVE_HOLDER_PID="$holder_pid" \
+    run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --reemit --source compact)
+  kill "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+  assert_contains "$out" "READ-ONLY SESSION" "competing live lock owner did not force read-only mode"
+  [ "$(cat "$home/state/.session-start-agents-baseline")" = "$before" ] \
+    || fail "a read-only session wrote a baseline from the age proof"
+
+  pass "a read-only session never writes a baseline from the age proof"
+}
+
 test_read_only_pi_compact_refreshes_against_its_own_session_identity() {
   local rec root home fakebin holder_pid out baseline_before completion_before
   rec=$(new_world agents-refresh-read-only)
@@ -3187,6 +3294,7 @@ test_session_start_relaunches_herdr_husk_secondmate
 test_status_tail_bounding
 test_status_tail_line_cap
 test_orphan_status_logs_are_printed
+test_old_orphan_status_logs_collapse_to_a_count_unless_decision_open
 test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
 test_endpoint_read_death_is_isolated_and_reported
@@ -3195,6 +3303,8 @@ test_endpoint_bound_rejects_padded_zero
 test_perl_timeout_fallback_reports_signal_death_nonzero
 test_abnormal_digest_death_banners_and_exits_zero
 test_composition_invokes_real_scripts
+test_agents_older_than_the_process_needs_no_refresh_and_a_newer_one_is_delivered
+test_age_proof_never_writes_a_baseline_from_a_read_only_session
 test_branch_outcome_replay_respects_captain_barrier_and_lease_sweep
 test_non_pi_session_start_leaves_branch_state_untouched
 test_session_start_seeds_the_outcome_display_tail_while_away

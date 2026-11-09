@@ -18,6 +18,23 @@
 # FM_STATUS_PRESENTATION_LOCK_TIMEOUT sets the positive whole-second wait for
 # presentation-path locks (default 10); queue mutation locks remain blocking.
 #
+# Two presentations repeat less so a long session does not re-read the same
+# bytes on every wake; neither changes what is acknowledged or consumed.
+#   - Wake rows print grouped: the reason once as a `reason:` line, then one
+#     `seq<TAB>kind<TAB>file` line per row under it. The signal rows of one
+#     watcher batch all carry the whole batch's reason, so the full rows grew
+#     quadratically. FM_WAKE_DRAIN_ROWS=full restores the five-field rows for a
+#     machine reader (the supervise daemon sets it).
+#   - OPEN DECISIONS lists in full only a decision that is new or changed since
+#     main's last committed presentation, plus one count line for the rest.
+#     FM_OPEN_DECISIONS_VIEW selects: `changed` (default), `all` (list every
+#     open decision, still recorded - a session start or return, where the
+#     reader has lost its context), or `peek` (list every open decision and
+#     record nothing - the quiet probe, a machine reader). The record is
+#     state/.open-decisions-presented and is committed only after the section's
+#     bytes reach stdout, like the status presentation receipt. The branch actor
+#     always lists everything.
+#
 # --probe --reason <wake reason line> [--settle] answers one question without
 # presenting or consuming anything: is this wake provably empty? It prints one
 # line, QUIET or "NEWS: <why>", and exits 0 either way (nonzero is an error).
@@ -70,6 +87,7 @@ ACK_FINGERPRINTS=
 ACK_NOTICE_FINGERPRINTS=
 PRESENTATION_LOCK_TIMEOUT=${FM_STATUS_PRESENTATION_LOCK_TIMEOUT:-10}
 BRANCH_OUTCOMES_RC=0
+OPEN_DECISIONS_NEXT=
 case "$PRESENTATION_LOCK_TIMEOUT" in ''|*[!0-9]*|0) PRESENTATION_LOCK_TIMEOUT=10 ;; esac
 
 # --- per-actor consume (docs/watcher-continuity.md "Per-actor acknowledgement") --
@@ -601,43 +619,79 @@ EOF
 # common case.
 print_open_decisions_section() {
   local snapshot=${1:-} open task key verb note line item_bytes=220 global_bytes=4000
-  local output='' used=0 shown=0 omitted=0 bytes
+  local output='' used=0 shown=0 omitted=0 bytes view fp presented next='' unchanged=0
+  local record="$STATE/.open-decisions-presented" entry
 
   if [ -n "$snapshot" ]; then
     open=$(scan_open_decisions_snapshot "$STATE" "$snapshot") || return 1
   else
     open=$(scan_open_decisions_incremental "$STATE") || return 1
   fi
-  [ -n "$open" ] || return 0
 
-  while IFS=$(printf '\t') read -r task key verb note; do
-    [ -n "$task" ] || continue
-    line="$task"
-    [ "$key" = default ] || line="$line [key=$key]"
-    line="$line $verb: $note"
-    # The shared cut counts the item's own characters; the trailing newline this
-    # section's global budget also pays for is this caller's, so the per-item
-    # allowance passed down is one short of the cap.
-    fm_cap_line_var "$line" $((item_bytes - 1))
-    line=$FM_LINE_CAP_LINE
-    bytes=$(( ${#line} + 1 ))
-    if [ $((used + bytes)) -gt "$global_bytes" ]; then
-      omitted=$((omitted + 1))
-      continue
-    fi
-    output="$output$line
+  view=${FM_OPEN_DECISIONS_VIEW:-changed}
+  [ "$PROBE" != true ] || view=peek
+  [ "$ACTOR" = main ] || view=peek
+  case "$view" in changed|all|peek) ;; *) view=changed ;; esac
+  presented=
+  if [ "$view" = changed ] && [ -f "$record" ] && [ ! -L "$record" ]; then
+    presented=$(command cat "$record" 2>/dev/null || true)
+  fi
+
+  if [ -n "$open" ]; then
+    while IFS=$(printf '\t') read -r task key verb note; do
+      [ -n "$task" ] || continue
+      fp=$(printf '%s\t%s\t%s\t%s' "$task" "$key" "$verb" "$note" | cksum | tr -d ' \t')
+      entry="$task $key $fp"
+      if [ -n "$presented" ] && printf '%s\n' "$presented" | grep -Fxq -- "$entry"; then
+        unchanged=$((unchanged + 1))
+        next="$next$entry
 "
-    used=$((used + bytes))
-    shown=$((shown + 1))
-  done <<EOF
+        continue
+      fi
+      line="$task"
+      [ "$key" = default ] || line="$line [key=$key]"
+      line="$line $verb: $note"
+      # The shared cut counts the item's own characters; the trailing newline this
+      # section's global budget also pays for is this caller's, so the per-item
+      # allowance passed down is one short of the cap.
+      fm_cap_line_var "$line" $((item_bytes - 1))
+      line=$FM_LINE_CAP_LINE
+      bytes=$(( ${#line} + 1 ))
+      if [ $((used + bytes)) -gt "$global_bytes" ]; then
+        # Cut by the byte cap, so not shown and not recorded: it comes back on
+        # the next drain.
+        omitted=$((omitted + 1))
+        continue
+      fi
+      output="$output$line
+"
+      used=$((used + bytes))
+      shown=$((shown + 1))
+      next="$next$entry
+"
+    done <<EOF
 $open
 EOF
+  fi
 
-  [ "$shown" -gt 0 ] || [ "$omitted" -gt 0 ] || return 0
+  # Record what this presentation lists; the commit happens only after it is
+  # printed (print_status_sections). An empty set also clears the record, so a
+  # decision that closes and later reopens is listed again.
+  if [ "$view" != peek ]; then
+    OPEN_DECISIONS_NEXT=$(mktemp "$STATE/.open-decisions-presented.XXXXXX" 2>/dev/null) || OPEN_DECISIONS_NEXT=
+    if [ -n "$OPEN_DECISIONS_NEXT" ]; then
+      printf '%s' "$next" > "$OPEN_DECISIONS_NEXT" || { rm -f -- "$OPEN_DECISIONS_NEXT"; OPEN_DECISIONS_NEXT=; }
+    fi
+  fi
+
+  [ "$shown" -gt 0 ] || [ "$omitted" -gt 0 ] || [ "$unchanged" -gt 0 ] || return 0
   printf 'OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):\n' || return 1
   printf '%s' "$output" || return 1
   if [ "$omitted" -gt 0 ]; then
     printf 'OPEN DECISIONS: %d more omitted (byte cap)\n' "$omitted" || return 1
+  fi
+  if [ "$unchanged" -gt 0 ]; then
+    printf 'OPEN DECISIONS: %d more unchanged since they were last shown, not repeated (bin/fm-crew-state.sh <task> reads one; a session start lists them all)\n' "$unchanged" || return 1
   fi
   # Answerer-closes hint, printed at exactly the moment an answer gets written:
   # the send that answers a listed decision also closes it, so closure never
@@ -711,20 +765,28 @@ EOF
 # annotation shows only the newest event of a task and a later routine line
 # buries the ask (fm-classify-lib.sh's scan_merge_ready_waiting owns what counts
 # and its heuristic). A reminder rather than news: it prints on every
-# presentation while a PR waits, so the quiet-wake probe deliberately does not
 # count it. Bounded and silent when nothing waits. A scan failure never changes
-# the drain's exit status.
+# the drain's exit status. A PR the local records already prove merged
+# (merged_pr_urls_local, no network; by URL, or for a row that names only
+# "PR <n>" by number inside the sending task's own repositories) is left out of
+# the list and counted on one line instead, because a status log that never says "merged" would otherwise
+# keep it coming back on every wake.
 print_merge_ready_waiting_section() {
   local snapshot=${1:-} rows task first label note line age now shown=0 omitted=0 bytes
-  local output='' used=0 item_bytes=260 global_bytes=2600
+  local output='' used=0 item_bytes=260 global_bytes=2600 merged_urls known=0
 
   [ -n "$snapshot" ] || return 0
   now=$(date +%s)
   rows=$(scan_merge_ready_waiting "$STATE" "$snapshot" "$now" 2>/dev/null) || return 0
   [ -n "$rows" ] || return 0
+  merged_urls=$(merged_pr_urls_local "$STATE" "${FM_DATA_OVERRIDE:-${FM_HOME:-}/data}" 2>/dev/null || true)
 
   while IFS=$(printf '\t') read -r task first label note; do
     [ -n "$task" ] || continue
+    if merge_ready_row_merged_locally "$STATE" "$task" "$label" "$note" "$merged_urls"; then
+      known=$((known + 1))
+      continue
+    fi
     if [ "${first:-0}" -gt 0 ] 2>/dev/null; then
       age="waiting $(( (now - first) / 3600 ))h"
     else
@@ -746,11 +808,18 @@ print_merge_ready_waiting_section() {
 $rows
 EOF
 
+  [ "$shown" -gt 0 ] || [ "$omitted" -gt 0 ] || [ "$known" -eq 0 ] || {
+    printf 'MERGE-READY WAITING: %d reported-ready PR(s) not listed - local records already show them merged.\n' "$known" || return 1
+    return 0
+  }
   [ "$shown" -gt 0 ] || [ "$omitted" -gt 0 ] || return 0
   printf 'MERGE-READY WAITING (reported ready, no later status says it was merged - confirm each PR'"'"'s live state before asking the captain):\n' || return 1
   printf '%s' "$output" || return 1
   if [ "$omitted" -gt 0 ]; then
     printf 'MERGE-READY WAITING: %d more omitted (byte cap)\n' "$omitted" || return 1
+  fi
+  if [ "$known" -gt 0 ]; then
+    printf 'MERGE-READY WAITING: %d more not listed - local records already show them merged.\n' "$known" || return 1
   fi
 }
 
@@ -930,6 +999,25 @@ cap_outcome_line() {  # <line> <max-bytes>
   OUTCOME_LINE_BYTES=${#OUTCOME_LINE}
 }
 
+# Print the presented wake rows (epoch, seq, kind, key, reason; tab separated).
+# See the header: by default each run of rows sharing one reason prints that
+# reason once, then only seq, kind and key per row.
+print_wake_rows() {  # <rows>
+  if [ "${FM_WAKE_DRAIN_ROWS:-}" = full ]; then
+    printf '%s\n' "$1"
+    return
+  fi
+  printf '%s\n' "$1" | awk -F '\t' '
+    NF >= 5 {
+      if (!started) { print "WAKE ROWS (reason once per group; each row is seq, kind, file):"; started = 1 }
+      if (!grouped || $5 != last) { print "reason: " $5; last = $5; grouped = 1 }
+      print $2 "\t" $3 "\t" $4
+      next
+    }
+    { print }
+  '
+}
+
 print_status_sections() {
   local snapshot=${1:-} fully_presented=${2:-} acknowledged prepared
   if [ -z "$snapshot" ]; then snapshot=$(status_presentation_snapshot "$STATE") || return 1; fi
@@ -950,14 +1038,21 @@ print_status_sections() {
   # until the prepared bytes reach stdout. If the consumer closes or fails,
   # leave the receipt behind so the next drain can recover the presentation.
   if ! command cat "$prepared"; then
-    rm -f -- "$prepared"
+    rm -f -- "$prepared" "$OPEN_DECISIONS_NEXT"
     return 1
   fi
   if ! status_commit_presentation_snapshot "$STATE" "$acknowledged"; then
-    rm -f -- "$prepared"
+    rm -f -- "$prepared" "$OPEN_DECISIONS_NEXT"
     return 1
   fi
   rm -f -- "$prepared"
+  # The decisions record advances only now that the section reached stdout; a
+  # failed write leaves the old record, so the next drain lists them again.
+  if [ -n "$OPEN_DECISIONS_NEXT" ] && [ -f "$OPEN_DECISIONS_NEXT" ]; then
+    mv -f -- "$OPEN_DECISIONS_NEXT" "$STATE/.open-decisions-presented" 2>/dev/null \
+      || rm -f -- "$OPEN_DECISIONS_NEXT"
+  fi
+  OPEN_DECISIONS_NEXT=
 }
 
 print_status_presentation() {  # [<deduped-raw-rows>]
@@ -1250,7 +1345,7 @@ case "${FM_WAKE_DRAIN_TEST_DELAY_BEFORE_COMMIT:-0}" in
   *) sleep "$FM_WAKE_DRAIN_TEST_DELAY_BEFORE_COMMIT" ;;
 esac
 if [ -n "$RAW_ROWS" ]; then
-  printf '%s\n' "$RAW_ROWS" || exit "$?"
+  print_wake_rows "$RAW_ROWS" || exit "$?"
 fi
 fm_recovery_marker_snapshot "$RECOVERY_MARKER" || exit 1
 RECOVERY_MARKER_TOKEN=$FM_RECOVERY_MARKER_TOKEN
