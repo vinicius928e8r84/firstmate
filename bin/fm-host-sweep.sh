@@ -2,11 +2,13 @@
 # fm-host-sweep.sh - constant cleanup of idle agents and leftovers on every machine. Deterministic: no model, no sudo.
 #
 # Usage: fm-host-sweep.sh [--dry-run|--apply] [--host NAME]... [--idle-hours N] [--tmp-days N] [--clone-days N]
-#          [--max-lanes N] [--pool-keep N] [--proc-min-age SECS] [--remote-branches] [--no-clones] [--verbose] [--removed-log FILE]
+#          [--max-lanes N] [--budget SECS] [--pool-keep N] [--proc-min-age SECS] [--remote-branches] [--no-clones] [--verbose] [--removed-log FILE]
 #   default --dry-run (lists what would go and the bytes); --apply removes. One report screen at the end, one block per machine.
 #   --idle-hours N      a finished agent still holding its pane/slot for more than N hours is closed (default 3)
 #   --tmp-days N        ended-task /tmp dirs, dead pod logs and CI caches older than N days go (default 3)
 #   --clone-days N      a clean fully pushed clone outside projects/ untouched for N days goes (default 30)
+#   --budget SECS       wall-clock cap per machine (default 1200): sweeps that cannot start inside it are reported `kept: time budget`;
+#                       machines run in parallel, each worker stops at its own budget
 #   --pool-keep N       keep at least N free treehouse worktrees per pool (default 3)
 #   --remote-branches   also delete remote branches already contained in the remote default branch (outward-facing; off by default)
 #   --verbose           also list every `kept` item with the reason it was left alone
@@ -48,7 +50,7 @@ SELF="${BASH_SOURCE[0]}"
 case "$SELF" in /*) ;; *) SELF="$PWD/$SELF" ;; esac
 
 MODE=orchestrate
-apply=0 kind=vps root='' idle_hours=2 tmp_days=3 clone_days=30 max_lanes=20 pool_keep=3 proc_min_age=1800
+apply=0 kind=vps root='' idle_hours=2 tmp_days=3 clone_days=30 max_lanes=20 budget=1200 pool_keep=3 proc_min_age=1800
 remote_branches=0 clones=1 verbose=0 removed_log='' only_hosts=() homes=() testdirs=() dead_globs=()
 usage() { sed -n '2,/^set -uo/p' "$SELF" | sed '$d; s/^# \{0,1\}//' >&2; exit 64; }
 num() { case "${2-}" in ''|*[!0-9]*) echo "fm-host-sweep: $1 needs a number" >&2; exit 64 ;; esac; }
@@ -66,6 +68,7 @@ while [ $# -gt 0 ]; do
     --idle-hours) shift; num "$1" "${1-}"; idle_hours=$1 ;;
     --tmp-days) shift; num "$1" "${1-}"; tmp_days=$1 ;;
     --clone-days) shift; num "$1" "${1-}"; clone_days=$1 ;;
+    --budget) shift; num "$1" "${1-}"; budget=$1 ;;
     --max-lanes) shift; num "$1" "${1-}"; max_lanes=$1 ;;
     --pool-keep) shift; num "$1" "${1-}"; pool_keep=$1 ;;
     --proc-min-age) shift; num "$1" "${1-}"; proc_min_age=$1 ;;
@@ -85,15 +88,18 @@ tick() {  # FM_SWEEP_DEBUG=1 prints the seconds each sweep took, on stderr
   [ -z "${FM_SWEEP_DEBUG:-}" ] || echo "phase $1: $((SECONDS - TICK0))s" >&2
   TICK0=$SECONDS
 }
+left() { [ $((DEADLINE - SECONDS)) -ge "$1" ]; }   # at least N seconds of the machine's budget remain
 worker_main() {
-  TICK0=$SECONDS
+  TICK0=$SECONDS; DEADLINE=$((SECONDS + budget))
   [ "$kind" != mac ] || { sweep_tmp; return 0; }
-  sweep_lanes; tick lanes
-  sweep_procs; tick procs
-  sweep_branches; tick branches
-  sweep_pool; tick pool
-  sweep_tmp; tick tmp
-  if [ "$clones" = 1 ]; then sweep_clones; tick clones; fi
+  if left 120; then sweep_lanes; else emit lanes kept "-" 0 "time budget of ${budget}s reached before the lane sweep"; fi; tick lanes
+  if left 30; then sweep_procs; fi; tick procs
+  if left 60; then sweep_branches; else emit branches kept "-" 0 "time budget reached"; fi; tick branches
+  if left 60; then sweep_pool; else emit pool kept "-" 0 "time budget reached"; fi; tick pool
+  if left 60; then sweep_tmp; else emit tmp kept "-" 0 "time budget reached"; fi; tick tmp
+  if [ "$clones" = 1 ]; then
+    if left 60; then sweep_clones; else emit clones kept "-" 0 "time budget reached"; fi; tick clones
+  fi
   return 0
 }
 
@@ -178,8 +184,9 @@ sweep_lanes() {
   for h in "${homes[@]}"; do
     closer="$root/bin/fm-close-finished-lanes.sh"; ctl="$root/bin/fm-control.sh"; crew="$root/bin/fm-crew-state.sh"
     [ -x "$closer" ] || { emit lanes kept "$h" 0 "no fm-close-finished-lanes.sh under $root"; continue; }
+    left 120 || { emit lanes kept "$h" 0 "time budget reached before this home"; continue; }
     : > "$SCRATCH/lanes_closed"
-    out=$(FM_HOME="$h" to 1800 "$closer" "$([ "$apply" = 1 ] && echo --apply || echo --dry-run)" --max "$max_lanes" --budget 1500 2>&1)
+    out=$(FM_HOME="$h" to "$(( DEADLINE - SECONDS > 120 ? DEADLINE - SECONDS : 120 ))" "$closer" "$([ "$apply" = 1 ] && echo --apply || echo --dry-run)" --max "$max_lanes" --budget "$(( DEADLINE - SECONDS - 60 > 60 ? DEADLINE - SECONDS - 60 : 60 ))" 2>&1)
     while IFS= read -r line; do
       case "$line" in
         "closed: "*|"would close: "*)
@@ -444,17 +451,24 @@ mac mac ${FM_SWEEP_MAC_SSH:-none} - - ${FM_SWEEP_MAC_TESTDIRS:--}"
   fi
   printf '== fm-host-sweep %s %s\n' "$([ $apply = 1 ] && echo apply || echo dry-run)" "$(date -u +%FT%TZ)"
   printf '%-10s %-9s %6s %6s %6s %6s %10s  %s\n' machine status lanes procs branch tmp+ MB "other (pool/clones)"
+  # machines run in parallel; each writes its block and its removal rows to files that are joined in order
+  local outdir names='' mname
+  outdir=$(mktemp -d "${TMPDIR:-/tmp}/fm-host-sweep-out.XXXXXX") || exit 1
   while read -r name k target hroot hhomes htest; do
     [ -n "$name" ] || continue
     if [ "${#only_hosts[@]}" -gt 0 ]; then case " ${only_hosts[*]} " in *" $name "*) ;; *) continue ;; esac; fi
-    sweep_host "$name" "$k" "$target" "$hroot" "$hhomes" "${htest:-}" "${globs[@]}"
+    names="$names $name"
+    sweep_host "$name" "$k" "$target" "$hroot" "$hhomes" "${htest:-}" "${globs[@]}" > "$outdir/$name.out" 2> /dev/null < /dev/null &
   done <<< "$specs"
+  wait
+  for mname in $names; do cat "$outdir/$mname.out"; [ ! -f "$outdir/$mname.removed" ] || cat "$outdir/$mname.removed" >> "$removed_log"; done
+  rm -rf "$outdir"
   printf 'audit log: %s (removals are appended on --apply)\n' "$removed_log"
 }
 
 sweep_host() {  # name kind target root homes testdirs globs...
   local name=$1 k=$2 target=$3 hroot=$4 hhomes=$5 htest=$6; shift 6
-  local -a wargs=(--worker --kind "$k" --idle-hours "$idle_hours" --tmp-days "$tmp_days" --clone-days "$clone_days"
+  local -a wargs=(--worker --kind "$k" --budget "$budget" --idle-hours "$idle_hours" --tmp-days "$tmp_days" --clone-days "$clone_days"
     --max-lanes "$max_lanes" --pool-keep "$pool_keep" --proc-min-age "$proc_min_age")
   local out rc=0 h t g status=ok line
   [ "$apply" = 1 ] && wargs+=(--apply)
@@ -466,11 +480,11 @@ sweep_host() {  # name kind target root homes testdirs globs...
   for g in "$@"; do wargs+=(--dead-glob "$g"); done
   case "$target" in
     none|'') printf '%-10s %-9s no ssh target configured (set FM_SWEEP_MAC_SSH or config/host-sweep.hosts)\n' "$name" unknown; return 0 ;;
-    local) out=$(bash "$SELF" "${wargs[@]}" 2>/dev/null </dev/null) || rc=$? ;;
+    local) out=$(timeout "$((budget + 180))" bash "$SELF" "${wargs[@]}" 2>/dev/null </dev/null) || rc=$? ;;
     *)
       local q; q=$(printf '%q ' "${wargs[@]}")
       # shellcheck disable=SC2086
-      out=$(${FM_SWEEP_SSH_CMD:-ssh} -o BatchMode=yes -o ConnectTimeout="${FM_SWEEP_SSH_TIMEOUT:-10}" -o ServerAliveInterval=15 "$target" "bash -s -- $q" < "$SELF" 2>/dev/null) || rc=$? ;;
+      out=$(timeout "$((budget + 180))" ${FM_SWEEP_SSH_CMD:-ssh} -o BatchMode=yes -o ConnectTimeout="${FM_SWEEP_SSH_TIMEOUT:-10}" -o ServerAliveInterval=15 "$target" "bash -s -- $q" < "$SELF" 2>/dev/null) || rc=$? ;;
   esac
   if [ "$rc" != 0 ] && ! printf '%s\n' "$out" | grep -q '^ITEM'; then
     printf '%-10s %-9s did not answer (exit %s)\n' "$name" unreachable "$rc"; return 0
@@ -490,7 +504,7 @@ sweep_host() {  # name kind target root homes testdirs globs...
   printf '           kept %s, refused %s%s\n' "$kept" "$failed" "$([ $apply = 1 ] && echo '' || echo ' (columns count what WOULD go)')"
   printf '%s\n' "$out" | awk -F'\t' -v v="$verbose" '$1=="ITEM"&&($3=="would"||$3=="failed"||(v&&$3=="kept")){printf "           %s %s %s (%d MB): %s\n", $3, $2, $4, $5/1048576, $6}' | head -40
   if [ "$apply" = 1 ]; then
-    printf '%s\n' "$out" | awk -F'\t' -v t="$(date -u +%FT%TZ)" -v h="$name" '$1=="ITEM"&&$3=="removed"{printf "%s\t%s\t%s\t%s\t%s\t%s\n", t, h, $2, $4, $5, $6}' >> "$removed_log"
+    printf '%s\n' "$out" | awk -F'\t' -v t="$(date -u +%FT%TZ)" -v h="$name" '$1=="ITEM"&&$3=="removed"{printf "%s\t%s\t%s\t%s\t%s\t%s\n", t, h, $2, $4, $5, $6}' > "$outdir/$name.removed"
   fi
 }
 
