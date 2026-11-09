@@ -26,7 +26,10 @@ test_add_set_list() {
   assert_contains "$out" "20261029-2"$'\t'"proposed"$'\t'"unassigned" "an unowned proposal is explicit"
   assert_equals 2 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" "one line per id"
   assert_equals 4 "$("$QUEUE" list --all-history | wc -l | tr -d ' ')" "history keeps every row"
-  "$QUEUE" set "$id1" proved "real path checked"
+  "$QUEUE" set "$id1" proved "real path checked" >/dev/null 2>&1; rc=$?
+  expect_code 5 "$rc" "proved without a passing proof is refused"
+  "$QUEUE" set "$id1" landed "on main" --proof 'true' >/dev/null
+  "$QUEUE" prove "$id1" >/dev/null
   out=$("$QUEUE" list --open)
   assert_not_contains "$out" "20261029-1" "a proved improvement is not open"
   assert_contains "$out" "20261029-2" "a proposed one stays open"
@@ -57,7 +60,7 @@ test_fields_cannot_break_the_ledger() {
   local id
   id=$("$QUEUE" add $'tab\there' --audit 20261030)
   "$QUEUE" set "$id" building $'two\nlines'
-  assert_equals 0 "$(awk -F'\t' 'NF != 7 { bad++ } END { print bad + 0 }' "$FM_AUDIT_QUEUE")" "every ledger row keeps seven fields"
+  assert_equals 0 "$(awk -F'\t' 'NF != 8 { bad++ } END { print bad + 0 }' "$FM_AUDIT_QUEUE")" "every ledger row keeps eight fields"
   pass "tabs and newlines in a field cannot add fields or rows"
 }
 
@@ -85,16 +88,65 @@ test_wip_cap_and_the_24h_worker_deadline() {
   assert_not_contains "$out" "20261101-1" "a building id is not stale"
   assert_not_contains "$out" "20261101-2" "a dropped id is not stale"
   id=$("$QUEUE" add "with a due time" --audit 20261102 --due +48h)
-  assert_equals 7 "$(awk -F'\t' -v id="$id" '$2 == id { print NF }' "$FM_AUDIT_QUEUE")" "a row keeps seven fields with a due time"
+  assert_equals 8 "$(awk -F'\t' -v id="$id" '$2 == id { print NF }' "$FM_AUDIT_QUEUE")" "a row keeps eight fields with a due time"
   "$QUEUE" add "bad" --audit 20261102 --due soon >/dev/null 2>&1; rc=$?
   expect_code 2 "$rc" "a due time that is not an epoch or +Nh"
   export FM_AUDIT_QUEUE="$FM_HOME/data/audit-queue.tsv"
   pass "the work-in-flight cap, the freed slot and the 24 h worker deadline"
 }
 
+test_prove_records_the_result_and_only_a_pass_proves() {
+  local home out id rc
+  home="$TMP_ROOT/prove"; mkdir -p "$home"; : > "$home/present"
+  export FM_AUDIT_QUEUE="$home/q.tsv"
+  export FM_HOME="$home"
+  rm -f "$FM_AUDIT_QUEUE"
+  id=$("$QUEUE" add "thing one" --audit 20261105 --proof 'test -e present')
+  local id2 id3 id4
+  id2=$("$QUEUE" add "thing two" --audit 20261105 --proof 'test -e missing')
+  id3=$("$QUEUE" add "thing three" --audit 20261105)
+  "$QUEUE" set "$id" landed "on main" >/dev/null
+  assert_contains "$("$QUEUE" list | grep thing)" "test -e present" "the proof is carried forward on a later row"
+  out=$("$QUEUE" prove --all)
+  assert_contains "$out" "$id: PASS" "a present file proves"
+  assert_contains "$out" "$id2: FAIL(exit 1)" "a missing file fails"
+  assert_not_contains "$out" "$id3" "an item with no proof is not run by --all"
+  assert_contains "$("$QUEUE" list | grep "^$id")" "proved" "a passing proof makes the id proved"
+  assert_contains "$("$QUEUE" list | grep "^$id2")" "proposed" "a failing proof leaves the state"
+  assert_contains "$("$QUEUE" list | grep "^$id2")" "proof FAIL(exit 1)" "and records why"
+  assert_not_contains "$("$QUEUE" list --open)" "$id	" "a proved id is no longer open"
+  assert_contains "$("$QUEUE" prove "$id3")" "$id3: no-proof" "a single id without a proof says so"
+  : > "$home/missing"
+  assert_contains "$("$QUEUE" prove "$id2")" "$id2: PASS" "re-proving after the fix flips it"
+  rc=0; "$QUEUE" prove nope >/dev/null 2>&1 || rc=$?
+  expect_code 3 "$rc" "an unknown id"
+  # the guard: writing proofs and protected surfaces are refused at add time and at prove time
+  for p in 'rm -rf data' 'echo x > file' 'git push origin main' 'git -C x commit -m y' 'ssh pc true' 'curl -d a http://x' \
+    'runpod pods' 'cat anki.txt' 'gh api -X POST repos/a/b/issues' 'crontab -r' 'sed -i s/a/b/ f'; do
+    rc=0; "$QUEUE" add "bad $p" --audit 20261106 --proof "$p" >/dev/null 2>&1 || rc=$?
+    expect_code 5 "$rc" "proof was accepted but must be refused: $p"
+  done
+  for p in 'test -x bin/x 2>/dev/null' 'git merge-base --is-ancestor a b >/dev/null' 'crontab -l | grep -q x' 'gh api repos/a/b --jq .state | grep -qx closed'; do
+    rc=0; "$QUEUE" add "ok $p" --audit 20261106 --proof "$p" >/dev/null 2>&1 || rc=$?
+    expect_code 0 "$rc" "read-only proof was refused: $p"
+  done
+  id4=$("$QUEUE" add "tampered" --audit 20261107 --proof 'true')
+  sed -i 's/\ttrue$/\ttouch pwned/' "$FM_AUDIT_QUEUE"
+  out=$("$QUEUE" prove "$id4")
+  assert_contains "$out" "REFUSED" "a hand-edited writing proof is refused at prove time"
+  assert_absent "$home/pwned" "the unsafe proof did not run"
+  id4=$("$QUEUE" add "slow" --audit 20261108 --proof 'sleep 20')
+  out=$(FM_ACTIONS_PROOF_TIMEOUT=1 "$QUEUE" prove "$id4")
+  assert_contains "$out" "$id4: TIMEOUT(1s)" "a proof over the bound is stopped"
+  assert_contains "$("$QUEUE" list | grep "^$id4")" "proposed" "a timed-out proof does not prove"
+  export FM_HOME="$TMP_ROOT/home" FM_AUDIT_QUEUE="$TMP_ROOT/home/data/audit-queue.tsv"
+  pass "prove runs the stored read-only proof, only a pass makes an id proved, unsafe and slow proofs are stopped"
+}
+
 test_add_set_list
 test_existing_thing_is_not_proposed_again
 test_fields_cannot_break_the_ledger
 test_wip_cap_and_the_24h_worker_deadline
+test_prove_records_the_result_and_only_a_pass_proves
 
 echo '# all fm-improvement-queue tests passed'

@@ -259,7 +259,7 @@ test_wrapper_deferral_exit_is_queued_without_using_tries() {
   cat > "$home/bin/hold-wrapper" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$FM_HOME/wrap.calls"
-echo "wrapflag=${FM_SCHEDULED_WRAP:-}" >> "$FM_HOME/wrap.env"
+echo "wrapflag=${FM_SCHEDULED_WRAP:-} loop=${FM_SCHEDULED_LOOP:-} helper=${FM_SCHEDULED_SPAWN_HELPER:-}" >> "$FM_HOME/wrap.env"
 rc=$(head -1 "$FM_HOME/wrap.script" 2>/dev/null); [ -n "$rc" ] || rc=0
 sed -i 1d "$FM_HOME/wrap.script" 2>/dev/null
 [ "$rc" != 78 ] || echo "scheduled-deferred reason=state/HOLD exists"
@@ -270,7 +270,7 @@ SH
   expect_code 78 "$rc" "a wrapper deferral was not passed through"
   assert_equals deferred "$(last "$home" weekly-retro result)" "the durable record did not show the deferral"
   assert_contains "$(sed -n 's/^detail=//p' "$home/state/scheduled-loops/weekly-retro.last")" "state/HOLD" "the deferral reason was lost"
-  assert_equals wrapflag=1 "$(head -1 "$home/wrap.env")" "the wrapper was not told it runs under the scheduler"
+  assert_equals "wrapflag=1 loop=weekly-retro helper=1" "$(head -1 "$home/wrap.env")" "the wrapper was not told its loop name and that it runs under the scheduler"
   printf '%s\n' 78 78 78 78 78 78 78 > "$home/wrap.script"
   for i in 1 2 3 4 5 6 7; do
     FM_SCHEDULED_NOW=$(date -u -d "2026-11-09 11:07:00 + $i hour" +%s) sched "$home" tick >/dev/null

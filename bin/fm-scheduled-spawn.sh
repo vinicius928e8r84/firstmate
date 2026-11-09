@@ -26,6 +26,9 @@
 # still fires. While a usage-limit hold stands (`until=` in state/.quota-silence, written by bin/fm-quota-silence-lib.sh
 # when config/quota-silence names the account) a run is queued instead of started and the tick waits for the hold to
 # end plus FM_SCHEDULED_QUOTA_GRACE_SEC (300).
+# A wrapper that spawns its own lane runs with FM_SCHEDULED_LOOP=<loop> and FM_SCHEDULED_SPAWN_HELPER=1: it passes
+# `--scheduled-loop "$FM_SCHEDULED_LOOP"` to bin/fm-spawn.sh so the lane is admitted from the scheduled reserve and not
+# from the ordinary cap, and bin/fm-spawn.sh leaves the failure alert to this helper.
 # Load contract for the private wrappers (the "refused by load" deferral). A wrapper that declines to run only
 # because the host load average is over its own gate exits 79 and prints, on stdout or stderr, one line:
 #   scheduled-load-refused load1=<X> max=<Y>
@@ -221,7 +224,7 @@ wrap_loop() { # <loop> <command...>
     return "$DEFER_EXIT"
   fi
   out=$(mktemp "${TMPDIR:-/tmp}/fm-scheduled.XXXXXX") || exit 1
-  FM_SCHEDULED_WRAP=1 "$@" 8>&- 2>&1 | tee "$out"   # a lane the wrapper starts must not inherit the loop lock
+  FM_SCHEDULED_WRAP=1 FM_SCHEDULED_LOOP=$loop FM_SCHEDULED_SPAWN_HELPER=1 "$@" 8>&- 2>&1 | tee "$out"   # a lane the wrapper starts must not inherit the loop lock
   rc=${PIPESTATUS[0]}
   if [ "$rc" -eq 0 ]; then
     resolve_run "$loop" 0 1
