@@ -48,8 +48,8 @@
 #                       detected primary harness.
 #   5. read-once contract - the do-not-re-read contract covering every source
 #                       represented by the two digests below.
-#   6. fleet digest   - a compact data/backlog.md identity/metadata listing,
-#                       every state/*.meta, a bounded state/*.status tail,
+#   6. fleet digest   - a compact data/backlog.md listing, one line per
+#                       state/*.meta task (see COMPACT VIEWS below),
 #                       the away posture (state/.afk-contract and the legacy
 #                       state/.afk daemon flag), and a cheap per-task
 #                       endpoint-liveness read, each bounded and crash-
@@ -143,10 +143,10 @@
 #   - `done` rows are never listed. Retained completion history belongs to the
 #     reporting surfaces (bin/fm-bearings-snapshot.sh, /ahoy), and at startup it
 #     is pure weight - 10 done rows cost 3.3KB in an observed main-home digest.
-#   - Every in-flight, held, and blocked row is listed IN FULL, with its
-#     hold_kind/hold_reason and blocked_by. Those are the rows AGENTS.md
-#     sections 7 and 10 make actionable at startup, so they are never bounded
-#     away.
+#   - Every in-flight, held, and blocked row is listed, with its hold_kind/
+#     hold_reason and blocked_by. Those are the rows AGENTS.md sections 7 and
+#     10 make actionable at startup, so they are never bounded away; the
+#     compact view (COMPACT VIEWS below) only shortens their text.
 #   - Only the plain queued (dispatchable-now) listing is bounded, by
 #     FM_SESSION_START_QUEUED_LIMIT, default 20. Anything it omits is disclosed
 #     with an exact remainder count and the command that shows the rest, so a
@@ -170,14 +170,43 @@
 # compatible tasks-axi is available, or `data/backlog.md` when the file body is
 # truly needed.
 #
-# STATUS TAILS: FM_SESSION_START_STATUS_TAIL bounds how many lines each task's
-# tail prints, and bin/fm-line-cap-lib.sh bounds how long each of those lines
-# may be. Both bounds are safe because the section prints every task's full
-# status log path, and AGENTS.md section 8 treats a status line as a wake EVENT
-# rather than current state - bin/fm-crew-state.sh owns current state.
-# ORPHAN STATUS LOGS (no matching .meta) print a tail only while they hold an
+# STATUS TAILS (full task view): FM_SESSION_START_STATUS_TAIL bounds how many
+# lines each task's tail prints, and bin/fm-line-cap-lib.sh bounds how long each
+# of those lines may be. Both bounds are safe because the section prints every
+# task's full status log path, and AGENTS.md section 8 treats a status line as a
+# wake EVENT rather than current state - bin/fm-crew-state.sh owns current state.
+# ORPHAN STATUS LOGS (no matching .meta) are listed only while they hold an
 # open decision or their newest event is inside FM_SESSION_START_ORPHAN_DAYS
 # (default 3); every older one is counted in a single line.
+#
+# COMPACT VIEWS: a context re-emit reprints this digest after every compaction,
+# so each bulky block prints what a turn acts on and leaves the rest one command
+# away. Each block has its own switch, each switch falls back to
+# FM_SESSION_START_VIEW, and only the exact word `full` restores that block's
+# previous long form; anything else keeps it compact.
+#   FM_SESSION_START_TASK_VIEW - Work under way and listed orphan logs print one
+#     line per task: id, kind, delivery mode, yolo, remote host, endpoint
+#     liveness (ep=), open=N when N decisions or blockers are still open, and the
+#     newest status line that is not pending-reply bookkeeping (capped), plus a
+#     pr= line. The full record stays in state/<id>.meta and state/<id>.status.
+#     A locked digest lists every open decision in the drain's OPEN DECISIONS
+#     section; a read-only one, which runs no drain, lists them under the task.
+#   FM_SESSION_START_BACKLOG_VIEW - the tasks-axi listing caps titles and hold
+#     reasons, carries an in-flight item's hold on its in-flight row instead of
+#     repeating the row under held, and counts the dispatchable rows in one line
+#     unless FM_SESSION_START_QUEUED_LIMIT asks for that many of them. Full rows:
+#     bin/fm-tasks-axi.sh show <id> --full and bin/fm-tasks-axi.sh ready.
+#   FM_SESSION_START_SECONDMATES_VIEW - data/secondmates.md prints one line per
+#     route (id, host, capped routing scope); the charters stay in the file.
+#   FM_SESSION_START_SUPERVISION_VIEW - a Pi-family context re-emit renders the
+#     compact supervision block (fm-supervision-instructions.sh --compact 1),
+#     which names the command that prints the full protocol.
+#   FM_SESSION_START_FRAME_VIEW - the RE-EMIT CUE is left out on a Pi-family
+#     harness, which delivers the digest as its own message and marks a cut;
+#     the re-emit header and the read-once contract are one paragraph each; and
+#     a Pi-family re-emit's NEXT STEP is one line.
+# A memory budget overrun (bin/fm-startup-memory-budget.sh report) adds one
+# STARTUP_MEMORY line to the bootstrap section while it lasts.
 #
 # RUNTIME BOUND: the digest is now executed through a native session-open
 # adapter (see bin/fm-sessionstart-run.sh), which blocks either hook-driven
@@ -226,7 +255,9 @@
 #             a lock another live session took meanwhile still produces the
 #             ordinary read-only path. A re-emit prints a short RE-EMIT CUE
 #             first, so a harness that spills a large output and shows only its
-#             head still tells the model to read the saved full output.
+#             head still tells the model to read the saved full output; a
+#             Pi-family harness never spills it, so the compact frame view
+#             leaves the cue out there.
 #
 #   --source  The native session-open source, supplied only by
 #             fm-sessionstart-run.sh. A genuine `startup` that owns the active
@@ -386,6 +417,8 @@ PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 . "$SCRIPT_DIR/fm-line-cap-lib.sh"
 # shellcheck source=bin/fm-hold-reason-lib.sh
 . "$SCRIPT_DIR/fm-hold-reason-lib.sh"
+# shellcheck source=bin/fm-secondmate-registry-lib.sh
+. "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
 
 # One tasks-axi compatibility verdict per session start. The probe costs three
 # tasks-axi subprocesses and this digest needs the same answer twice - here for
@@ -405,6 +438,25 @@ ORPHAN_DAYS=${FM_SESSION_START_ORPHAN_DAYS:-3}
 case "$ORPHAN_DAYS" in ''|*[!0-9]*) ORPHAN_DAYS=3 ;; esac
 QUEUED_LIMIT=${FM_SESSION_START_QUEUED_LIMIT:-20}
 case "$QUEUED_LIMIT" in ''|*[!0-9]*|0) QUEUED_LIMIT=20 ;; esac
+# The compact tasks-axi view lists dispatchable rows only when a count is asked for.
+QUEUED_LIMIT_ASKED=0
+case "${FM_SESSION_START_QUEUED_LIMIT:-}" in
+  ''|*[!0-9]*) ;;
+  *) [ "$FM_SESSION_START_QUEUED_LIMIT" -gt 0 ] && QUEUED_LIMIT_ASKED=1 ;;
+esac
+# COMPACT VIEWS (header): each block's switch falls back to FM_SESSION_START_VIEW,
+# and only the exact word `full` restores that block's long form.
+VIEW_DEFAULT=${FM_SESSION_START_VIEW:-compact}
+view_of() {  # <variable> <block-switch-value>
+  case "${2:-$VIEW_DEFAULT}" in full) printf -v "$1" full ;; *) printf -v "$1" compact ;; esac
+}
+view_of TASK_VIEW "${FM_SESSION_START_TASK_VIEW:-}"
+view_of BACKLOG_VIEW "${FM_SESSION_START_BACKLOG_VIEW:-}"
+view_of SECONDMATES_VIEW "${FM_SESSION_START_SECONDMATES_VIEW:-}"
+view_of SUPERVISION_VIEW "${FM_SESSION_START_SUPERVISION_VIEW:-}"
+view_of FRAME_VIEW "${FM_SESSION_START_FRAME_VIEW:-}"
+PI_FAMILY=0
+case "$PRIMARY_HARNESS" in pi|pi-signed) PI_FAMILY=1 ;; esac
 # One per-task endpoint read may never outlive this bound: a hung backend CLI
 # becomes that task's endpoint: error line instead of the digest's whole
 # runtime budget.
@@ -437,6 +489,26 @@ print_file_or_absent() {
   else
     printf 'ABSENT\n'
   fi
+}
+
+# print_secondmates_compact <path>: one line per route, from the shared registry
+# parser (bin/fm-secondmate-registry-lib.sh): id, SSH host or local, and the
+# routing scope capped by the shared line cap. A line that is not a route record
+# prints capped, so nothing in the file is silently dropped.
+print_secondmates_compact() {
+  local path=$1 line
+  subsection "data/secondmates.md - one line per second mate (full charters: data/secondmates.md - read before routing work to a second mate, relaunching, or retiring one)"
+  [ -f "$path" ] || { printf 'ABSENT\n'; return 0; }
+  [ -s "$path" ] || { printf '(present, empty)\n'; return 0; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *[![:space:]]*) ;; *) continue ;; esac
+    if secondmate_registry_parse_line "$line"; then
+      fm_cap_line_var "$SECONDMATE_REGISTRY_SCOPE" 140
+      printf -- '- %s (%s): %s\n' "$SECONDMATE_REGISTRY_ID" "${SECONDMATE_REGISTRY_HOST:-local}" "$FM_LINE_CAP_LINE"
+    else
+      fm_cap_line "$line" 140
+    fi
+  done < "$path"
 }
 
 print_backlog_pointer() {
@@ -528,6 +600,104 @@ print_ready_queued_bounded() {
   '
 }
 
+# toon_rows_fields: the indented rows of tasks-axi TOON listings on stdin, one
+# record per row with the unit separator between id, state, kind, repo, title,
+# blocked_by, hold_kind, and hold_reason, in that order whatever order the
+# listing's own field header uses. A quoted field is a JSON string; a title that
+# tasks-axi itself cut keeps its first line, so its cut notice is dropped.
+toon_rows_fields() {
+  perl -MJSON::PP -e '
+    use strict;
+    use warnings;
+    binmode STDIN, ":encoding(UTF-8)";
+    binmode STDOUT, ":encoding(UTF-8)";
+    my $json = JSON::PP->new->allow_nonref;
+    my @names;
+    while (my $line = <STDIN>) {
+      chomp $line;
+      if ($line =~ /^[a-z_]+\[\d+\]\{([^}]*)\}:$/) { @names = split /,/, $1; next; }
+      if ($line !~ /^  (.*)$/) { @names = () if $line =~ /^[a-z_]/; next; }
+      next unless @names;
+      my ($rest, @values) = ($1);
+      while (length $rest) {
+        if ($rest =~ s/^("(?:[^"\\]|\\.)*")(?:,|$)//) {
+          push @values, eval { $json->decode($1) } // $1;
+        } elsif ($rest =~ s/^([^,]*)(?:,|$)//) {
+          push @values, $1;
+        } else {
+          last;
+        }
+      }
+      my %row;
+      @row{@names} = @values;
+      $row{title} = (split /\n/, $row{title} // "")[0] // "";
+      print join("\x1f", map { my $v = $row{$_} // ""; $v =~ s/[\x1f\r\n\t]+/ /g; $v }
+        qw(id state kind repo title blocked_by hold_kind hold_reason)), "\n";
+    }
+  '
+}
+
+# compact_backlog_group <toon-listing> <skip-ids> [<limit>]: one row line per
+# listed task, title capped at 70 and hold reason at 150 characters by the shared
+# line cap, into COMPACT_GROUP_ROWS; rows whose id is in the space-separated
+# <skip-ids> are left out, and <limit> (0 = none) bounds the rows kept.
+# COMPACT_GROUP_TOTAL counts every row not skipped, COMPACT_GROUP_SHOWN the kept
+# ones, and COMPACT_GROUP_IDS names them all.
+compact_backlog_group() {
+  local skip=" ${2:-} " limit=${3:-0} id state kind repo title blocked hold_kind hold_reason row
+  COMPACT_GROUP_ROWS=
+  COMPACT_GROUP_TOTAL=0
+  COMPACT_GROUP_SHOWN=0
+  COMPACT_GROUP_IDS=
+  while IFS=$'\x1f' read -r id state kind repo title blocked hold_kind hold_reason; do
+    [ -n "$id" ] || continue
+    case "$skip" in *" $id "*) continue ;; esac
+    COMPACT_GROUP_TOTAL=$((COMPACT_GROUP_TOTAL + 1))
+    COMPACT_GROUP_IDS="$COMPACT_GROUP_IDS $id"
+    [ "$limit" -le 0 ] || [ "$COMPACT_GROUP_SHOWN" -lt "$limit" ] || continue
+    fm_cap_line_var "$title" 70
+    row="  $id ${kind:--} ${repo:--} $FM_LINE_CAP_LINE"
+    case "$hold_kind" in
+      ''|-|none) ;;
+      *)
+        fm_cap_line_var "$hold_reason" 150
+        row="$row | held $hold_kind: $FM_LINE_CAP_LINE"
+        ;;
+    esac
+    case "$blocked" in ''|-|none) ;; *) row="$row | blocked by $blocked" ;; esac
+    COMPACT_GROUP_ROWS="$COMPACT_GROUP_ROWS$row"$'\n'
+    COMPACT_GROUP_SHOWN=$((COMPACT_GROUP_SHOWN + 1))
+  done < <(printf '%s\n' "$1" | toon_rows_fields)
+}
+
+# The compact tasks-axi listing (COMPACT VIEWS in the header): every in-flight,
+# held, and blocked row stays, shortened; an in-flight item's hold rides on its
+# in-flight row instead of repeating it under held; the dispatchable rows are
+# one count line unless FM_SESSION_START_QUEUED_LIMIT asks for some of them.
+print_backlog_tasks_axi_short() {  # <in-flight> <held> <blocked> <ready>
+  local in_flight_ids followups
+  printf 'compact backlog (tasks-axi; done rows omitted; titles capped at 70 and hold reasons at 150 characters):\n'
+  compact_backlog_group "$1" ''
+  in_flight_ids=$COMPACT_GROUP_IDS
+  printf 'in flight (%s):\n%s' "$COMPACT_GROUP_TOTAL" "$COMPACT_GROUP_ROWS"
+  compact_backlog_group "$2" "$in_flight_ids"
+  printf 'held queued (%s):\n%s' "$COMPACT_GROUP_TOTAL" "$COMPACT_GROUP_ROWS"
+  compact_backlog_group "$3" ''
+  printf 'blocked queued (%s):\n%s' "$COMPACT_GROUP_TOTAL" "$COMPACT_GROUP_ROWS"
+  if [ "$QUEUED_LIMIT_ASKED" -eq 1 ]; then
+    compact_backlog_group "$4" '' "$QUEUED_LIMIT"
+    printf 'ready queued (shown %s of %s; bin/fm-tasks-axi.sh ready lists them all):\n%s' \
+      "$COMPACT_GROUP_SHOWN" "$COMPACT_GROUP_TOTAL" "$COMPACT_GROUP_ROWS"
+  else
+    compact_backlog_group "$4" '' 1
+    printf 'ready queued: %s item(s) - run bin/fm-tasks-axi.sh ready at the next heartbeat or after a cleanup (AGENTS.md section 10); full rows: bin/fm-tasks-axi.sh show <id> --full\n' \
+      "$COMPACT_GROUP_TOTAL"
+  fi
+  # Public follow-ups are never dispatchable; a pending one is a signal, a zero is not.
+  followups=$(printf '%s\n' "$4" | awk '/^ready_public_followups:/ && $2 != "0"')
+  [ -z "$followups" ] || printf '%s\n' "$followups"
+}
+
 print_backlog_tasks_axi_compact() {
   local path=$1 in_flight held blocked ready err
   if ! in_flight=$(tasks-axi list --file "$path" --state in_flight --fields "$BACKLOG_FIELDS" 2>&1); then
@@ -538,6 +708,15 @@ print_backlog_tasks_axi_compact() {
     err=$blocked
   elif ! ready=$(tasks-axi ready --file "$path" 2>&1); then
     err=$ready
+  elif [ "$BACKLOG_VIEW" = compact ]; then
+    print_backlog_tasks_axi_short \
+      "$(printf '%s\n' "$in_flight" | fm_hold_reason_decode_stream)" \
+      "$(printf '%s\n' "$held" | fm_hold_reason_decode_stream)" \
+      "$(printf '%s\n' "$blocked" | fm_hold_reason_decode_stream)" \
+      "$ready"
+    # Its ready line already names the full-row command.
+    BACKLOG_POINTER_SHOWN=1
+    return 0
   else
     printf 'compact backlog listing (tasks-axi; done rows omitted; every in-flight, held, and blocked row shown in full; ready queued bounded to %s; task bodies omitted)\n' \
       "$QUEUED_LIMIT"
@@ -568,7 +747,7 @@ print_backlog_compact() {
       else
         print_backlog_manual_compact "$path" "tasks-axi unavailable or incompatible"
       fi
-      print_backlog_pointer
+      [ "${BACKLOG_POINTER_SHOWN:-0}" -eq 1 ] || print_backlog_pointer
     else
       printf '(present, empty)\n'
     fi
@@ -588,6 +767,67 @@ print_status_tail() {
   while IFS= read -r line || [ -n "$line" ]; do
     fm_cap_line "$line"
   done < <(tail -n "$STATUS_TAIL" "$status")
+}
+
+# newest_task_event <status-file>: the newest status line that is not
+# pending-reply bookkeeping. A record under a reserved key (bin/fm-classify-lib.sh)
+# tracks a request this home sent, not something the task did; one still open is
+# counted by open=N and listed by OPEN DECISIONS, and a closed one is history.
+newest_task_event() {
+  local keys='' prefix
+  for prefix in ${FM_CLASSIFY_RESERVED_KEY_PREFIXES:-$FM_CLASSIFY_RESERVED_KEY_PREFIXES_DEFAULT}; do
+    keys="$keys${keys:+|}$prefix"
+  done
+  if [ -z "$keys" ]; then
+    grep -v -E '^[[:space:]]*$' "$1" 2>/dev/null | tail -n 1
+    return 0
+  fi
+  grep -v -E -e '^[[:space:]]*$' -e "^[^:[]*(\\[[^]]*\\][[:space:]]*)*\\[key=($keys)" "$1" 2>/dev/null | tail -n 1
+}
+
+# print_task_line <id> <meta-file-or-empty> <endpoint-word-or-empty> <status-file> [<open-set>]
+# One task in the compact task view (COMPACT VIEWS in the header). <open-set> is
+# the decision fold's "<key>\t<verb>\t<note>" lines; when it is not given it comes
+# from the cursor-backed fold, which the drain above has just brought up to date.
+print_task_line() {
+  local id=$1 meta=$2 ep=$3 status=$4 open line kind='' mode='' yolo='' host='' pr='' last='' n=0 key verb note
+  line=$id
+  if [ -n "$meta" ]; then
+    kind=$(fm_meta_get "$meta" kind)
+    mode=$(fm_meta_get "$meta" mode)
+    yolo=$(fm_meta_get "$meta" yolo)
+    host=$(fm_meta_get "$meta" remote_host)
+    pr=$(fm_meta_get "$meta" pr)
+    line="$line ${kind:-?}"
+    [ -z "$mode" ] || [ "$mode" = "$kind" ] || line="$line $mode"
+    [ -z "$yolo" ] || line="$line yolo=$yolo"
+    [ -z "$host" ] || line="$line host=$host"
+  fi
+  [ -z "$ep" ] || line="$line ep=$ep"
+  if [ "$#" -ge 5 ]; then
+    open=$5
+  else
+    open=$(status_open_decisions_incremental "$status" 2>/dev/null || true)
+  fi
+  while IFS= read -r key; do
+    [ -z "$key" ] || n=$((n + 1))
+  done <<EOF
+$open
+EOF
+  [ "$n" -eq 0 ] || line="$line open=$n"
+  [ ! -f "$status" ] || last=$(newest_task_event "$status")
+  fm_cap_line_var "${last:-no status event yet}" 200
+  printf '%s | %s\n' "$line" "$FM_LINE_CAP_LINE"
+  [ -z "$pr" ] || printf '  pr=%s\n' "$pr"
+  # A read-only digest runs no drain, so it has no OPEN DECISIONS section.
+  [ "$READ_ONLY" -eq 1 ] && [ "$n" -gt 0 ] || return 0
+  while IFS=$'\t' read -r key verb note; do
+    [ -n "$verb" ] || continue
+    fm_cap_line_var "open: $verb [key=$key]: $note" 200
+    printf '  %s\n' "$FM_LINE_CAP_LINE"
+  done <<EOF
+$open
+EOF
 }
 
 # fm_session_start_endpoint_read <backend> <target> [expected-label]: ONE
@@ -718,16 +958,23 @@ if [ "$REEMIT" -eq 1 ]; then
   # First in the output on purpose: a harness that spills a large hook output
   # delivers only a short head inline (Claude: about 2,000 characters), and
   # CONTEXT prints last, so this cue is the part that must survive the spill.
-  printf 'RE-EMIT CUE: if this output ends with "Output too large ... Full output saved to <path>",\n'
-  printf 'read that whole file now, before acting. Otherwise read data/captain.md, data/captain-shared.md,\n'
-  printf 'and data/learnings.md under %s now if any of them is missing below.\n' "$DATA"
-  section "SESSION START (CONTEXT RE-EMIT) - $FM_HOME"
-  printf 'This session already took the helm at its own startup and has only lost its\n'
-  printf 'context. Lock ownership is re-verified and the durable records below are\n'
-  printf 'reprinted, but the sweeps startup already reconciled - project clone refresh,\n'
-  printf 'secondmate convergence and liveness, pending remote handoff\n'
-  printf 'retry, X-mode artifact writes, and stale Herdr child cleanup - are NOT repeated.\n'
-  printf 'Queued wakes ARE still drained: they arrived after startup and are this turn work.\n'
+  # A Pi-family harness delivers the digest as its own message and marks a cut.
+  if [ "$FRAME_VIEW" = full ] || [ "$PI_FAMILY" -eq 0 ]; then
+    printf 'RE-EMIT CUE: if this output ends with "Output too large ... Full output saved to <path>",\n'
+    printf 'read that whole file now, before acting. Otherwise read data/captain.md, data/captain-shared.md,\n'
+    printf 'and data/learnings.md under %s now if any of them is missing below.\n' "$DATA"
+  fi
+  if [ "$FRAME_VIEW" = full ]; then
+    section "SESSION START (CONTEXT RE-EMIT) - $FM_HOME"
+    printf 'This session already took the helm at its own startup and has only lost its\n'
+    printf 'context. Lock ownership is re-verified and the durable records below are\n'
+    printf 'reprinted, but the sweeps startup already reconciled - project clone refresh,\n'
+    printf 'secondmate convergence and liveness, pending remote handoff\n'
+    printf 'retry, X-mode artifact writes, and stale Herdr child cleanup - are NOT repeated.\n'
+    printf 'Queued wakes ARE still drained: they arrived after startup and are this turn work.\n'
+  else
+    section "SESSION START (CONTEXT RE-EMIT) - $FM_HOME: this session only lost its context; the lock is re-verified, startup sweeps are not repeated, and the wakes below are this turn's work."
+  fi
 else
   section "SESSION START - $FM_HOME"
 fi
@@ -821,8 +1068,22 @@ else
       "$SCRIPT_DIR/fm-bootstrap.sh" 2>&1
   )
 fi
-if [ -n "$BOOT_OUT" ]; then
-  printf '%s\n' "$BOOT_OUT"
+# A startup-memory budget overrun is standing curation debt: name it while it
+# lasts. The report is a local read and prints nothing usable without a budget.
+MEMORY_LINE=
+MEMORY_REPORT=$(FM_HOME="$FM_HOME" FM_CONFIG_OVERRIDE="$CONFIG" FM_DATA_OVERRIDE="$DATA" \
+  "$SCRIPT_DIR/fm-startup-memory-budget.sh" report 2>/dev/null) || MEMORY_REPORT=
+case "$MEMORY_REPORT" in
+  *budget_status=over-budget*)
+    MEMORY_LINE=$(printf '%s\n' "$MEMORY_REPORT" | awk -F= '
+      $1 == "total_estimated_tokens" { total = $2 }
+      $1 == "effective_budget_tokens" { budget = $2 }
+      END { printf "STARTUP_MEMORY: %s/%s estimated tokens - over budget; curate with /stow", total, budget }')
+    ;;
+esac
+if [ -n "$BOOT_OUT" ] || [ -n "$MEMORY_LINE" ]; then
+  [ -z "$BOOT_OUT" ] || printf '%s\n' "$BOOT_OUT"
+  [ -z "$MEMORY_LINE" ] || printf '%s\n' "$MEMORY_LINE"
 else
   printf '(silent - all good)\n'
 fi
@@ -864,7 +1125,10 @@ else
       printf '%s\n' "$BRANCH_REPLAY_OUT"
     fi
   fi
-  DRAIN_OUT=$(FM_OPEN_DECISIONS_VIEW=all "$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
+  # The drain prints its own WAKE_ACK_REQUIRED line for the rows it presents,
+  # so the guard it runs need not tell this turn to drain them again.
+  DRAIN_OUT=$(FM_OPEN_DECISIONS_VIEW=all FM_GUARD_QUEUE_PRESENTED="${FM_GUARD_QUEUE_PRESENTED:-1}" \
+    "$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
   if [ -n "$DRAIN_OUT" ]; then
     printf '%s\n' "$DRAIN_OUT"
   else
@@ -926,12 +1190,18 @@ if [ "$PRIMARY_HARNESS" = omp ]; then
     fi
   fi
 fi
+# A Pi-family context re-emit gets the compact block (COMPACT VIEWS in the header).
+SUPERVISION_COMPACT=0
+if [ "$REEMIT" -eq 1 ] && [ "$PI_FAMILY" -eq 1 ] && [ "$SUPERVISION_VIEW" = compact ]; then
+  SUPERVISION_COMPACT=1
+fi
 "$SCRIPT_DIR/fm-supervision-instructions.sh" \
   --harness "$PRIMARY_HARNESS" \
   --read-only "$READ_ONLY" \
   --afk "$AFK_PRESENT" \
   --afk-mode "$AFK_MODE" \
-  --x-mode "$X_MODE_PRESENT"
+  --x-mode "$X_MODE_PRESENT" \
+  --compact "$SUPERVISION_COMPACT"
 
 # --- 5. read-once contract -------------------------------------------------
 # Ahead of the two digests it governs, not after them: a truncated tail is
@@ -941,6 +1211,20 @@ fi
 # a stage that never ran, which the truncation banner names by stage.
 stage read-once
 section "READ-ONCE CONTRACT"
+if [ "$FRAME_VIEW" = compact ]; then
+  READ_ONCE_TASKS='every state/*.meta (one line each)'
+  [ "$TASK_VIEW" = compact ] || READ_ONCE_TASKS='every state/*.meta with a bounded state/*.status tail'
+  READ_ONCE_MATES='data/secondmates.md (compact)'
+  [ "$SECONDMATES_VIEW" = compact ] || READ_ONCE_MATES='data/secondmates.md'
+  printf 'This digest prints %s, a compact backlog, data/projects.md, %s,\n' "$READ_ONCE_TASKS" "$READ_ONCE_MATES"
+  cat <<'EOF'
+data/captain.md, data/captain-shared.md and data/learnings.md. Do not re-read them.
+Go to a source only when it is flagged ABSENT or corrupt, a capped line or older
+history matters (state/<id>.status), a full task body is needed
+(bin/fm-tasks-axi.sh show <id> --full), or a STARTUP TRUNCATED banner names a stage
+that never ran.
+EOF
+else
 cat <<'EOF'
 Everything below is printed in full for this session start: every state/*.meta,
 a compact data/backlog.md listing, a bounded tail of every state/*.status,
@@ -965,6 +1249,7 @@ Go to a source directly only when:
   - or a context re-emit opened with a read cue because the
     harness cut the digest short.
 EOF
+fi
 
 # --- 6. fleet-state digest ---------------------------------------------
 # Before CONTEXT: see this file's ORDERING note. Live fleet identity is what a
@@ -973,14 +1258,20 @@ stage fleet-state
 section "FLEET STATE"
 print_backlog_compact "$DATA/backlog.md" "data/backlog.md"
 
-subsection "Work under way (state/*.meta)"
+if [ "$TASK_VIEW" = full ]; then
+  subsection "Work under way (state/*.meta)"
+else
+  subsection "Work under way - one line per task (full record: state/<id>.meta and state/<id>.status; read them only before steering, controlling, or cleaning up that task):"
+fi
 META_FOUND=0
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
   META_FOUND=1
   id=$(basename "$meta" .meta)
-  printf '\n--- %s ---\n' "$id"
-  cat "$meta"
+  if [ "$TASK_VIEW" = full ]; then
+    printf '\n--- %s ---\n' "$id"
+    cat "$meta"
+  fi
 
   window=$(fm_meta_get "$meta" window)
   target=$(fm_backend_target_of_meta "$meta")
@@ -992,18 +1283,26 @@ for meta in "$STATE"/*.meta; do
     # the bound firing and >=128 is a signal death. Every other nonzero status
     # is the probe's own verdict that the endpoint is gone.
     if [ "$endpoint_rc" -eq 0 ]; then
-      printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
+      endpoint_word=alive
+      endpoint_line="endpoint: alive (backend=$backend window=$window)"
     elif [ "$endpoint_rc" -eq 124 ] || [ "$endpoint_rc" -ge 128 ]; then
-      printf 'endpoint: error (backend=%s window=%s - the endpoint read died or hit its %ss bound; the digest continued past it)\n' \
-        "$backend" "$window" "$ENDPOINT_TIMEOUT"
+      endpoint_word="error(the read died or hit its ${ENDPOINT_TIMEOUT}s bound)"
+      endpoint_line="endpoint: error (backend=$backend window=$window - the endpoint read died or hit its ${ENDPOINT_TIMEOUT}s bound; the digest continued past it)"
     else
-      printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
+      endpoint_word=dead
+      endpoint_line="endpoint: dead (backend=$backend window=$window)"
     fi
   else
-    printf 'endpoint: unknown (no window recorded)\n'
+    endpoint_word=unknown
+    endpoint_line='endpoint: unknown (no window recorded)'
   fi
 
   status="$STATE/$id.status"
+  if [ "$TASK_VIEW" = compact ]; then
+    print_task_line "$id" "$meta" "$endpoint_word" "$status"
+    continue
+  fi
+  printf '%s\n' "$endpoint_line"
   if [ -f "$status" ]; then
     print_status_tail "$status"
   else
@@ -1034,6 +1333,10 @@ for status in "$STATE"/*.status; do
     continue
   fi
   ORPHAN_STATUS_FOUND=1
+  if [ "$TASK_VIEW" = compact ]; then
+    print_task_line "$id" '' '' "$status" "$orphan_open"
+    continue
+  fi
   printf '\n--- %s ---\n' "$id"
   print_status_tail "$status"
 done
@@ -1121,7 +1424,11 @@ fi
 stage context
 section "CONTEXT"
 print_file_or_absent "$DATA/projects.md" "data/projects.md"
-print_file_or_absent "$DATA/secondmates.md" "data/secondmates.md"
+if [ "$SECONDMATES_VIEW" = compact ]; then
+  print_secondmates_compact "$DATA/secondmates.md"
+else
+  print_file_or_absent "$DATA/secondmates.md" "data/secondmates.md"
+fi
 print_file_or_absent "$DATA/captain.md" "data/captain.md"
 print_file_or_absent "$DATA/captain-shared.md" "data/captain-shared.md (shared, main-authoritative, read-only in secondmate homes)"
 print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
@@ -1158,6 +1465,9 @@ X mode is active, so the emitted block's cadence instruction applies.
 This script never starts supervision itself.
 
 EOF
+elif [ "$REEMIT" -eq 1 ] && [ "$PI_FAMILY" -eq 1 ] && [ "$FRAME_VIEW" = compact ]; then
+  printf 'Handle the queued wakes above; the Pi extension owns watcher continuity, so do not arm another cycle.\n'
+  NEXT_STEP_SHORT=1
 else
 cat <<EOF
 Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.
@@ -1165,7 +1475,7 @@ This script never starts supervision itself.
 
 EOF
 fi
-cat <<'EOF'
+[ "${NEXT_STEP_SHORT:-0}" -eq 1 ] || cat <<'EOF'
 The digest above is complete for this session start. The READ-ONCE CONTRACT
 section near the top of it governs what may still be read from disk.
 EOF

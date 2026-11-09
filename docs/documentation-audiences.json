@@ -471,6 +471,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": "docs/supervision-protocols/pi-compact.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": "docs/supervision-protocols/pi.md",
       "audience": "agent-runtime"
     },

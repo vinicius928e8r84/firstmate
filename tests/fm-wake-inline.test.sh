@@ -2,8 +2,10 @@
 # tests/fm-wake-inline.test.sh - bin/fm-wake-inline.sh, the inline drain and
 # turn-end acknowledgement of the main actor. The equivalence claim is that the
 # text the model reads and the acknowledgement it would have run are exactly
-# what the plain drain presents, so each case drives the real fm-wake-drain.sh
-# over the same queue twice (plain, then inline) and compares.
+# what the plain drain presents - less the guard's instruction to drain the
+# rows again, which the inline drain's own presentation makes wrong - so each
+# case drives the real fm-wake-drain.sh over the same queue twice (plain, then
+# inline) and compares.
 set -u
 
 # shellcheck source=tests/wake-helpers.sh
@@ -57,10 +59,13 @@ test_inline_text_and_ack_args_match_the_plain_drain() {
 
   plain_seq=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) .*$/\1/p' "$plain")
   [ -n "$plain_seq" ] || fail "setup error: the plain drain printed no acknowledgement line: $(cat "$plain")"
-  grep -v '^WAKE_ACK_REQUIRED: ' "$plain" > "$dir/plain.filtered"
+  grep -q '^WARNING: queued wakes pending - drain them' "$plain" \
+    || fail "setup error: the plain drain printed no drain-again warning to leave out: $(cat "$plain")"
+  grep -v -e '^WAKE_ACK_REQUIRED: ' -e '^WARNING: queued wakes pending - drain them' "$plain" > "$dir/plain.filtered"
   cmp -s "$dir/plain.filtered" "$inline" \
-    || fail "inline text differs from the plain drain minus its ack line: $(diff "$dir/plain.filtered" "$inline")"
+    || fail "inline text differs from the plain drain minus its ack line and drain-again warning: $(diff "$dir/plain.filtered" "$inline")"
   grep -q 'WAKE_ACK_REQUIRED' "$inline" && fail "the ack line leaked into the text the model reads"
+  grep -q 'queued wakes pending - drain them' "$inline" && fail "the inline text told the model to drain the rows it already carries"
   inline_seq=$(cut -d' ' -f1 "$ack_out")
   [ "$inline_seq" = "$plain_seq" ] || fail "inline ack sequence $inline_seq differs from the plain drain's $plain_seq"
   [ "$(wc -w < "$ack_out")" -eq 2 ] || fail "ack args must be 'SEQUENCE GENERATION': $(cat "$ack_out")"

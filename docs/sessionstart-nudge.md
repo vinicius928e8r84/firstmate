@@ -145,7 +145,7 @@ Some digest work remains local but unbounded:
 So the whole digest still runs as one bounded child, default 120s via `FM_SESSION_START_TIMEOUT`.
 
 Each per-task endpoint liveness read runs serially in its own crash-isolated child, bounded by `FM_SESSION_START_ENDPOINT_TIMEOUT` (default 10s; a non-numeric or zero value falls back to the default).
-So a read that hangs or dies becomes that task's own `endpoint: error` line and the digest continues.
+So a read that hangs or dies becomes an endpoint error on that task's own line and the digest continues.
 With a wedged backend the stage's ceiling is tasks times that per-read bound and can itself reach the digest bound.
 
 The per-item backlog row reads inside bootstrap's reconcile and close-replay sweeps are the exception.
@@ -307,6 +307,7 @@ The extension encodes an unencoded digest or fallback as `session-start` operati
 
 The extension streams the hook to completion and retains at most 512 KiB for message delivery.
 Whenever the digest is incomplete, this approved containment keeps the prefix and appends a loud `PI SESSION-START DELIVERY TRUNCATED` marker with direct-inspection guidance.
+Nothing is ever spilled to a saved file, so a Pi or pi-signed re-emit leaves out the `RE-EMIT CUE` unless the long frame is selected (`FM_SESSION_START_FRAME_VIEW=full`).
 
 ### OpenCode
 

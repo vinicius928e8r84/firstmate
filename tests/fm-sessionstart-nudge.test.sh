@@ -267,8 +267,8 @@ test_run_clear_and_compact_reemit() {
     out=$(run_hook "$root" --source "$source" </dev/null) || status=$?
     expect_code 0 "$status" "run wrapper $source"
     assert_contains "$out" "$REEMIT_BANNER$root" "$source did not re-emit the digest"
-    assert_contains "$out" "are NOT repeated" "$source did not report the skipped startup sweeps"
-    assert_contains "$out" "Queued wakes ARE still drained" "$source did not preserve the wake-queue drain"
+    assert_contains "$out" "startup sweeps are not repeated" "$source did not report the skipped startup sweeps"
+    assert_contains "$out" "the wakes below are this turn's work" "$source did not preserve the wake-queue drain"
     assert_not_contains "$out" "FIRSTMATE_OP" "a $source open also emitted the nudge instruction"
   done
   pass "run wrapper: clear and compact re-emit the digest without repeating startup sweeps"

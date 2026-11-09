@@ -19,7 +19,9 @@
 #       that are already gone is a harmless no-op, so a repeat is safe.
 #
 # Output is the drain's own text, so what the model reads is the same filtered
-# presentation it read before; nothing is summarized or dropped. An
+# presentation it read before; nothing is summarized or dropped, except that
+# the drain's guard is told the rows were just presented (FM_GUARD_QUEUE_PRESENTED,
+# bin/fm-guard.sh), so it does not tell the model to drain them again. An
 # unacknowledged wake stays durable, so a caller that never acknowledges (an
 # aborted turn, a crash) costs a re-presentation, not a lost wake.
 set -u
@@ -39,7 +41,7 @@ case "$1" in
     ack_out=$3
     out=$(mktemp "${TMPDIR:-/tmp}/fm-wake-inline.XXXXXX") || exit 1
     trap 'rm -f -- "$out"' EXIT
-    bash "$DRAIN" > "$out" 2>&1
+    FM_GUARD_QUEUE_PRESENTED="${FM_GUARD_QUEUE_PRESENTED:-1}" bash "$DRAIN" > "$out" 2>&1
     status=$?
     [ "$status" -eq 0 ] || { cat -- "$out"; exit "$status"; }
     ack_line=$(grep -E '^WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through [0-9]+ --recovery-generation [A-Za-z0-9._-]+$' "$out" | tail -n 1)

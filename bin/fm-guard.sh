@@ -38,7 +38,11 @@
 # The ordinary warning also stays silent for the supervision branch
 # actor (FM_SUPERVISION_ACTOR=branch), because that actor runs guarded commands
 # while handling exactly the queued rows its grant covers and can drain nothing
-# else. The watcher-down banner and its reminder stay silent for that actor too,
+# else. It is silent too when FM_GUARD_QUEUE_PRESENTED=1 says the calling drain
+# has just presented the queued rows with its own WAKE_ACK_REQUIRED line (the
+# session-start digest and the inline wake drain set it), where "drain them"
+# would contradict the instruction not to drain again. The watcher-down banner
+# and its reminder stay silent for the branch actor too,
 # and its calls leave the episode state alone: the branch never owns watcher
 # continuity (Pi main or the supervision host restarts the watcher once the
 # branch's turn ends, and a successor cycle that closed on a newer wake mid-turn
@@ -58,6 +62,8 @@ queue_pending=false
 queue_branch_held=false
 READ_ONLY=${FM_GUARD_READ_ONLY:-0}
 case "$READ_ONLY" in 1|true|TRUE|yes|YES) READ_ONLY=1 ;; *) READ_ONLY=0 ;; esac
+QUEUE_PRESENTED=${FM_GUARD_QUEUE_PRESENTED:-0}
+case "$QUEUE_PRESENTED" in 1|true|TRUE|yes|YES) QUEUE_PRESENTED=1 ;; *) QUEUE_PRESENTED=0 ;; esac
 CONTINUE_LINE=${FM_GUARD_CONTINUE_LINE:-This is a supervision warning only; the guarded operation WILL still run.}
 
 # Volatile, home-scoped episode marker: one line = the current stale-episode key.
@@ -283,7 +289,7 @@ fi
 if "$queue_pending"; then
   if [ "$READ_ONLY" -eq 1 ]; then
     echo "WARNING: queued wakes pending - left untouched because this session lacks verified fleet-lock ownership." >&2
-  elif [ "$GUARD_ACTOR" != branch ]; then
+  elif [ "$GUARD_ACTOR" != branch ] && [ "$QUEUE_PRESENTED" -eq 0 ]; then
     echo "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else." >&2
   fi
 elif "$queue_branch_held"; then

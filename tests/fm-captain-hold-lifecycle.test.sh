@@ -4601,9 +4601,24 @@ SH
         chmod +x "$home/fakebin/tasks-axi"
         ;;
     esac
+    if [ "$mode" = tool ]; then
+      # The compact listing renders a reason as one capped line of plain text:
+      # still decoded exactly once, with its line breaks and tabs folded to spaces.
+      start=$(PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" FM_HOME="$home" \
+        FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
+        FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-session-start.sh" 2>&1 || true)
+      assert_contains "$start" "held captain: $(printf '%s' "$expected_reason" | perl -0777 -pe 's/[\r\n\t]+/ /g')" \
+        "the compact startup listing changed the decoded reason"
+      assert_contains "$start" "held captain: fm-hold-v1:bm9ydGg=" "the compact startup listing changed a once-decoded reason"
+      assert_not_contains "$start" "held captain: north" "the compact startup listing decoded a reason twice"
+      assert_contains "$start" "held captain: $legacy" "the compact startup listing changed the legacy reason"
+      for malformed in "${malformed_reasons[@]}"; do
+        assert_contains "$start" "held captain: $malformed" "the compact startup listing changed historical literal $malformed"
+      done
+    fi
     start=$(PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" FM_HOME="$home" \
       FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
-      FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-session-start.sh" 2>&1 || true)
+      FM_BOOTSTRAP_NETWORK=skip FM_SESSION_START_BACKLOG_VIEW=full "$ROOT/bin/fm-session-start.sh" 2>&1 || true)
     assert_contains "$start" "$quoted_reason" "startup $mode changed the encoded reason"
     assert_contains "$start" 'Investigate literal %28' "startup $mode changed the title"
     assert_contains "$start" "$legacy" "startup $mode changed the legacy reason"

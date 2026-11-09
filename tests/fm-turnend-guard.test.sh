@@ -1353,6 +1353,101 @@ EOF
   pass ".pi primary extension: a nested load keeps the live session's turn-end marker"
 }
 
+# A nested `pi --help` sits below the shell that ran it, never directly under
+# the lock holder, so it must not bind the marker even when the marker names no
+# live ancestor; and the live session re-asserts a stale marker after a
+# compaction and as each run settles, so a stale one cannot outlive the session.
+test_pi_extension_nested_load_never_binds_and_session_remarks() {
+  local repo home ext marker_case out status
+  repo="$TMP_ROOT/pi-marker-remark-root"
+  home="$TMP_ROOT/pi-marker-remark-home"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  mkdir -p "$repo/.pi/extensions/lib" "$repo/bin" "$home/state"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$repo/.pi/extensions/lib/fm-operational-input.ts"
+  cp "$ROOT/bin/fm-operational-input.sh" "$repo/bin/fm-operational-input.sh"
+  for marker_case in deep-nested settle compact; do
+    rm -f "$home/state/.pi-turnend-extension-loaded" "$home/state/.lock"
+    # The extra command keeps bash from exec'ing node, so the lock holder below
+    # (this test's own shell) is a strict ancestor more than one level up.
+    out=$(PLUGIN="$ext" FM_HOME="$home" MARKER_CASE="$marker_case" LOCK_HOLDER=$$ \
+      bash -c 'node --input-type=module; exit $?' 2>&1 <<'EOF'
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const marker = `${process.env.FM_HOME}/state/.pi-turnend-extension-loaded`;
+const lock = `${process.env.FM_HOME}/state/.lock`;
+const version = `sha256:${createHash("sha256").update(readFileSync(process.env.PLUGIN)).digest("hex")}`;
+const handlers = new Map();
+const pi = {
+  on(event, handler) {
+    handlers.set(event, handler);
+  },
+  async sendUserMessage() {},
+  sendMessage() {},
+};
+async function load() {
+  const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+  mod.default(pi);
+}
+const dead = spawnSync(process.execPath, ["-e", "0"], { stdio: "ignore" }).pid;
+const stale = `${version}\n${dead}\n`;
+const bound = `${version}\n${process.pid}\n`;
+
+switch (process.env.MARKER_CASE) {
+  case "deep-nested": {
+    const holder = process.env.LOCK_HOLDER;
+    if (!holder || holder === String(process.ppid) || holder === String(process.pid)) {
+      throw new Error(`setup error: the lock holder ${holder} is not a deeper ancestor`);
+    }
+    writeFileSync(lock, `${holder}\n`);
+    writeFileSync(marker, stale);
+    await load();
+    await handlers.get("session_start")?.({ type: "session_start", reason: "reload" }, {});
+    await handlers.get("agent_settled")?.({ type: "agent_settled" }, {});
+    const after = readFileSync(marker, "utf8");
+    if (after !== stale) throw new Error(`a nested load bound the marker to itself: ${JSON.stringify(after)}`);
+    break;
+  }
+  case "settle":
+  case "compact": {
+    // Another live process holds the lock at load, so nothing binds; then this
+    // session takes the lock, and its next settle or compaction re-asserts.
+    const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    try {
+      writeFileSync(lock, `${other.pid}\n`);
+      writeFileSync(marker, stale);
+      await load();
+      if (readFileSync(marker, "utf8") !== stale) throw new Error("a load under a foreign live lock bound the marker");
+      writeFileSync(lock, `${process.pid}\n`);
+      if (process.env.MARKER_CASE === "settle") {
+        await handlers.get("agent_settled")({ type: "agent_settled" }, {});
+      } else {
+        await handlers.get("session_compact")({ type: "session_compact" }, {});
+      }
+      const after = readFileSync(marker, "utf8");
+      if (after !== bound) {
+        throw new Error(`the ${process.env.MARKER_CASE} did not re-assert the marker: ${JSON.stringify(after)}`);
+      }
+    } finally {
+      other.kill("SIGTERM");
+    }
+    break;
+  }
+  default:
+    throw new Error(`unknown marker case: ${process.env.MARKER_CASE}`);
+}
+EOF
+)
+    status=$?
+    [ "$status" = 0 ] || fail "Pi turn-end marker re-assertion failed for the '$marker_case' case (exit $status): $out"
+    [ -z "$out" ] || fail "Pi turn-end marker re-assertion '$marker_case' case printed output: $out"
+  done
+  pass ".pi primary extension: a nested load never binds the turn-end marker and the live session re-asserts it"
+}
+
 # --- --claude cooperative mode -----------------------------------------------
 # In --claude mode the guard ignores stop_hook_active (Claude marks every stop
 # after ANY stop-hook continuation true, including asyncRewake rewake turns) and
@@ -2429,6 +2524,7 @@ test_pi_extension_injects_once_per_logical_agent_run
 test_pi_guard_selfheals_before_waking_the_model
 test_pi_extension_retries_after_followup_delivery_failure
 test_pi_extension_keeps_marker_of_live_ancestor_session
+test_pi_extension_nested_load_never_binds_and_session_remarks
 test_hook_claude_mode_reblocks_stop_hook_active_when_unhealthy
 test_hook_claude_mode_reblocks_x_mode_without_tasks
 test_hook_claude_mode_allows_when_autoarm_owner_alive

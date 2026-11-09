@@ -870,6 +870,38 @@ test_branch_actor_is_not_told_to_drain_queued_wakes() {
   pass "fm-guard: the branch actor is never told to drain queued wakes while main still is"
 }
 
+# A drain that has just presented the queued rows with its own WAKE_ACK_REQUIRED
+# line (the session-start digest and the inline wake drain) says so with
+# FM_GUARD_QUEUE_PRESENTED=1, and the guard it runs does not tell that turn to
+# drain them again; every other call, and every other alarm, is unchanged.
+test_presented_queue_is_not_drained_again() {
+  local dir home out pid
+  dir=$(make_guard_case presented-queue)
+  home=$(case_home "$dir")
+  sleep 60 &
+  pid=$!
+  record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
+  touch "$home/state/.last-watcher-beat"
+  printf '%s\n' "1700000000	1	signal	task	signal: crewmate needs a decision" > "$home/state/.wake-queue"
+  out=$(FM_GUARD_QUEUE_PRESENTED=1 run_guard_case_extension "$dir")
+  assert_not_contains "$out" "queued wakes pending" \
+    "the guard told a turn to drain the rows its drain had just presented"
+  out=$(FM_GUARD_QUEUE_PRESENTED=0 run_guard_case_extension "$dir")
+  assert_contains "$out" "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else." \
+    "FM_GUARD_QUEUE_PRESENTED=0 must keep the queued-wake warning"
+  out=$(run_guard_case_extension "$dir")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  assert_contains "$out" "queued wakes pending - drain them" "an ordinary guarded command lost the queued-wake warning"
+  out=$(FM_GUARD_QUEUE_PRESENTED=1 run_guard_case "$dir")
+  [ "$(count_text "$out" "WATCHER DOWN - SUPERVISION IS OFF")" -eq 1 ] \
+    || fail "a presented queue must not hide the watcher-down banner: $out"
+  out=$(FM_GUARD_QUEUE_PRESENTED=1 run_guard_case_read_only "$dir")
+  assert_contains "$out" "queued wakes pending - left untouched because this session lacks verified fleet-lock ownership" \
+    "a presented queue must not hide the read-only advisory"
+  pass "fm-guard: a drain that just presented the queue is not told to drain it again, and nothing else changes"
+}
+
 test_persistent_model_ignores_pi_extension_evidence() {
   local dir home out pid
   dir=$(make_guard_case persistent-ignores-pi-evidence)
@@ -954,6 +986,7 @@ test_extension_ownership_needs_every_signal
 test_extension_stale_beacon_alarms_despite_live_session
 test_extension_handoff_keeps_queued_wake_warning
 test_branch_actor_is_not_told_to_drain_queued_wakes
+test_presented_queue_is_not_drained_again
 test_branch_actor_is_never_told_to_repair_the_watcher
 test_persistent_model_ignores_pi_extension_evidence
 test_extension_live_watcher_is_healthy_without_ownership_evidence

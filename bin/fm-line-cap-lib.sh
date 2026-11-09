@@ -4,7 +4,7 @@
 #
 # ONE OWNER for the bounded-line shape both digests use. The wake digest's
 # OPEN DECISIONS section (bin/fm-wake-drain.sh) and the session-start digest's
-# per-task status tails (bin/fm-session-start.sh) render the same kind of
+# per-task status lines (bin/fm-session-start.sh) render the same kind of
 # content - an agent-written status line, which AGENTS.md section 8 treats as a
 # wake EVENT rather than current state - into a size-bounded view. An agent
 # reading both must recognize one truncation marker, and the two caps must not
@@ -18,9 +18,9 @@
 # The cap counts characters, so a plain-ASCII line - what status lines are in
 # practice - is bounded to the same number of bytes, and a multibyte character
 # is never cut in half into an invalid sequence.
-# Truncation stays recoverable because the session-start digest prints each
-# task's full status log path, while every OPEN DECISIONS entry begins with the
-# task id that identifies its durable state/<id>.status source.
+# Truncation stays recoverable because the session-start digest names each
+# task's status log (state/<id>.status), while every OPEN DECISIONS entry begins
+# with the task id that identifies that durable source.
 
 FM_LINE_CAP_DEFAULT=220
 FM_LINE_CAP_SUFFIX=' [truncated]'

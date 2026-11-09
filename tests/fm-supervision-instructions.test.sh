@@ -332,6 +332,41 @@ test_pi_snippet_uses_effective_extension_path() {
   pass "pi supervision snippet renders the effective extension path"
 }
 
+# The compact form keeps the state lines, the three rules a re-emitted session
+# acts on, the regression example verbatim, and the command that prints the full
+# protocol; only the Pi family has one.
+test_compact_pi_block_points_to_the_full_protocol() {
+  local home out full harness
+  home="$TMP_ROOT/compact-home"
+  mkdir -p "$home/state" "$home/config"
+  for harness in pi pi-signed; do
+    out=$(FM_HOME="$home" "$RENDER" --harness "$harness" --compact 1)
+    full=$(FM_HOME="$home" "$RENDER" --harness "$harness")
+    assert_contains "$out" "SUPERVISION OPERATING INSTRUCTIONS - primary harness: $harness" "$harness: compact heading missing"
+    assert_contains "$out" "- Lock: held by this session" "$harness: compact block lost its state lines"
+    assert_contains "$out" "- Ordinary wake: the Pi extension already owns watcher continuity; do not arm another cycle." \
+      "$harness: compact block lost the ordinary-wake line"
+    assert_contains "$out" "Mode: Pi extension background wake (compact re-emit form)." "$harness: compact snippet missing"
+    assert_contains "$out" "call fm_watch_arm_pi only for the first cycle or when a notification reports the cycle missing, failed, or unhealthy" \
+      "$harness: compact block lost the arm rule"
+    assert_contains "$out" "call fm_branch_processed once with the highest listed sequence" "$harness: compact block lost the branch rule"
+    # shellcheck disable=SC2016  # backticks are literal text
+    assert_contains "$out" 'Regression example - keep verbatim and never condense away: `[seq 41] claude-mod: implementation complete, ready for review` requires relaying a captain-facing outcome response, not just `Captain, shipshape.`.' \
+      "$harness: compact block condensed away the regression example"
+    assert_contains "$out" "Full protocol: bin/fm-supervision-instructions.sh --harness $harness - read it before any watcher repair, extension restart, or supervision-branch question." \
+      "$harness: compact block does not name its own full protocol command"
+    assert_not_contains "$out" "__FM_" "$harness: a placeholder leaked into the compact block"
+    assert_not_contains "$out" "11. Never use shell" "$harness: compact block printed the full protocol"
+    [ "${#out}" -lt "${#full}" ] || fail "$harness: the compact block is not shorter than the full one"
+    assert_equals "$(FM_HOME="$home" "$RENDER" --harness "$harness" --compact 0)" "$full" \
+      "$harness: --compact 0 must render exactly the full block"
+  done
+  assert_equals "$(FM_HOME="$home" "$RENDER" --harness claude --compact 1)" "$(FM_HOME="$home" "$RENDER" --harness claude)" \
+    "a harness without a compact form must ignore --compact"
+  pass "the compact Pi block keeps the state lines, the three rules, the regression example, and the full-protocol command"
+}
+
+test_compact_pi_block_points_to_the_full_protocol
 test_supervision_host_protocol_on_a_claude_home_unless_off
 test_supervision_host_protocol_on_every_arm_owner
 test_selected_harness_block_only

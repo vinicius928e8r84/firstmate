@@ -79,9 +79,33 @@ function markerNamesLiveAncestor(): boolean {
   return false;
 }
 
+// A live lock binds the marker only from the process that holds it, or from the
+// extension host directly under a wrapper that holds it (pi-signed). A nested Pi
+// command sits deeper, so even when the marker names no live ancestor - the
+// session never wrote it, or an earlier nested load did - it cannot bind the
+// marker to a pid that dies at once.
+function lockHeldHere(): boolean {
+  let lockPid = "";
+  try {
+    lockPid = readFileSync(`${state}/.lock`, "utf8").trim();
+  } catch {
+    return false;
+  }
+  return lockPid === String(process.pid) || lockPid === parentPid(String(process.pid));
+}
+
+// Runs at load, at session start, after each compaction, and as each run settles,
+// so the live session re-asserts a marker that went stale while it ran.
 function markLoaded(): void {
-  if (!existsSync(state) || lockOwnership() === "other" || markerNamesLiveAncestor()) return;
-  writeFileSync(marker, `${extensionVersion}\n${process.pid}\n`);
+  if (!existsSync(state)) return;
+  const ownership = lockOwnership();
+  if (ownership === "other" || (ownership === "owned" && !lockHeldHere()) || markerNamesLiveAncestor()) return;
+  const content = `${extensionVersion}\n${process.pid}\n`;
+  try {
+    if (readFileSync(marker, "utf8") === content) return;
+  } catch {
+  }
+  writeFileSync(marker, content);
 }
 
 // Pi's session_start reasons are startup | reload | new | resume | fork, and a
@@ -614,6 +638,7 @@ export default function (pi: ExtensionAPI) {
   // may retry without another before_agent_start, so the event keeps its
   // existing delivery path while sharing generation ownership and cancellation.
   pi.on?.("session_compact", async (_event, ctx) => {
+    markLoaded();
     registerSessionstartExitListener();
     const generation = createSessionstartGeneration("compact", sessionIdFromContext(ctx));
     sessionstartGeneration = generation;
@@ -650,6 +675,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async () => {
+    markLoaded();
     if (guardFollowupActive) {
       guardFollowupActive = false;
       return;

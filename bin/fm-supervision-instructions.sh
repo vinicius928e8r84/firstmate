@@ -9,7 +9,10 @@
 # (docs/supervision-protocols/supervision-host.md, whose lines tagged
 # "{<harness>,...} " render only for the listed harnesses), and Grok's arm
 # command becomes the host; on a home that does not run it the output is
-# unchanged.
+# unchanged. --compact 1 swaps a Pi-family block's protocol body for
+# docs/supervision-protocols/pi-compact.md, which keeps the state lines and names
+# the command that prints the full protocol; bin/fm-session-start.sh asks for it
+# only on a context re-emit, and other harnesses ignore it.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,15 +29,18 @@ AFK_MODE=away
 X_MODE=0
 REPAIR_LINE=0
 QUEUE_PENDING=0
+COMPACT=0
 
 usage() {
   cat <<'EOF'
-Usage: fm-supervision-instructions.sh [--harness <name>] [--read-only 0|1] [--afk 0|1] [--afk-mode away|quiet] [--x-mode 0|1] [--repair-line] [--queue-pending 0|1]
+Usage: fm-supervision-instructions.sh [--harness <name>] [--read-only 0|1] [--afk 0|1] [--afk-mode away|quiet] [--x-mode 0|1] [--compact 0|1] [--repair-line] [--queue-pending 0|1]
 
 Print the current primary harness's supervision operating instructions.
 With --repair-line, print one concise repair instruction for guard and hook messages.
 --afk-mode only matters when --afk 1 (present); it selects the away-mode vs
 quiet-mode (kunchenguid/firstmate#2356) wording, and defaults to away.
+--compact 1 prints a Pi-family block's short re-emit form, which points back to
+this command for the full protocol; other harnesses always print the full block.
 EOF
 }
 
@@ -80,6 +86,11 @@ while [ "$#" -gt 0 ]; do
       QUEUE_PENDING=$(bool_value "$2")
       shift 2
       ;;
+    --compact)
+      [ "$#" -gt 1 ] || { echo "error: --compact requires 0 or 1" >&2; exit 2; }
+      COMPACT=$(bool_value "$2")
+      shift 2
+      ;;
     --repair-line)
       REPAIR_LINE=1
       shift
@@ -104,6 +115,9 @@ case "$HARNESS" in
   claude|codex|opencode|pi|grok|cursor|omp) SNIPPET="$DOC_DIR/$HARNESS.md" ;;
   pi-signed) SNIPPET="$DOC_DIR/pi.md" ;;
   *) HARNESS=unknown; SNIPPET="$DOC_DIR/unknown.md" ;;
+esac
+case "$COMPACT:$HARNESS" in
+  1:pi|1:pi-signed) SNIPPET="$DOC_DIR/pi-compact.md" ;;
 esac
 [ -f "$SNIPPET" ] || SNIPPET="$DOC_DIR/unknown.md"
 HOST_SNIPPET=
@@ -173,6 +187,7 @@ render_snippet() {  # [snippet]
     line=${line//__FM_X_MODE_ENV_SH__/$x_mode_env_sh}
     line=${line//__FM_X_MODE_ENV__/$x_mode_env}
     line=${line//__FM_GROK_ARM__/$grok_arm}
+    line=${line//__FM_HARNESS__/$HARNESS}
     printf '%s\n' "$line"
   done < "$snippet"
 }
