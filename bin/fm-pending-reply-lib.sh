@@ -1877,8 +1877,8 @@ fm_pending_reply_task_has_open() {  # <state-dir> <task_id>
 # reached) can never receive the correlated report that resolves it, so its
 # escalation decision stays open forever. fm_pending_reply_close_ghost is the
 # guarded operator close for exactly that case: it refuses without a reason,
-# refuses an already-resolved record, refuses while the endpoint is live, and
-# otherwise resolves the record via=ghost-close and closes the keyed decision
+# refuses an already-resolved record, refuses while the endpoint is live (or
+# unproven but showing life, see above), and otherwise resolves the record via=ghost-close and closes the keyed decision
 # through the one close path above, whose note is
 # fm_pending_reply_resolved_note (the reserved-key vocabulary the fold
 # accepts), with the operator's reason appended. Entry point:
@@ -1888,10 +1888,48 @@ fm_pending_reply_task_has_open() {  # <state-dir> <task_id>
 # `ssh -o BatchMode=yes -o ConnectTimeout=8 <host> true` reachability probe of
 # a remote secondmate's host (tests); it receives the host as $1 and exit 0
 # means reachable.
+#
+# A reachable host proves nothing about the mate: its herdr endpoint can be
+# gone while ssh answers. So a reachable remote host is followed by the same
+# recovery-grade endpoint state read the digest and fm-crew-state use
+# (fm-on.sh + fm-remote-secondmate-control.sh state), bounded by
+# FM_PENDING_REPLY_REMOTE_STATE_TIMEOUT seconds per read (default 25). The read
+# is replaceable by FM_PENDING_REPLY_REMOTE_STATE_PROBE (tests): it receives
+# the task id as $1 and prints the state word. alive is live; dead and
+# missing are a ghost; anything else (a timeout, an unreadable or ambiguous
+# answer) is neither proof of life nor of death, verdict unproven:<why>.
+#
+# An unproven endpoint closes only when the request can no longer expect an
+# answer: the task shows no sign of life after the request (no status line
+# stamped after it other than this library's own pending-reply lines, no
+# unhandled steering message), and either the request is older than
+# FM_PENDING_REPLY_GHOST_MIN_AGE_DAYS days (default 7; the close script's
+# --min-age-days overrides) after one inconclusive read, or the read stayed
+# inconclusive twice in a row. A proven-live endpoint is never closed.
 
-# Prints live | ghost:<why> for the endpoint of <task_id> recorded in <state-dir>.
-fm_pending_reply_endpoint_verdict() {  # <state-dir> <task_id>
-  local state=$1 task_id=$2 meta host backend target agent
+# One recovery-grade state read of a remote secondmate's endpoint; prints
+# alive | dead | missing, or unknown when the read was inconclusive.
+fm_pending_reply_remote_endpoint_state() {  # <state-dir> <task_id>
+  local task_id=$2 out secs=${FM_PENDING_REPLY_REMOTE_STATE_TIMEOUT:-25}
+  case "$secs" in ''|*[!0-9]*|0) secs=25 ;; esac
+  if [ -n "${FM_PENDING_REPLY_REMOTE_STATE_PROBE:-}" ]; then
+    out=$("$FM_PENDING_REPLY_REMOTE_STATE_PROBE" "$task_id" 2>/dev/null </dev/null) || out=
+  else
+    out=$(fm_run_timed "$secs" "$_FM_PENDING_REPLY_LIB_DIR/fm-on.sh" "$task_id" \
+      fm-remote-secondmate-control.sh state "$task_id" 2>/dev/null </dev/null) || out=
+  fi
+  out=$(printf '%s\n' "$out" | tail -1)
+  case "$out" in
+    alive|dead|missing) printf '%s' "$out" ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# Prints live | ghost:<why> | unproven:<why> for the endpoint of <task_id>
+# recorded in <state-dir>. <attempts> (default 2) is how many inconclusive
+# remote state reads in a row make a remote endpoint unproven.
+fm_pending_reply_endpoint_verdict() {  # <state-dir> <task_id> [attempts]
+  local state=$1 task_id=$2 attempts=${3:-2} meta host backend target agent reachable=0 n rstate=unknown
   meta="$state/$task_id.meta"
   if [ ! -f "$meta" ]; then
     printf 'ghost:no endpoint record (%s.meta) for this task' "$task_id"
@@ -1900,16 +1938,26 @@ fm_pending_reply_endpoint_verdict() {  # <state-dir> <task_id>
   host=$(fm_meta_get "$meta" remote_host)
   if [ -n "$host" ]; then
     if [ -n "${FM_PENDING_REPLY_REMOTE_PROBE:-}" ]; then
-      if "$FM_PENDING_REPLY_REMOTE_PROBE" "$host" >/dev/null 2>&1; then
-        printf 'live'
-      else
-        printf 'ghost:remote host %s is unreachable' "$host"
-      fi
+      if "$FM_PENDING_REPLY_REMOTE_PROBE" "$host" >/dev/null 2>&1; then reachable=1; fi
     elif ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" true >/dev/null 2>&1 </dev/null; then
-      printf 'live'
-    else
-      printf 'ghost:remote host %s is unreachable' "$host"
+      reachable=1
     fi
+    if [ "$reachable" != 1 ]; then
+      printf 'ghost:remote host %s is unreachable' "$host"
+      return 0
+    fi
+    case "$attempts" in ''|*[!0-9]*|0) attempts=2 ;; esac
+    n=0
+    while [ "$n" -lt "$attempts" ]; do
+      rstate=$(fm_pending_reply_remote_endpoint_state "$state" "$task_id")
+      [ "$rstate" = unknown ] || break
+      n=$((n + 1))
+    done
+    case "$rstate" in
+      alive) printf 'live' ;;
+      dead|missing) printf 'ghost:remote endpoint is %s on %s' "$rstate" "$host" ;;
+      *) printf 'unproven:remote endpoint state on %s was unreadable or timed out %s time(s) in a row' "$host" "$attempts" ;;
+    esac
     return 0
   fi
   backend=$(fm_backend_of_meta "$meta")
@@ -1921,10 +1969,38 @@ fm_pending_reply_endpoint_verdict() {  # <state-dir> <task_id>
   esac
 }
 
+# Whole days after which an unproven endpoint's unanswered request may be closed.
+fm_pending_reply_ghost_min_age_days() {  # [override]
+  local d=${1:-${FM_PENDING_REPLY_GHOST_MIN_AGE_DAYS:-7}}
+  case "$d" in ''|*[!0-9]*) d=7 ;; esac
+  printf '%s' "$d"
+}
+
+# 0 when the task shows a sign of life after the request was created: a status
+# line stamped after it that is not one of this library's own pending-reply
+# lines, or a steering message nobody handled yet.
+fm_pending_reply_task_shows_life() {  # <state-dir> <task_id> <created_epoch> <parent_status>
+  local state=$1 task_id=$2 created=$3 status=$4 line at
+  # shellcheck source=bin/fm-task-inbox-lib.sh
+  . "$_FM_PENDING_REPLY_LIB_DIR/fm-task-inbox-lib.sh"
+  if fm_task_inbox_oldest_unhandled "$state" "$task_id" >/dev/null; then
+    return 0
+  fi
+  case "$created" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$status" ] && [ -f "$status" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *"[key=pending-reply-"*) continue ;; esac
+    at=$(status_line_at_epoch "$line" 2>/dev/null) || continue
+    [ "$at" -gt "$created" ] && return 0
+  done < "$status"
+  return 1
+}
+
 # 0 closed (or already closed), 1 refused or failed; the reason is printed on
 # stderr. Serialized per correlation like every resolve and escalation.
-fm_pending_reply_close_ghost() {  # <state-dir> <corr_id> <reason>
-  local state=$1 corr=$2 reason=$3 rec phase task_id verdict key parent_status now still rc=0
+fm_pending_reply_close_ghost() {  # <state-dir> <corr_id> <reason> [min-age-days]
+  local state=$1 corr=$2 reason=$3 min_days created age_ok=0 attempts=2
+  local rec phase task_id verdict key parent_status now still rc=0
   local STATE FM_WAKE_QUEUE FM_WAKE_QUEUE_LOCK lock
   reason=$(printf '%s' "$reason" | tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037\177' | sed 's/^ *//; s/ *$//')
   if [ -z "$reason" ]; then
@@ -1944,14 +2020,29 @@ fm_pending_reply_close_ghost() {  # <state-dir> <corr_id> <reason>
   parent_status=$(fm_pending_reply_get "$rec" parent_status)
   key=$(fm_pending_reply_escalation_key "$corr")
   phase=$(fm_pending_reply_get "$rec" phase)
-  verdict=$(fm_pending_reply_endpoint_verdict "$state" "$task_id")
+  min_days=$(fm_pending_reply_ghost_min_age_days "${4:-}")
+  created=$(fm_pending_reply_get "$rec" created_epoch)
+  case "$created" in
+    ''|*[!0-9]*) ;;
+    *) [ $(( $(fm_pending_reply_now) - created )) -gt $(( min_days * 86400 )) ] && age_ok=1 ;;
+  esac
+  [ "$age_ok" != 1 ] || attempts=1
+  verdict=$(fm_pending_reply_endpoint_verdict "$state" "$task_id" "$attempts")
   case "$verdict" in
     ghost:*) ;;
+    unproven:*)
+      if fm_pending_reply_task_shows_life "$state" "$task_id" "$created" "$parent_status"; then
+        echo "error: refusing to close pending reply $corr: the endpoint of task '$task_id' is not proven dead and the task shows signs of life after the request (a later status line or an unhandled steering message); resend or wait instead" >&2
+        return 1
+      fi
+      ;;
     *)
       echo "error: refusing to close pending reply $corr: the endpoint of task '$task_id' is live and resolvable, so the request can still be answered; resend or wait instead" >&2
       return 1
       ;;
   esac
+  # shellcheck disable=SC2034 # read by bin/fm-pending-reply-close-ghost.sh for its report line
+  FM_PENDING_REPLY_CLOSE_VERDICT=$verdict
   STATE=$state
   lock="$state/.pending-reply-$corr.lock"
   # shellcheck source=bin/fm-wake-lib.sh

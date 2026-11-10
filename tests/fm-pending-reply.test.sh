@@ -2352,7 +2352,8 @@ RECORD
   printf 'window=remote:%s\nremote_host=pc-aux2\nkind=secondmate\n' "$task" > "$state/$task.meta"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/probe-up"; chmod +x "$dir/probe-up"
   printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/probe-down"; chmod +x "$dir/probe-down"
-  out=$(FM_HOME="$dir/home" FM_PENDING_REPLY_REMOTE_PROBE="$dir/probe-up" "$close" "$corr" --reason "retired" 2>&1); rc=$?
+  printf '#!/usr/bin/env bash\necho alive\n' > "$dir/state-alive"; chmod +x "$dir/state-alive"
+  out=$(FM_HOME="$dir/home" FM_PENDING_REPLY_REMOTE_PROBE="$dir/probe-up" FM_PENDING_REPLY_REMOTE_STATE_PROBE="$dir/state-alive" "$close" "$corr" --reason "retired" 2>&1); rc=$?
   expect_code 1 "$rc" "a live resolvable endpoint must be refused"
   assert_contains "$out" "live and resolvable" "the refusal should say why"
   [ "$(fm_pending_reply_get "$rec" phase)" = escalated ] || fail "a refused close must leave the record untouched"
@@ -2381,6 +2382,112 @@ RECORD
   expect_code 0 "$rc" "a task without endpoint metadata is a ghost: $out"
   [ -z "$(status_open_decisions "$state/$task.status")" ] || fail "the second decision should be closed too"
   pass "ghost close: needs a reason, refuses a live endpoint, closes retired and unreachable ones with the owned note"
+}
+
+# A remote host that answers ssh says nothing about the mate's own endpoint: the
+# close consults the endpoint state read, closes a dead or missing one, and
+# closes an unreadable one only for an old or twice-unreadable request that
+# shows no sign of life.
+test_ghost_close_remote_endpoint_state() {
+  local dir state corr rec out rc n=0 task=pc-aux2
+  dir="$TMP_ROOT/ghost-close-state"; mkdir -p "$dir"
+  state="$dir/home/state"; mkdir -p "$state/pending-replies"
+  local close="$ROOT/bin/fm-pending-reply-close-ghost.sh"
+  printf 'window=remote:%s\nremote_host=pc-aux\nkind=secondmate\n' "$task" > "$state/$task.meta"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/probe-up"; chmod +x "$dir/probe-up"
+  # The state read prints $dir/answers line N on call N (the last line repeats) and counts its calls.
+  cat > "$dir/state-probe" <<PROBE
+#!/usr/bin/env bash
+c=\$(cat "$dir/calls" 2>/dev/null || echo 0); c=\$((c + 1)); echo "\$c" > "$dir/calls"
+line=\$(sed -n "\${c}p" "$dir/answers"); [ -n "\$line" ] || line=\$(tail -1 "$dir/answers")
+[ "\$line" = hang ] && exit 1
+echo "\$line"
+PROBE
+  chmod +x "$dir/state-probe"
+  mk() {  # <created_epoch> -> prints a fresh escalated record's corr id
+    n=$((n + 1)); corr=$(printf '%016x' "$((0xabc0000000000000 + n))")
+    cat > "$state/pending-replies/$corr" <<RECORD
+schema=fm-pending-reply.v1
+corr_id=$corr
+task_id=$task
+parent_home=$dir/home
+parent_status=$state/$task.status
+request_summary=resume the proof
+created_epoch=$1
+delivered_epoch=$1
+phase=escalated
+escalated_epoch=$1
+recovery_delivery_outcome=failed
+grace_secs=120
+RECORD
+    printf 'blocked [key=pending-reply-%s] [at=%s]: pending-reply-recovery-delivery-failed: task=%s pending-reply-id=%s request=resume the proof\n' \
+      "$corr" "$1" "$task" "$corr" >> "$state/$task.status"
+  }
+  run() {  # <answers...> -- closes $corr with the probe answering them; sets out rc
+    printf '%s\n' "$@" > "$dir/answers"; rm -f "$dir/calls"
+    out=$(FM_HOME="$dir/home" FM_PENDING_REPLY_NOW=2000000 FM_PENDING_REPLY_REMOTE_PROBE="$dir/probe-up" \
+      FM_PENDING_REPLY_REMOTE_STATE_PROBE="$dir/state-probe" "$close" "$corr" --reason "mate endpoint gone" 2>&1); rc=$?
+  }
+  local young=1900000 old=1000000
+
+  mk $young; rec="$state/pending-replies/$corr"
+  run alive
+  expect_code 1 "$rc" "an endpoint that answers alive over a reachable host must be refused"
+  assert_contains "$out" "live and resolvable" "the refusal should say why"
+  [ "$(fm_pending_reply_get "$rec" phase)" = escalated ] || fail "a refused close must leave the record untouched"
+
+  # A reachable host with the endpoint confirmed missing is a ghost, however young the request.
+  run missing
+  expect_code 0 "$rc" "a confirmed missing endpoint on a reachable host should close: $out"
+  assert_contains "$out" "remote endpoint is missing on pc-aux" "the close should report why"
+  [ "$(fm_pending_reply_get "$rec" resolved_via)" = ghost-close ] || fail "the record should be ghost-closed"
+  mk $young; run dead
+  expect_code 0 "$rc" "a confirmed dead endpoint should close: $out"
+
+  # A young request with an endpoint that stays unreadable on two reads in a row closes ...
+  mk $young; rec="$state/pending-replies/$corr"
+  run hang
+  expect_code 0 "$rc" "two unreadable reads in a row should close a request with no sign of life: $out"
+  [ "$(cat "$dir/calls")" = 2 ] || fail "a young request should take two reads, got $(cat "$dir/calls")"
+  assert_contains "$out" "unproven" "the close should say the endpoint was unproven"
+  # ... but a single flaky read followed by a live answer must not.
+  mk $young; rec="$state/pending-replies/$corr"
+  run hang alive
+  expect_code 1 "$rc" "a flaky read followed by alive must be refused"
+  [ "$(fm_pending_reply_get "$rec" phase)" = escalated ] || fail "the refused record must stay open"
+
+  # An old request needs only one inconclusive read.
+  mk $old; rec="$state/pending-replies/$corr"
+  run hang
+  expect_code 0 "$rc" "an old request with an unreadable endpoint should close: $out"
+  [ "$(cat "$dir/calls")" = 1 ] || fail "an old request should take one read, got $(cat "$dir/calls")"
+  # The age threshold is explicit: a stricter --min-age-days takes the two-read path.
+  mk $old; printf 'hang\n' > "$dir/answers"; rm -f "$dir/calls"
+  out=$(FM_HOME="$dir/home" FM_PENDING_REPLY_NOW=2000000 FM_PENDING_REPLY_REMOTE_PROBE="$dir/probe-up" \
+    FM_PENDING_REPLY_REMOTE_STATE_PROBE="$dir/state-probe" "$close" "$corr" --reason "gone" --min-age-days 30 2>&1); rc=$?
+  expect_code 0 "$rc" "a request younger than --min-age-days still closes after two unreadable reads: $out"
+  [ "$(cat "$dir/calls")" = 2 ] || fail "--min-age-days 30 should have required two reads"
+
+  # Signs of life block an unproven close: a later status line from the mate, or an unhandled steer.
+  mk $old; rec="$state/pending-replies/$corr"
+  printf 'working [at=%s]: still busy on something\n' 1500000 >> "$state/$task.status"
+  run hang
+  expect_code 1 "$rc" "a later status line from the mate must block an unproven close"
+  assert_contains "$out" "signs of life" "the refusal should say why"
+  [ "$(fm_pending_reply_get "$rec" phase)" = escalated ] || fail "the refused record must stay open"
+  sed -i '/still busy/d' "$state/$task.status"
+  mkdir -p "$state/$task.inbox"; printf 'schema=fm-task-inbox.v1\n--\nhello\n' > "$state/$task.inbox/001.msg"
+  run hang
+  expect_code 1 "$rc" "an unhandled steering message must block an unproven close"
+  rm -rf "$state/$task.inbox"
+
+  # No reason: refused before any probe.
+  rm -f "$dir/calls"
+  out=$(FM_HOME="$dir/home" FM_PENDING_REPLY_NOW=2000000 FM_PENDING_REPLY_REMOTE_PROBE="$dir/probe-up" \
+    FM_PENDING_REPLY_REMOTE_STATE_PROBE="$dir/state-probe" "$close" "$corr" 2>&1); rc=$?
+  expect_code 1 "$rc" "no reason must be refused"
+  [ ! -f "$dir/calls" ] || fail "a refusal for a missing reason must not probe"
+  pass "ghost close: a reachable host is followed by the endpoint state; unproven endpoints close only when old or repeatedly unreadable and silent"
 }
 
 # An order that never reached its mate stays resendable until a later order to the same task
@@ -2556,6 +2663,7 @@ test_escalated_undelivered_correlation_stays_retryable
 test_same_kind_escalation_reopens_after_operator_close
 test_summary_keeps_accents_and_caps_by_character
 test_ghost_close_guards_and_closes
+test_ghost_close_remote_endpoint_state
 test_superseded_undelivered_order_is_closed_and_not_resent
 test_later_order_supersedes_at_send_and_in_the_tick
 test_archive_moves_only_old_settled_records
