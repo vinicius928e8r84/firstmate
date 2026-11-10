@@ -7747,6 +7747,11 @@ EOF
     keys="${keys}${key}
 "
     [ "$(watch_window_key "$endpoint")" = "$key" ] || fail "endpoint key was unstable"
+    # The key is v3. plus the endpoint's SHA-256 whichever tool derives it.
+    if command -v shasum >/dev/null 2>&1; then
+      [ "$key" = "v3.$(printf '%s' "$endpoint" | shasum -a 256 | cut -d' ' -f1)" ] \
+        || fail "endpoint key is not v3. plus the endpoint's SHA-256: $endpoint"
+    fi
   done
   pass "punctuation, percent escapes and Unicode have distinct stable filename keys"
 }

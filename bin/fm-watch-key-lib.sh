@@ -23,10 +23,13 @@
 # markers are outside this cleanup. Leaving obsolete files in place is safe.
 window_key() {  # <window>
   local digest
-  if command -v shasum >/dev/null 2>&1; then
-    digest=$(printf '%s' "$1" | shasum -a 256)
-  else
+  # sha256sum is a compiled binary; shasum is a Perl script that costs about
+  # three times as much per call, and the watcher derives a key many times per
+  # poll. Both print the same digest, so the key never depends on which ran.
+  if command -v sha256sum >/dev/null 2>&1; then
     digest=$(printf '%s' "$1" | sha256sum)
+  else
+    digest=$(printf '%s' "$1" | shasum -a 256)
   fi
   printf 'v3.%s' "${digest%% *}"
 }
