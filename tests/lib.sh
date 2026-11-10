@@ -123,6 +123,25 @@ pass() {
   printf 'ok - %s\n' "$1"
 }
 
+# fm_test_run <test-function>...
+# Print a TAP plan 1..N derived from the function names (N is $#), run each
+# function (each must emit exactly one `ok - ` line via pass), then print
+# FM_TEST_COMPLETE. Adding a test is adding a name to this call; N is not a
+# separately maintained numeral. The names given are the names run.
+fm_test_run() {
+  local name kind
+  [ "$#" -gt 0 ] || fail "fm_test_run: no tests registered"
+  printf '1..%s\n' "$#"
+  while [ "$#" -gt 0 ]; do
+    name=$1
+    shift
+    kind=$(type -t "$name" 2>/dev/null || true)
+    [ "$kind" = function ] || fail "fm_test_run: $name is not a function"
+    "$name"
+  done
+  printf 'FM_TEST_COMPLETE\n'
+}
+
 # Harness argument assertions reuse the emitted prefix rather than duplicating
 # its per-spawn env-file path. The dispatch suite executes it separately to prove
 # credential preservation, hooks-path selection and invalid-count refusal.
@@ -912,6 +931,16 @@ assert_grep() {
 # assert_no_grep <pattern> <file> <msg>: fixed-string grep must NOT match.
 assert_no_grep() {
   ! grep -F -- "$1" "$2" >/dev/null || fail "$3"
+}
+
+# assert_no_regex <pattern> <file> <msg>: extended-regex must NOT match.
+# assert_*_grep are fixed-string, so an anchored pattern given to them searches
+# for a literal caret and can never match - an absence assertion written that
+# way passes no matter what the file holds. Use this for any anchored absence.
+assert_no_regex() {
+  local status=0
+  grep -E -- "$1" "$2" >/dev/null || status=$?
+  [ "$status" -eq 1 ] || fail "$3 (grep status: $status)"
 }
 
 # assert_absent <path> <msg>: path must not exist.
