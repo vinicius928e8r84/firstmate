@@ -3128,6 +3128,7 @@ FM_WATCH_STALL_BACKOFF_BASE_SECS=60   # first wait between queue-stall rearm att
 FM_WATCH_STALL_BACKOFF_MAX_SECS=900   # cap on that wait
 FM_WATCH_STALL_ATTEMPT_LIMIT=5   # queue-stall rearm attempts per stall before the exhaustion alarm reaches main
 FM_WATCH_STALL_CHECK_MS=30000   # interval of the extension's queue-stall check
+FM_WATCH_LOCK_POLL_MS=2000   # Pi extension: interval of the check that arms the watcher once the session lock becomes this session's after a restart (docs/watcher-continuity.md "Arm when the session lock arrives"); 0 disables it
 FM_WATCHER_STALE_GRACE=300   # defaults to FM_GUARD_GRACE if set, else the poll-derived grace (docs/turnend-guard.md "Guard grace and the poll cadence"); seconds before a fresh arm refuses a live holder's stale beacon (attached arms: FM_WATCHER_STALL_BOUND)
 FM_WATCHER_STALL_BOUND=       # live-holder stall bound; default and arm/re-arm behavior: docs/turnend-guard.md "Guard grace and the poll cadence"
 FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals into one wake

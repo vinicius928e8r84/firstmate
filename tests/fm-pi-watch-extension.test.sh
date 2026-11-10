@@ -6978,6 +6978,89 @@ test_pi_aborted_or_errored_run_leaves_the_wake_unacknowledged
 test_pi_failing_inline_drain_falls_back_to_the_model_drain
 test_pi_slow_inline_drain_under_the_default_cap_stays_inline
 test_pi_timed_out_inline_drain_falls_back_and_leaves_no_orphan_ack_file
+# A restarted primary loads the extension before its first model turn takes the
+# session lock, so session_start finds the lock not yet ours. The extension must
+# arm once the lock becomes ours, without a model turn or the queue-stall rearm,
+# must never arm for a lock another live process holds, and must keep the old
+# behavior when FM_WATCH_LOCK_POLL_MS is 0.
+pi_lock_arrival_case() {  # <name> <lock-mode: ours|foreign> <poll-ms> -> prints the arm count after the wait
+  local name=$1 mode=$2 poll=$3 repo home plugin log foreign=
+  repo="$TMP_ROOT/pi-lock-arrival-$name-root"
+  home="$TMP_ROOT/pi-lock-arrival-$name-home"
+  log="$TMP_ROOT/pi-lock-arrival-$name.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=lock-arrival\n' "$$"
+trap 'exit 0' TERM INT
+while [ -e "$0" ]; do sleep 0.05; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  if [ "$mode" = foreign ]; then
+    sleep 60 &
+    foreign=$!
+  fi
+  PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_LOCK_MODE="$mode" \
+    FM_FOREIGN_PID="$foreign" FM_WATCH_LOCK_POLL_MS="$poll" FM_WATCH_STALL_REARM_SECS=0 node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  registerCommand() {},
+  registerTool() {},
+  sendUserMessage: async () => {},
+  events: { on() {}, emit() {} },
+};
+const arms = () => existsSync(process.env.FM_ARM_LOG)
+  ? readFileSync(process.env.FM_ARM_LOG, "utf8").split("\n").filter((row) => row.startsWith("arm=")).length
+  : 0;
+const lock = `${process.env.FM_HOME}/state/.lock`;
+// The previous session's lock is still on disk and its pid is dead.
+writeFileSync(lock, "999999\n");
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {});
+await new Promise((resolve) => setTimeout(resolve, 300));
+if (arms() !== 0) throw new Error("armed before the session lock was ours");
+// The first model turn runs the locked session-start command.
+writeFileSync(lock, `${process.env.FM_LOCK_MODE === "foreign" ? process.env.FM_FOREIGN_PID : process.pid}\n`);
+for (let i = 0; i < 40 && arms() === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+await new Promise((resolve) => setTimeout(resolve, 300));
+console.log(`arms=${arms()}`);
+process.exit(0);
+EOF
+  [ -z "$foreign" ] || kill "$foreign" 2>/dev/null || true
+}
+
+test_pi_arms_once_the_session_lock_becomes_ours() {
+  local out
+  out=$(pi_lock_arrival_case ours ours 100) || fail "Pi lock-arrival case failed: $out"
+  assert_contains "$out" "arms=1" "the extension must arm once the lock becomes ours, not wait for a model turn"
+  pass "Pi arms once the session lock becomes ours, without a model turn"
+}
+
+test_pi_never_arms_for_a_lock_another_session_holds() {
+  local out
+  out=$(pi_lock_arrival_case foreign foreign 100) || fail "Pi foreign-lock case failed: $out"
+  assert_contains "$out" "arms=0" "the extension must not arm for a lock another live process holds"
+  pass "Pi never arms for a session lock another live process holds"
+}
+
+test_pi_lock_arrival_arm_can_be_disabled() {
+  local out
+  out=$(pi_lock_arrival_case disabled ours 0) || fail "Pi disabled lock-arrival case failed: $out"
+  assert_contains "$out" "arms=0" "FM_WATCH_LOCK_POLL_MS=0 must keep the arm waiting for a model turn"
+  pass "FM_WATCH_LOCK_POLL_MS=0 keeps the previous arm-on-model-turn behavior"
+}
+
+test_pi_arms_once_the_session_lock_becomes_ours
+test_pi_never_arms_for_a_lock_another_session_holds
+test_pi_lock_arrival_arm_can_be_disabled
 test_pi_selfheal_request_restarts_an_exhausted_cycle_once
 test_pi_selfheal_request_is_refused_without_the_session_lock
 test_pi_ready_timeout_honors_the_arm_load_budget

@@ -188,6 +188,13 @@ After `FM_WATCH_STALL_ATTEMPT_LIMIT` attempts and one more backoff with the stal
 A drained queue or a fresh beacon ends the stall and resets the count.
 `tests/fm-pi-watch-extension.test.sh` pins both paths with an injected clock (`FM_WATCH_STALL_NOW`).
 
+### Arm when the session lock arrives
+
+A restarted primary loads the Pi extension before its first model turn runs the locked session-start command, so `session_start` finds the session lock not yet this session's and arms nothing.
+Until the lock is this session's, the extension reads it every `FM_WATCH_LOCK_POLL_MS` (2000, zero disables) and arms once through the same owner path as `fm_watch_arm_pi` when it becomes this session's, instead of waiting for a model turn or the queue-stall rearm.
+A lock held by another live session, a stopped or replaced generation, an arm child, a scheduled retry, a restore, or a self-heal already in flight ends the check without arming, and it gives up after 30 minutes.
+`tests/fm-pi-watch-extension.test.sh` pins the arrival, the foreign-lock refusal, and the disabled path.
+
 ### Claude handling successor
 
 Claude's Stop hook also starts one handling successor before notification.

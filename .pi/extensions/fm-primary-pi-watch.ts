@@ -204,6 +204,13 @@ const stallCheckMs = positiveInteger("FM_WATCH_STALL_CHECK_MS", 30000);
 const stallBackoffBaseSecs = positiveInteger("FM_WATCH_STALL_BACKOFF_BASE_SECS", 60);
 const stallBackoffMaxSecs = positiveInteger("FM_WATCH_STALL_BACKOFF_MAX_SECS", 900);
 const stallAttemptLimit = positiveInteger("FM_WATCH_STALL_ATTEMPT_LIMIT", 5);
+// A restarted primary loads this extension before its first model turn takes
+// the session lock, so session_start finds the lock not yet ours and arms
+// nothing. Until the lock becomes ours the extension checks for it this often
+// and arms once through the owner path instead of waiting for a model turn or
+// the queue-stall rearm. Zero disables the check; it gives up after the bound.
+const lockPollMs = nonNegativeInteger("FM_WATCH_LOCK_POLL_MS", 2000);
+const lockPollMaxMs = 30 * 60 * 1000;
 // 35s on Windows so the budget stays above arm's MSYS confirm default (30s in
 // bin/fm-watch-arm.sh): a slow but successful Git Bash cold start must not be
 // SIGTERMed mid-confirmation. Conditioned on win32 so other platforms keep 12s.
@@ -1702,10 +1709,34 @@ export default function (pi: ExtensionAPI) {
     await acknowledgeConsumedWakes();
   });
 
+  // Waits for this session to take the lock (see lockPollMs), arms once, and
+  // stops. A lock held by another live session, a replaced or stopped
+  // generation, or the bound also end it, so it never arms a second cycle.
+  function awaitLockThenArm(owner: SessionGeneration): void {
+    if (lockPollMs <= 0) return;
+    const deadline = Date.now() + lockPollMaxMs;
+    const timer = setInterval(() => {
+      if (!generationIsLive(owner) || owner !== generation || Date.now() >= deadline) {
+        clearInterval(timer);
+        return;
+      }
+      const ownership = lockOwnership();
+      if (ownership === "missing") return;
+      clearInterval(timer);
+      if (ownership !== "owned" || liveArmChild(owner) || owner.retryTimer || owner.restoring || owner.healing) return;
+      const result = activateOwnedWatch(owner);
+      appendExtensionLog(`lock acquired arm start=${result.ok ? `ok pid=${owner.child?.pid ?? "none"}` : "failed"}`);
+    }, lockPollMs);
+    timer.unref();
+  }
+
   pi.on?.("session_start", async () => {
     if (generation.stopping) generation = createGeneration();
     activateGeneration(generation);
-    if (lockOwnership() !== "owned") return;
+    if (lockOwnership() !== "owned") {
+      awaitLockThenArm(generation);
+      return;
+    }
     activateOwnedWatch(generation);
   });
   pi.on?.("session_shutdown", async (event) => {
