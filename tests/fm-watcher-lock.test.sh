@@ -25,6 +25,13 @@ LIB="$ROOT/bin/fm-wake-lib.sh"
 # an arm genuinely fails to exit; a passing case returns as soon as it does.
 ARM_FAIL_EXIT_POLLS=400
 
+# The arm stretches its confirmation window and backs off with the host load
+# (bin/fm-wake-lib.sh fm_arm_confirm_window), so pin an unloaded host: every case
+# below asserts the watcher and arm logic, not the contention of the machine
+# running it. A deadline-forced arm would otherwise outlive its short window on
+# a loaded host and wait on a child that is by then healthy.
+export FM_LOAD1_OVERRIDE=0
+
 TMP_ROOT=$(fm_test_tmproot fm-watcher-lock-tests)
 
 # Execute the actual disposable-checkout guard before any watcher can start.
