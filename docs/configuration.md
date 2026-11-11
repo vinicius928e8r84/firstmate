@@ -1879,6 +1879,22 @@ Its first priority is idle agents holding worker slots: finished lanes are close
 It also ends orphan agent and test processes of ended tasks, deletes branches contained in the default branch, frees clean treehouse worktrees, removes ended-task `/tmp` directories and dead pod logs, and removes clean fully pushed old clones outside `projects/`; the Mac sweep never leaves `/tmp` and its listed test folders.
 Machines come from `config/host-sweep.hosts` and extra dead-log globs from `config/host-sweep.conf`; the script header owns the format, every proof, the never-touch list, and the environment.
 
+The cleanup expansion adds leftovers of the fleet itself: Herdr terminals with no agent and no live task whose lone childless shell stayed idle for `--pane-idle-hours` (default 2; the proof and the close are `bin/fm-herdr-session-cleanup.sh --sweep-idle`), orphan test runs, orphan `lavish-axi` pollers, `chrome-devtools-axi` bridges of an ended task or idle with no connection, preview servers of an ended task or unused for `--preview-hours` (default 24), shared-Chrome tabs open `--chrome-hours` (default 12) with no client, and orphan files in `state/`.
+A finished agent is closed after `--idle-hours` (default 3).
+Every one of these rules is pid-proved and re-read right before it acts; none uses `pkill` or a name pattern.
+Items that only the owner may decide (branches with commits not in the default branch, dirty free worktrees, old `data/<id>` folders, old transcripts, big caches, tasks parked on a decision) are only listed as `ask`, never touched.
+The added rules are a simulation (`would`, marked `rules not armed`) even under `--apply` until `--armed` is given or `config/host-sweep.rules-armed` exists; deleting that file disarms them again, and everything older keeps its previous behaviour.
+`--pass light` (agents, processes, terminals, Chrome tabs, `state/`) and `--pass disk` (branches, worktree pool, `/tmp`, clones, the waiting list) split the work; `--pass full` is the default.
+A machine whose load average is above its core count runs only what frees memory: no teardown and no disk sweeps.
+The `pc` machine kind ends nothing but agent processes and Herdr terminals.
+`--notify` (with `--apply`) appends one line to the primary's inbox through `bin/fm-inbox.sh note` only when something was removed or an item waits for the owner; an empty round writes nothing and an unchanged waiting list is repeated at most once a day.
+Scheduling (cron, installed by the owner; remove the two lines to stop):
+
+```
+*/30 * * * * FM_HOME=$HOME/firstmate FM_SWEEP_MAC_SSH=fm-mac nice -n 19 timeout 1700 $HOME/firstmate/bin/fm-host-sweep.sh --apply --pass light --notify >> $HOME/firstmate/state/.host-sweep.cron.log 2>&1
+17 4 * * * FM_HOME=$HOME/firstmate FM_SWEEP_MAC_SSH=fm-mac nice -n 19 timeout 3000 $HOME/firstmate/bin/fm-host-sweep.sh --apply --pass disk --notify >> $HOME/firstmate/state/.host-sweep.cron.log 2>&1
+```
+
 **Missing or invalid rules**
 
 An absent rules file, a default-only file, or `rules: []` returns the non-clear reason `no rules to match` without a model or quota request, leaving firstmate's existing routing in control; an existing but unreadable or malformed rules file, including a broken symlink, remains an actionable exit 2 configuration error.

@@ -2,6 +2,19 @@
 # Retire stale restored-shell Herdr presentation children at locked session start.
 #
 # Usage: fm-herdr-session-cleanup.sh
+#        fm-herdr-session-cleanup.sh --sweep-idle [--apply] [--idle-hours N] [--meta-dir DIR]... [--session NAME]...
+#
+# The second form is the periodic idle-terminal sweep that bin/fm-host-sweep.sh runs (it needs no session lock, which the
+# session-start form above does). It reads its Herdr sessions from the herdr_session of every task record under each
+# --meta-dir (default this home's state/) plus HERDR_SESSION and --session, and prints one line per terminal:
+#   ITEM<TAB>panes<TAB>would|removed|kept|failed<TAB><session>:<pane><TAB>0<TAB><reason>
+# A terminal is closed only when ALL hold: no live task record names it (a secondmate's always counts as live), Herdr lists no agent in
+# it and fm_backend_herdr_pane_agent_state says no-agent, the session-start idle-shell proof (one lone childless shell, sleeping) passes,
+# it is neither the focused pane nor the last pane of its session, and it has been seen idle on every pass for --idle-hours (default 2):
+# the first sighting writes state/.sweep-idle-pane-<session>@<pane> (shell pid and start time), a pass that finds the shell busy or
+# replaced deletes it. The marker is the only thing a simulation writes. The close is the exact-pane focus-preserving helper; it is
+# confirmed gone before it is reported removed. Without --apply every closable terminal is reported `would`. Budget:
+# FM_HERDR_SWEEP_BUDGET seconds (default 90). FM_HERDR_SWEEP_NOW (epoch) stands in for the clock in tests.
 #
 # The caller must already own this Firstmate home's session lock. This script is
 # home-local and considers only the current named Herdr session and ordinary
@@ -435,7 +448,122 @@ fm_herdr_session_cleanup() {
   return 0
 }
 
+# ---- periodic idle-terminal sweep (header: --sweep-idle)
+fm_herdr_sweep_emit() { # <status> <object> <reason>
+  printf 'ITEM\tpanes\t%s\t%s\t0\t%s\n' "$1" "$2" "$3"
+}
+
+fm_herdr_sweep_collect() { # <meta-dir>... -> "<session>\t<pane>\t<live|ended>" per task record with a Herdr pane
+  local dir meta id kind last session pane
+  for dir in "$@"; do
+    for meta in "$dir"/*.meta; do
+      [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+      id=${meta##*/}; id=${id%.meta}
+      pane=$(sed -n 's/^herdr_pane_id=//p' "$meta" | tail -n 1)
+      session=$(sed -n 's/^herdr_session=//p' "$meta" | tail -n 1)
+      [ -n "$pane" ] || continue
+      kind=$(sed -n 's/^kind=//p' "$meta" | tail -n 1)
+      last=$(tail -n 1 "$dir/$id.status" 2>/dev/null | cut -d' ' -f1)
+      if [ "$kind" = secondmate ] || { [ "$last" != "done" ] && [ "$last" != "failed" ]; }; then
+        printf '%s\t%s\tlive\n' "${session:-default}" "$pane"
+      else
+        printf '%s\t%s\tended\n' "${session:-default}" "$pane"
+      fi
+    done
+  done
+}
+
+fm_herdr_sweep_session() { # <session> <apply> <idle-seconds> <records> <marker-dir> <now> <deadline>
+  local session=$1 apply=$2 limit=$3 records=$4 mdir=$5 now=$6 deadline=$7
+  local list rows count pane focused agent obj marker shell_pid started first seen_pid seen_start age live=''
+  list=$(fm_backend_herdr_cli "$session" pane list 2>/dev/null) || { fm_herdr_sweep_emit kept "$session" "pane list unreadable: nothing closed"; return 0; }
+  rows=$(printf '%s' "$list" | jq -er '.result.panes | select(type == "array") | .[]
+    | [.pane_id, (.focused // false | tostring), (.agent // "")] | @tsv' 2>/dev/null) || { fm_herdr_sweep_emit kept "$session" "pane list was unreadable: nothing closed"; return 0; }
+  count=$(printf '%s\n' "$rows" | grep -c .)
+  while IFS=$'\t' read -r pane focused agent; do
+    [ -n "$pane" ] || continue
+    case "$pane" in *[!A-Za-z0-9:_-]*) continue ;; esac
+    obj="$session:$pane"
+    marker="$mdir/.sweep-idle-pane-$session@${pane//:/_}"
+    live="$live $pane"
+    if printf '%s\n' "$records" | grep -qxF "$(printf '%s\t%s\tlive' "$session" "$pane")"; then
+      rm -f -- "$marker"; fm_herdr_sweep_emit kept "$obj" "pane of a live task"; continue
+    fi
+    if [ -n "$agent" ]; then rm -f -- "$marker"; fm_herdr_sweep_emit kept "$obj" "holds an agent ($agent)"; continue; fi
+    if [ "$SECONDS" -ge "$deadline" ]; then fm_herdr_sweep_emit kept "$obj" "time budget reached"; continue; fi
+    if [ "$(fm_backend_herdr_pane_agent_state "$session" "$pane")" != no-agent ] \
+      || ! shell_pid=$(fm_backend_herdr_pane_idle_shell_pid "$session" "$pane"); then
+      rm -f -- "$marker"; fm_herdr_sweep_emit kept "$obj" "not a provably idle childless shell without an agent"; continue
+    fi
+    started=$(ps -p "$shell_pid" -o lstart= 2>/dev/null | tr -s ' ')
+    seen_pid=; seen_start=; first=
+    if [ -f "$marker" ] && [ ! -L "$marker" ]; then
+      read -r first seen_pid seen_start < "$marker" 2>/dev/null || true
+    fi
+    if [ -z "$first" ] || [ "$seen_pid" != "$shell_pid" ] || [ "$seen_start" != "$started" ]; then
+      printf '%s %s %s\n' "$now" "$shell_pid" "$started" > "$marker"
+      fm_herdr_sweep_emit kept "$obj" "idle shell first seen now: needs $((limit / 3600)) h of consecutive passes"; continue
+    fi
+    age=$((now - first))
+    if [ "$age" -lt "$limit" ]; then fm_herdr_sweep_emit kept "$obj" "idle for $((age / 60)) min of $((limit / 60))"; continue; fi
+    if [ "$focused" = true ]; then fm_herdr_sweep_emit kept "$obj" "the focused pane"; continue; fi
+    if [ "$count" -le 1 ]; then fm_herdr_sweep_emit kept "$obj" "the last pane of the session"; continue; fi
+    if [ "$apply" != 1 ]; then
+      fm_herdr_sweep_emit would "$obj" "no agent, no live task, lone childless idle shell (pid $shell_pid) for $((age / 3600)) h"; continue
+    fi
+    if fm_backend_herdr_projection_close_pane_focus_preserving "$session" "$pane" no-agent \
+      && [ "$(fm_backend_herdr_pane_presence_state "$session" "$pane")" = dead ]; then
+      rm -f -- "$marker"; count=$((count - 1))
+      fm_herdr_sweep_emit removed "$obj" "no agent, no live task, lone childless idle shell (pid $shell_pid) for $((age / 3600)) h"
+    else
+      fm_herdr_sweep_emit failed "$obj" "close refused or not confirmed (focus-safe helper)"
+    fi
+  done <<< "$rows"
+  # markers of panes that no longer exist
+  for marker in "$mdir"/.sweep-idle-pane-"$session"@*; do
+    [ -f "$marker" ] || continue
+    pane=${marker##*@}
+    case " $live " in *" ${pane/_/:} "*) ;; *) rm -f -- "$marker" ;; esac
+  done
+  return 0
+}
+
+fm_herdr_idle_sweep() { # [--apply] [--idle-hours N] [--meta-dir DIR]... [--session NAME]...
+  local apply=0 hours=2 budget metas=() sessions=() records session now deadline s
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1 ;;
+      --idle-hours) shift; hours=${1:-2} ;;
+      --meta-dir) shift; metas+=("${1:?}") ;;
+      --session) shift; sessions+=("${1:?}") ;;
+      *) echo "usage: fm-herdr-session-cleanup.sh --sweep-idle [--apply] [--idle-hours N] [--meta-dir DIR]... [--session NAME]..." >&2; return 64 ;;
+    esac
+    shift
+  done
+  case "$hours" in ''|*[!0-9]*) hours=2 ;; esac
+  command -v herdr >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
+  [ "${#metas[@]}" -gt 0 ] || metas=("$STATE")
+  [ -d "${metas[0]}" ] || return 0
+  records=$(fm_herdr_sweep_collect "${metas[@]}")
+  [ -z "${HERDR_SESSION:-}" ] || sessions+=("$HERDR_SESSION")
+  while IFS=$'\t' read -r session _; do [ -z "$session" ] || sessions+=("$session"); done <<< "$records"
+  now=${FM_HERDR_SWEEP_NOW:-$(date +%s)}
+  budget=${FM_HERDR_SWEEP_BUDGET:-90}
+  case "$budget" in ''|*[!0-9]*) budget=90 ;; esac
+  deadline=$((SECONDS + budget))
+  for s in $(printf '%s\n' "${sessions[@]}" | awk 'NF && !seen[$0]++'); do
+    case "$s" in *[!A-Za-z0-9._-]*) continue ;; esac
+    fm_herdr_sweep_session "$s" "$apply" $((hours * 3600)) "$records" "${metas[0]}" "$now" "$deadline"
+  done
+  return 0
+}
+
 if [ "${FM_HERDR_SESSION_CLEANUP_SOURCE_ONLY:-0}" != 1 ]; then
+  if [ "${1:-}" = --sweep-idle ]; then
+    shift
+    fm_herdr_idle_sweep "$@"
+    exit $?
+  fi
   fm_herdr_session_cleanup
   exit 0
 fi

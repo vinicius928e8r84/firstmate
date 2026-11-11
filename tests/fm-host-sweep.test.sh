@@ -114,7 +114,7 @@ spawn_orphan() {  # dir pidfile
 spawn_orphan "$A/wt/l1" "$T/p-ended"; spawn_orphan "$A/wt/l3" "$T/p-live"
 mkdir -p "$A/wt/l1/Anki-profile"; cp "$(command -v sleep)" "$A/wt/l1/Anki-profile/node"
 spawn_orphan "$A/wt/l1/Anki-profile" "$T/p-anki"
-cleanup() { for f in "$T"/p-*; do [ -s "$f" ] && kill "$(cat "$f")" 2>/dev/null; done; pkill -f "$T/systemd" 2>/dev/null; git -C "$P" worktree remove --force "$T/checked-wt" 2>/dev/null; true; }
+cleanup() { for f in "$T"/p-*; do [ -s "$f" ] && kill "$(cat "$f")" 2>/dev/null; done; pkill -f "$T/systemd" 2>/dev/null; pkill -f "$T/holder" 2>/dev/null; git -C "$P" worktree remove --force "$T/checked-wt" 2>/dev/null; true; }
 trap cleanup EXIT
 sleep 0.5
 PPID_ENDED=$(ps -o ppid= -p "$(cat "$T/p-ended")" | tr -d ' ')
@@ -139,20 +139,54 @@ esac
 exec bash -c "$*"
 SH
 chmod +x "$FAKEBIN/ssh"
+# stand-ins for the socket table and the Chrome debugging endpoint: no clients unless $FAKE_SS_CLIENTS names a file
+cat > "$FAKEBIN/ss" <<'SH'
+#!/usr/bin/env bash
+[ -z "${FAKE_SS_CLIENTS:-}" ] || [ ! -f "$FAKE_SS_CLIENTS" ] || cat "$FAKE_SS_CLIENTS"
+exit 0
+SH
+cat > "$FAKEBIN/curl" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"/json/list"*) cat "${CDP_LIST:?}" ;;
+  *"-X PUT"*) echo "$*" >> "${CDP_LOG:?}" ;;
+esac
+SH
+chmod +x "$FAKEBIN/ss" "$FAKEBIN/curl"
+CDP_LIST=$T/cdp-list.json; CDP_LOG=$T/cdp.log; : > "$CDP_LOG"; : > "$CDP_LIST"; export CDP_LIST CDP_LOG
+# stand-ins for the socket table and the Chrome debugging endpoint: no clients unless $FAKE_SS_CLIENTS is a file
+cat > "$FAKEBIN/ss" <<'SH'
+#!/usr/bin/env bash
+[ -z "${FAKE_SS_CLIENTS:-}" ] || [ ! -f "$FAKE_SS_CLIENTS" ] || cat "$FAKE_SS_CLIENTS"
+exit 0
+SH
+cat > "$FAKEBIN/curl" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"/json/list"*) cat "${CDP_LIST:?}" ;;
+  *"-X PUT"*) echo "$*" >> "${CDP_LOG:?}" ;;
+esac
+SH
+chmod +x "$FAKEBIN/ss" "$FAKEBIN/curl"
+CDP_LIST=$T/cdp-list.json; CDP_LOG=$T/cdp.log; : > "$CDP_LOG"; export CDP_LIST CDP_LOG
 {
   printf '# name kind target root homes testdirs\n'
   printf 'alpha vps alpha-host %s %s\n' "$A/root" "$H"
   printf 'beta mac beta-host - - %s\n' "$B/tests"
+  printf 'gamma pc alpha-host %s %s\n' "$A/root" "$H"
   printf 'ghost vps down-host /x /y\n'
   printf 'nomac mac none - -\n'
 } > "$MAIN/config/host-sweep.hosts"
 
 run() {  # args...
-  env HOME="$T/home" PATH="$FAKEBIN:$PATH" WORLD_A="$A" WORLD_B="$B" CONTROL_LOG="$CONTROL_LOG" POOL="$POOL" POOL_LOG="$POOL_LOG" \
+  env HOME="$T/home" PATH="$FAKEBIN:$PATH" CDP_LIST="$CDP_LIST" CDP_LOG="$CDP_LOG" FAKE_SS_CLIENTS="${FAKE_SS_CLIENTS:-}" WORLD_A="$A" WORLD_B="$B" CONTROL_LOG="$CONTROL_LOG" POOL="$POOL" POOL_LOG="$POOL_LOG" \
     FM_HOME="$MAIN" FM_SWEEP_HOSTS="$MAIN/config/host-sweep.hosts" FM_SWEEP_SSH_TIMEOUT=5 \
-    bash "$TOOL" --proc-min-age 0 --pool-keep 1 --clone-days 5 ${VERBOSE:+--verbose} "$@" 2>"$T/err"
+    FM_SWEEP_LOAD="${LOAD:-0}" FM_SWEEP_CORES="${CORES:-64}" FM_SWEEP_PROC_SCOPE="$T/" FM_SWEEP_NOTIFY_CMD="$NOTIFY_STUB" \
+    bash "$TOOL" --proc-min-age 0 --test-min-age 0 --pool-keep 1 --clone-days 5 ${VERBOSE:+--verbose} "$@" 2>"$T/err"
 }
 LOG=$MAIN/data/sweep/removed.tsv
+NOTIFY_STUB=$T/notify-stub; NOTIFY_LOG=$T/notify.log; : > "$NOTIFY_LOG"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s"\n' "$NOTIFY_LOG" > "$NOTIFY_STUB"; chmod +x "$NOTIFY_STUB"
 
 # ======== 1. dry run
 OUT=$(run --dry-run); CODE=$?
@@ -233,5 +267,133 @@ assert_not_contains "$OUT" "alpha " "--host limits the sweep"
 run --idle-hours x >/dev/null; expect_code 64 "$?" "a non-number is a usage error"
 run --bogus >/dev/null; expect_code 64 "$?" "an unknown flag is a usage error"
 pass "host-sweep: usage"
+
+# ======== 5. the cleanup expansion: orphan test runs, preview servers, unlanded work listed, rules armed or not
+# A vitest run whose parent is gone, outside any task: ended only by an armed apply. A preview server inside an ended task's worktree.
+mkdir -p "$A/vt" "$A/wt/l1/srv"; cp "$(command -v bash)" "$A/vt/node"; cp "$(command -v bash)" "$A/wt/l1/srv/node"
+# (the stand-ins block on a fifo read inside bash itself: `-c "sleep"` would exec into sleep and lose the node name)
+mkfifo "$A/vt/fifo" "$A/wt/l1/srv/fifo"
+# shellcheck disable=SC2016  # the single-quoted script expands in the stand-in parent
+( cd "$A/vt" && setsid "$T/systemd" -c './node -c "read -r _ < fifo" vitest & echo $! > "$1"; wait' _ "$T/p-vitest" >/dev/null 2>&1 < /dev/null & )
+cp "$(command -v bash)" "$T/holder"   # a live parent: the older orphan rule must not be the one judging the preview
+# shellcheck disable=SC2016  # the single-quoted script expands in the stand-in parent
+( cd "$A/wt/l1/srv" && setsid "$T/holder" -c './node -c "read -r _ < fifo" servir.mjs 4999 & echo $! > "$1"; wait' _ "$T/p-preview" >/dev/null 2>&1 < /dev/null & )
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$T/p-vitest" ] && [ -s "$T/p-preview" ] && break; sleep 0.2; done
+sleep 0.5
+OUT=$(run --dry-run)
+assert_contains "$OUT" "would tests pid $(cat "$T/p-vitest")" "an orphan test run would be ended"
+assert_contains "$OUT" "would previews pid $(cat "$T/p-preview")" "a preview server of an ended task would be ended"
+assert_contains "$OUT" "branch:$P:fm/unlanded" "unlanded work is only listed"
+assert_not_contains "$OUT" "would branches $P:fm/unlanded" "unlanded work is never offered for removal"
+assert_contains "$OUT" "waiting for the owner's OK" "the report counts what waits for the owner"
+assert_contains "$OUT" "new rules not armed" "the report says the new rules are a simulation"
+alive "$T/p-vitest" || fail "a dry run ended the orphan test run"
+# apply without arming: still a simulation for the new rules
+OUT=$(run --apply)
+alive "$T/p-vitest" || fail "apply without --armed ended an orphan test run"
+alive "$T/p-preview" || fail "apply without --armed ended a preview server"
+assert_contains "$OUT" "rules not armed: simulation" "an unarmed apply says so on the item"
+# armed apply
+OUT=$(run --apply --armed)
+sleep 1
+alive "$T/p-vitest" && fail "armed apply left the orphan test run"
+alive "$T/p-preview" && fail "armed apply left the preview server of an ended task"
+alive "$T/p-live" || fail "armed apply ended a live task's process"
+alive "$T/p-anki" || fail "armed apply ended a protected process"
+has_branch fm/unlanded || fail "unlanded work was removed"
+assert_contains "$(cat "$LOG")" "orphan test run" "the armed removal is logged with its proof"
+# the config file arms it too, and deleting it disarms again
+touch "$MAIN/config/host-sweep.rules-armed"
+OUT=$(run --dry-run); assert_not_contains "$OUT" "new rules not armed" "config/host-sweep.rules-armed arms the rules"
+rm -f "$MAIN/config/host-sweep.rules-armed"
+OUT=$(run --dry-run); assert_contains "$OUT" "new rules not armed" "removing the file disarms them"
+pass "host-sweep: the added rules simulate until armed, then end only pid-proved leftovers"
+
+# ======== 6. passes and the load gate
+# (the earlier apply removed the old leftovers: put one back)
+mkdir -p "$A/tmp/fm-old1"; echo x > "$A/tmp/fm-old1/log"; old "$A/tmp/fm-old1" "$A/tmp/fm-old1/log"
+OUT=$(run --dry-run --pass light)
+assert_not_contains "$OUT" "would tmp $A/tmp/fm-old1" "the light pass does no disk sweep"
+assert_contains "$OUT" "would lanes $H:l1" "the light pass sweeps agents"
+OUT=$(run --dry-run --pass disk)
+assert_contains "$OUT" "would tmp $A/tmp/fm-old1 " "the disk pass sweeps /tmp"
+assert_not_contains "$OUT" "would lanes" "the disk pass leaves agents alone"
+run --pass bogus >/dev/null; expect_code 64 "$?" "an unknown pass is a usage error"
+OUT=$(LOAD=99 CORES=2 run --dry-run)
+assert_not_contains "$OUT" "would tmp $A/tmp/fm-old1" "above the core count no disk sweep runs"
+assert_not_contains "$OUT" "would lanes $H:l1" "above the core count no lane is closed (teardown frees disk, not memory)"
+assert_contains "$OUT" "would lanes $H:l2" "above the core count an idle finished agent is still exited"
+pass "host-sweep: light and disk passes, and the load gate"
+
+# ======== 7. leftovers in state/, and tabs of the shared Chrome
+ST=$H/state; hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
+KEY_GONE="v3.$(printf '%s' 'vps:gone' | sha256sum | cut -d' ' -f1)"; KEY_LIVE="v3.$(printf '%s' 'vps:w9' | sha256sum | cut -d' ' -f1)"
+echo 'window=vps:w9' >> "$H/state/l3.meta"
+echo h > "$ST/.hash-vps_w3_p2"; echo h > "$ST/.stale-$KEY_GONE"; echo h > "$ST/.hash-$KEY_LIVE"; echo h > "$ST/.count-vps_w4_p2"
+SEEN_OLD="$ST/.seen-procevent-$(hex 'procevent:lavish-0000:1')"; SEEN_QUEUED="$ST/.seen-procevent-$(hex 'procevent:lavish-1111:1')"
+echo x > "$SEEN_OLD"; echo x > "$SEEN_QUEUED"; echo '{"k":"procevent:lavish-1111:1"}' > "$ST/.wake-queue"
+echo x > "$ST/.claude-autoarm-epoch.tmp.123"; echo x > "$ST/fresh.tmp.9"
+old "$ST/.hash-vps_w3_p2" "$SEEN_OLD" "$SEEN_QUEUED" "$ST/.claude-autoarm-epoch.tmp.123"
+touch -d '5 days ago' "$ST/.stale-$KEY_GONE" "$ST/.hash-$KEY_LIVE"
+touch -d '30 days ago' "$SEEN_OLD" "$SEEN_QUEUED"
+run --apply --pass light >/dev/null
+assert_present "$ST/.hash-vps_w3_p2" "an unarmed apply keeps the state/ leftovers"
+OUT=$(run --apply --armed --pass light)
+assert_absent "$ST/.hash-vps_w3_p2" "a watcher marker of the retired key scheme goes"
+assert_absent "$ST/.stale-$KEY_GONE" "a v3 marker of a window no task names goes"
+assert_absent "$SEEN_OLD" "a dedup record whose key left the queue goes"
+assert_absent "$ST/.claude-autoarm-epoch.tmp.123" "an old temporary file goes"
+assert_present "$ST/.hash-$KEY_LIVE" "the marker of a window a task record names stays"
+assert_present "$ST/.count-vps_w4_p2" "a fresh marker stays"
+assert_present "$SEEN_QUEUED" "a dedup record whose key is still queued stays"
+assert_present "$ST/fresh.tmp.9" "a fresh temporary file stays"
+assert_present "$ST/l3.meta" "task records are never touched"
+
+# shared Chrome: a tab goes only after being seen on every pass for the window, with no client, never the last or an owner's page
+printf '[{"id":"AAA","type":"page","url":"https://a.example/","title":"a"},{"id":"BBB","type":"page","url":"https://b.example/","title":"Opera GX"},{"id":"CCC","type":"page","url":"https://c.example/","title":"c"}]' > "$CDP_LIST"
+export FM_SWEEP_CHROME_PORT=9222
+run --apply --armed --pass light >/dev/null
+assert_equals "" "$(cat "$CDP_LOG")" "a tab first seen is not closed"
+assert_present "$ST/.sweep-chrome-tab-9222-AAA" "its first sighting is recorded"
+echo $(( $(date +%s) - 13 * 3600 )) > "$ST/.sweep-chrome-tab-9222-AAA"; echo $(( $(date +%s) - 13 * 3600 )) > "$ST/.sweep-chrome-tab-9222-BBB"
+printf 'ESTAB 0 0 127.0.0.1:9222 127.0.0.1:55555\n' > "$T/ss-clients"
+OUT=$(FAKE_SS_CLIENTS="$T/ss-clients" run --apply --armed --pass light)
+assert_equals "" "$(cat "$CDP_LOG")" "a connected client keeps every tab"
+OUT=$(run --dry-run --pass light)
+assert_contains "$OUT" "would chrome tab AAA" "an old tab with no client would close"
+assert_not_contains "$OUT" "tab BBB" "an owner's page is not offered for closing"
+assert_equals "" "$(cat "$CDP_LOG")" "a simulation closes nothing"
+run --apply --pass light >/dev/null
+assert_equals "" "$(cat "$CDP_LOG")" "an unarmed apply closes no tab"
+run --apply --armed --pass light >/dev/null
+assert_equals 1 "$(grep -c . "$CDP_LOG")" "the armed apply closes exactly one tab"
+assert_contains "$(cat "$CDP_LOG")" "/json/close/AAA" "and it is the old idle one"
+pass "host-sweep: state/ leftovers and idle Chrome tabs, with their guards"
+
+# ======== 8. --notify: one line, only when something happened or waits
+: > "$NOTIFY_LOG"
+run --apply --armed --notify --host beta >/dev/null
+assert_equals "" "$(cat "$NOTIFY_LOG")" "an empty round notifies nobody"
+run --apply --pass disk --notify --host alpha >/dev/null
+assert_equals 1 "$(grep -c . "$NOTIFY_LOG")" "a round with items waiting writes exactly one line"
+assert_contains "$(cat "$NOTIFY_LOG")" "esperando seu OK" "the line says what waits for the owner"
+assert_contains "$(cat "$NOTIFY_LOG")" "limpei" "and what was cleaned"
+: > "$NOTIFY_LOG"
+run --apply --pass disk --notify --host alpha >/dev/null
+assert_equals "" "$(cat "$NOTIFY_LOG")" "an unchanged waiting list is not repeated within a day"
+pass "host-sweep: notifies once, only when something changed or waits"
+
+# ======== 9. the PC touches agent processes and terminals only
+mkdir -p "$A/tmp/fm-old1" "$HR/oldclone"; echo x > "$A/tmp/fm-old1/log"; echo c > "$HR/oldclone/f"; echo h > "$ST/.hash-vps_w7_p2"
+old "$A/tmp/fm-old1" "$A/tmp/fm-old1/log" "$ST/.hash-vps_w7_p2"
+OUT=$(run --apply --armed --host gamma)
+assert_present "$A/tmp/fm-old1" "the PC sweep leaves /tmp alone"
+assert_present "$ST/.hash-vps_w7_p2" "the PC sweep leaves state/ alone"
+assert_present "$HR/oldclone" "the PC sweep leaves clones alone"
+assert_not_contains "$OUT" "removed tmp" "nothing from the disk sweeps is removed on the PC"
+assert_not_contains "$OUT" "removed state" "no state/ file is removed on the PC"
+OUT=$(run --apply --armed --host alpha --pass disk)
+assert_absent "$A/tmp/fm-old1" "the same sweep on a vps does remove it"
+pass "host-sweep: the PC sweeps agent processes and terminals only"
 
 printf '# all fm-host-sweep tests passed\n'
