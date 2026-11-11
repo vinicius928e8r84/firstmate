@@ -445,6 +445,28 @@ fm_send_resolve_target() { # <raw-target>
   return 1
 }
 
+# A secondmate closed for lack of work (bin/fm-secondmate-sleep.sh) reopens
+# before any delivery to it; the fire-and-forget plane is a no-reply nudge and
+# never wakes one.
+fm_send_wake_sleeping_target() { # <raw-target> <args...>
+  local id=${1#fm-} a
+  shift
+  case "$id" in '' | *[!A-Za-z0-9._-]*) return 0 ;; esac
+  [ -e "$STATE/$id.asleep" ] || return 0
+  for a in "$@"; do
+    [ "$a" != --fire-and-forget ] && [ "${a#--fire-and-forget=}" = "$a" ] || return 0
+  done
+  # Housekeeping callers (bootstrap nudges, config rereads, restarts) set
+  # FM_SEND_NO_WAKE=1: a mate closed on purpose reads current files when it is
+  # reopened, so the message is skipped instead of opening it for nothing.
+  if [ "${FM_SEND_NO_WAKE:-0}" = 1 ]; then
+    echo "note: $id is asleep; housekeeping message skipped (it reads current files when reopened)" >&2
+    exit 0
+  fi
+  "$SCRIPT_DIR/fm-secondmate-sleep.sh" wake "$id" >&2
+}
+fm_send_wake_sleeping_target "$@" || exit 1
+
 RAW_TARGET=$1
 fm_send_resolve_target "$RAW_TARGET" || exit 1
 T=$RESOLVED_TARGET

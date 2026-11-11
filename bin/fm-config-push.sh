@@ -17,6 +17,8 @@
 # data/captain-shared.md-only updates send no new reread pointer.
 # Warnings-only skips exit 0; real propagation or reread-send errors exit non-zero.
 set -u
+# Housekeeping sends never reopen a secondmate closed on purpose (bin/fm-secondmate-sleep.sh).
+export FM_SEND_NO_WAKE=1
 
 usage() {
   cat <<'EOF'

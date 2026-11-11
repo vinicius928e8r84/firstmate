@@ -27,6 +27,10 @@
 #     already did).
 #   - The sweep is skipped entirely under FM_BOOTSTRAP_DETECT_ONLY=1 (the
 #     read-only session path), matching the other mutating sweeps.
+#   - A secondmate closed on purpose (state/<id>.asleep, bin/fm-secondmate-sleep.sh)
+#     is never relaunched by the sweep or the watcher tick; `sleep` refuses a mate
+#     that holds work, `wake` reopens it and clears the mark, the sleep sweep
+#     opens a sleeping mate that has work, and a send to it reopens it first.
 #   - The sweep is naturally scoped to the primary: with no kind=secondmate
 #     meta present (a secondmate's own state/ never holds one, since
 #     secondmates never spawn secondmates), it is a silent no-op.
@@ -869,6 +873,136 @@ SH
   pass "full probe: a hung remote host is deferred inside its own budget and a prompt host is unaffected"
 }
 
+
+# --- sleep: a secondmate closed on purpose --------------------------------
+
+run_sleep() {  # <fakebin> <home> <pane-cmd> <call-log> <args...> -> stdout+stderr; status in $?
+  local fb=$1 home=$2 cmd=$3 log=$4; shift 4
+  PATH="$fb:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$home" \
+    FM_TEST_PANE_CMD="$cmd" FM_TMUX_CALL_LOG="$log" \
+    "$ROOT/bin/fm-secondmate-sleep.sh" "$@" 2>&1
+}
+
+test_sweep_never_relaunches_a_sleeping_secondmate() {
+  local w fb tmuxfb log out
+  w=$(new_world sweep-asleep)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  date +%s > "$w/home/state/sm1.asleep"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log")
+
+  assert_not_contains "$out" "SECONDMATE_LIVENESS" "a mate closed on purpose must not be reported by the liveness sweep"
+  [ ! -s "$log" ] || fail "a mate closed on purpose must never be killed or relaunched: $(cat "$log")"
+  [ ! -e "$w/home/state/.secondmate-relaunch-sm1" ] || fail "a mate closed on purpose must leave no relaunch attempt: $(cat "$w/home/state/.secondmate-relaunch-sm1")"
+  pass "sweep: a secondmate marked asleep is left closed, with no kill, relaunch or ledger row"
+}
+
+test_sleep_closes_an_idle_mate_and_refuses_one_with_work() {
+  local w fb tmuxfb log out status
+  w=$(new_world sleep-close)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  printf '# Backlog\n\n## Queued\n- [ ] job-1 - a queued job (repo: p) (kind: ship) (since 2026-11-11)\n' > "$w/sm1/data/backlog.md"
+  out=$(run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" sleep sm1); status=$?
+  expect_code 3 "$status" "a mate with a queued job must be refused: $out"
+  assert_contains "$out" "open item" "the refusal must name the queued job"
+  assert_absent "$w/home/state/sm1.asleep" "a refused sleep left a mark"
+
+  printf '# Backlog\n\n## Queued\n' > "$w/sm1/data/backlog.md"
+  out=$(run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" sleep sm1); status=$?
+  expect_code 0 "$status" "an idle mate should close: $out"
+  assert_present "$w/home/state/sm1.asleep" "the sleeping mark was not written"
+  assert_contains "$(run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" status sm1)" "sm1 asleep" "status must report the mark"
+  [ ! -s "$log" ] || fail "closing a mate whose agent already stopped must not touch the endpoint: $(cat "$log")"
+  pass "sleep: closes an idle mate, refuses one that holds work, and writes only the mark"
+}
+
+test_sleep_refuses_a_live_mate_that_is_not_provably_idle() {
+  local w fb tmuxfb log out status
+  w=$(new_world sleep-live)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  out=$(run_sleep "$tmuxfb:$fb" "$w/home" claude "$log" sleep sm1); status=$?
+  expect_code 3 "$status" "a live mate with no idle proof must stay awake: $out"
+  assert_contains "$out" "not idle" "the refusal must say why"
+  assert_absent "$w/home/state/sm1.asleep" "a refused sleep left a mark"
+  [ ! -s "$log" ] || fail "a refused sleep must not touch the endpoint: $(cat "$log")"
+  pass "sleep: a live mate whose busy state is not idle is never closed"
+}
+
+test_wake_reopens_a_sleeping_mate_and_clears_the_mark() {
+  local w fb tmuxfb log out status
+  w=$(new_world wake-reopen)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  date +%s > "$w/home/state/sm1.asleep"
+
+  out=$(run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" wake sm1); status=$?
+  expect_code 0 "$status" "wake should reopen the mate: $out"
+  assert_contains "$(cat "$log")" "new-window" "wake must relaunch the endpoint"
+  assert_absent "$w/home/state/sm1.asleep" "wake left the mark behind"
+  case "$(tail -1 "$w/home/state/.secondmate-relaunch-sm1")" in
+    *rearmed*) ;;
+    *) fail "a deliberate wake must end with a rearmed row so it never counts toward the crash bound: $(cat "$w/home/state/.secondmate-relaunch-sm1")" ;;
+  esac
+  assert_contains "$(run_sleep "$tmuxfb:$fb" "$w/home" claude "$log" wake sm1)" "already awake" "a second wake is a no-op"
+  pass "wake: reopens a sleeping mate through the guarded relaunch and clears the mark"
+}
+
+test_sleep_sweep_opens_a_sleeping_mate_that_has_work_and_closes_idle_opted_in_mates() {
+  local w fb tmuxfb log out
+  w=$(new_world sleep-sweep)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  # Not opted in: nothing is slept.
+  run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" sweep >/dev/null
+  assert_absent "$w/home/state/sm1.asleep" "a mate that did not opt in was slept"
+
+  printf 'sm1\n' > "$w/home/config/secondmate-sleep"
+  run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" sweep >/dev/null
+  assert_present "$w/home/state/sm1.asleep" "an idle opted-in mate was not slept"
+  [ ! -s "$log" ] || fail "sleeping an already stopped mate must not touch the endpoint: $(cat "$log")"
+
+  # Work arrives while it sleeps: the sweep reopens it.
+  printf '# Backlog\n\n## Queued\n- [ ] job-2 - routed work (repo: p) (kind: ship) (since 2026-11-11)\n' > "$w/sm1/data/backlog.md"
+  run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" sweep >/dev/null
+  assert_absent "$w/home/state/sm1.asleep" "the sweep left a mate with work asleep"
+  assert_contains "$(cat "$log")" "new-window" "the sweep must relaunch a sleeping mate that has work"
+  pass "sleep sweep: only opted-in idle mates close, and a sleeping mate with work reopens"
+}
+
+test_send_reopens_a_sleeping_mate_first() {
+  local w fb tmuxfb log out status
+  w=$(new_world send-wakes)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  date +%s > "$w/home/state/sm1.asleep"
+
+  out=$(PATH="$tmuxfb:$fb:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$w/home" FM_TEST_PANE_CMD=zsh FM_TMUX_CALL_LOG="$log" \
+    "$ROOT/bin/fm-send.sh" sm1 "routed work for the mate" 2>&1); status=$?
+  assert_contains "$(cat "$log")" "new-window" "a send to a sleeping mate must reopen it first (status $status): $out"
+  assert_absent "$w/home/state/sm1.asleep" "the send left the mate marked asleep"
+
+  # A housekeeping send (bootstrap nudge, config reread) must not reopen it.
+  date +%s > "$w/home/state/sm1.asleep"; : > "$log"
+  out=$(FM_SEND_NO_WAKE=1 PATH="$tmuxfb:$fb:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$w/home" FM_TEST_PANE_CMD=zsh FM_TMUX_CALL_LOG="$log" \
+    "$ROOT/bin/fm-send.sh" sm1 "re-read your files" 2>&1); status=$?
+  expect_code 0 "$status" "a skipped housekeeping send is not an error: $out"
+  assert_present "$w/home/state/sm1.asleep" "a housekeeping send reopened a mate closed on purpose"
+  [ ! -s "$log" ] || fail "a housekeeping send touched the endpoint: $(cat "$log")"
+  pass "send: a message to a sleeping secondmate reopens it before delivery"
+}
+
 test_tmux_agent_state_classifies
 test_tmux_agent_state_rejects_malformed_targets_before_probe
 test_herdr_agent_state_preserves_husk_classifier
@@ -890,6 +1024,12 @@ test_sweep_noop_with_no_secondmate_meta
 test_sweep_skips_mate_whose_liveness_lock_is_held
 test_relaunch_waits_for_other_mates_relaunch_lock
 test_sweep_refuses_relaunch_on_ledger_errors
+test_sweep_never_relaunches_a_sleeping_secondmate
+test_sleep_closes_an_idle_mate_and_refuses_one_with_work
+test_sleep_refuses_a_live_mate_that_is_not_provably_idle
+test_wake_reopens_a_sleeping_mate_and_clears_the_mark
+test_sleep_sweep_opens_a_sleeping_mate_that_has_work_and_closes_idle_opted_in_mates
+test_send_reopens_a_sleeping_mate_first
 test_remote_poll_probe_maps_states
 test_remote_poll_probe_unreachable_preserves_route
 test_remote_full_probe_defers_a_hung_host_within_its_budget

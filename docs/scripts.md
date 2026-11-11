@@ -103,6 +103,8 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-pending-reply-close-ghost.sh` | Close a pending reply whose endpoint is retired or unresolvable, with a required reason; refuses a live endpoint |
 | `fm-decision-autoclose.sh` | Close OPEN DECISIONS whose task is gone or whose pending-reply destination is retired; never a live task's |
 | `fm-secondmate-report.sh` | Optional helper that resolves the parent channel itself and appends a correlated status or document-pointer report |
+| `fm-secondmate-sleep.sh` | Close a local secondmate that has no work and reopen it when work arrives (`sleep`, `wake`, `sweep`, `status`), so an idle mate holds no process or context |
+| `fm-repo-charter.sh` | Print the one-line charter or routing scope of the per-repo secondmate that owns one product repo's PR pipeline |
 | `fm-extension.mjs`       | Bind, inspect, verify, and strictly invoke trusted external process-event adapter packages |
 | `fm-extension-launch-barrier.mjs` | Publish one exact static core-owned invocation group before package code runs |
 | `fm-extension.sh`        | Expose extension binding commands through the tracked shell and remote-home command boundary |

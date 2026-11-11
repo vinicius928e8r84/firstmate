@@ -440,7 +440,7 @@ family_for_basename() {
     fm-pending-reply.test.sh|fm-pi-branch-extension.test.sh|\
     fm-procevent-extension-errors.test.sh|fm-procevent-quota.test.sh|fm-procevent-when.test.sh|fm-procevent.test.sh|\
     fm-live-gate.test.sh|\
-    fm-pr-merge-main.test.sh|fm-review-delta.test.sh|fm-review-rules.test.sh|\
+    fm-pr-merge-main.test.sh|fm-repo-charter.test.sh|fm-review-delta.test.sh|fm-review-rules.test.sh|\
     fm-project-origin.test.sh|fm-public-followup.test.sh|fm-quota-choose.test.sh|fm-scheduled-spawn.test.sh|\
     fm-remote-entrypoint.test.sh|fm-remote-secondmate-parent-binding.test.sh|\
     fm-send-remote-delivery.test.sh|fm-spawn-pool-base-freshen.test.sh|\
@@ -861,6 +861,7 @@ tests/fm-remote-secondmate-trace-context.test.sh 74870
 tests/fm-remote-transport-lanes.test.sh 66089
 tests/fm-request-log-retention.test.sh 7000
 tests/fm-review-delta.test.sh 4000
+tests/fm-repo-charter.test.sh 500
 tests/fm-review-rules.test.sh 500
 tests/fm-rovo-harness.test.sh 15691
 tests/fm-rovo-signals-live-e2e.test.sh 52

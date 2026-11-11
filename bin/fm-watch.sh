@@ -1065,6 +1065,8 @@ secondmate_wake_stall_tick() {
     task=${meta##*/}
     task=${task%.meta}
     case "$task" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+    # A mate closed on purpose (bin/fm-secondmate-sleep.sh) has no loop to stall.
+    [ ! -e "$STATE/$task.asleep" ] || continue
     home=$(fm_meta_get "$meta" home)
     [ -n "$home" ] || continue
     [ -f "$home/.fm-secondmate-home" ] && [ ! -L "$home/.fm-secondmate-home" ] || continue
@@ -1143,6 +1145,28 @@ EOF
     fm_wake_secondmate_stall_marker_write "$task" "$row_key" || return 1
     wake "$reason"
   done
+  return 0
+}
+
+# Secondmate sleep: closes opted-in mates that have no work and reopens a
+# sleeping mate that has some (bin/fm-secondmate-sleep.sh owns the contract and
+# config/secondmate-sleep the opt-in). Idle by default costs nothing here: with
+# no opt-in file and no marker the tick is one test. The sweep is bounded, its
+# outcome never wakes the supervisor (a closed mate is the intended state), and
+# a failure only lands in the triage log.
+SECONDMATE_SLEEP_SECS=${FM_SECONDMATE_SLEEP_SECS:-}
+case "$SECONDMATE_SLEEP_SECS" in ''|*[!0-9]*|0) SECONDMATE_SLEEP_SECS=300 ;; esac
+secondmate_sleep_tick() {
+  local tick_marker="$STATE/.secondmate-sleep-tick" marked='' m
+  for m in "$STATE"/*.asleep; do [ -e "$m" ] && marked=1; done
+  [ -n "$marked" ] || [ -e "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/secondmate-sleep" ] || return 0
+  [ "$(age_of "$tick_marker")" -ge "$SECONDMATE_SLEEP_SECS" ] || return 0
+  touch "$tick_marker" || return 0
+  fm_hold_active && return 0
+  fm_watcher_beat_touch "$STATE"
+  fm_run_timed "$SECONDMATE_LIVENESS_TIMEOUT" "$SCRIPT_DIR/fm-secondmate-sleep.sh" sweep >/dev/null 2>&1 \
+    || triage_log "secondmate sleep sweep did not finish cleanly"
+  fm_watcher_beat_touch "$STATE"
   return 0
 }
 
@@ -3884,6 +3908,8 @@ while :; do
     echo "watcher: secondmate liveness check failed" >&2
     exit 1
   }
+  fm_watcher_beat_touch "$STATE"
+  secondmate_sleep_tick
   fm_watcher_beat_touch "$STATE"
 
   # A live secondmate endpoint does not prove that its own wake loop is alive.

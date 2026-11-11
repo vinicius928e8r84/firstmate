@@ -67,6 +67,8 @@
 # unreached and every mate was still accounted for; 1 the input itself is
 # unusable; 2 invalid use.
 set -u
+# Housekeeping sends never reopen a secondmate closed on purpose (bin/fm-secondmate-sleep.sh).
+export FM_SEND_NO_WAKE=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"

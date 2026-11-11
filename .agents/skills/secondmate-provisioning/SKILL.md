@@ -156,6 +156,15 @@ Secondmate project lists may include `no-mistakes` and `direct-PR` projects only
 `local-only` projects stay with the main firstmate.
 For `no-mistakes` projects, seeding initializes only projects newly cloned into a secondmate home and refuses to mutate a preexisting clone that is not already initialized.
 
+## One secondmate per product repo, sleeping when idle
+
+A per-repo secondmate owns one repo's PR pipeline on the machine its workers run on, so it is a local route, never a remote one.
+Print its charter with `bin/fm-repo-charter.sh <project> [--merge-script <path>] [--rule-file <file>]` and seed it with `FM_SECONDMATE_CHARTER` and `FM_SECONDMATE_SCOPE` set from that output, so no repo reuses another repo's text; the script header owns the options and the seed command.
+Seeding writes the route and leaves the mate unlaunched, which is the ready-to-switch-on state; launching it is a separate `bin/fm-spawn.sh <id> --secondmate`.
+List its id in `config/secondmate-sleep` so it closes while it has no work, and give it a compaction point with a `secondmate <cap> <model> <window>` line in `config/worker-context-cap`; [`docs/configuration.md` "Secondmate sleep"](../../../docs/configuration.md#secondmate-sleep-configsecondmate-sleep) owns both.
+A mate closed on purpose carries `state/<id>.asleep`: liveness recovery leaves it closed, and `bin/fm-send.sh` or `bin/fm-secondmate-sleep.sh wake <id>` reopens it.
+Retiring the mate, as below, undoes the whole route.
+
 ## Record intake for an existing or inherited domain
 
 Classify the domain before seeding, because this step applies to only one of the two cases.

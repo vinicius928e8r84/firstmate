@@ -252,6 +252,27 @@ A worktree that already has its own `.pi/settings.json` keeps it, and cleanup an
 The script header of `bin/fm-worker-context-cap.sh` owns the arithmetic and the settings it writes.
 Project settings load only for a trusted worktree, which is the same trust the worker's launch already needs.
 
+A persistent secondmate's compaction point uses the same file, keyed by the secondmate id or by the shared word `secondmate` instead of a project name (its own id wins):
+
+```
+# <project-or-secondmate> <cap-tokens> <model-id> <window-tokens>
+secondmate 150000 claude-sonnet-5-5 1000000
+```
+
+`bin/fm-spawn.sh --secondmate` then writes the same git-excluded, marker-carrying `.pi/settings.json` into the secondmate home, and rewrites it on a later launch only while the file still carries that secondmate's own marker.
+A home with its own settings file keeps it.
+
+## Secondmate sleep (config/secondmate-sleep)
+
+An idle secondmate still costs tokens: every notice wakes the model with its whole context.
+Gitignored `config/secondmate-sleep` lists, one id per line (`*` for every local secondmate, `#` starts a comment), the secondmates that close while they have no work and reopen when work arrives; an absent file sleeps none.
+`bin/fm-secondmate-sleep.sh` owns the contract: `sleep <id>` closes a local mate only when it provably has no work (no crewmate record in its home, no open backlog item, no unresolved parent request, no inbox message, a recorded idle busy state, and `FM_SECONDMATE_SLEEP_IDLE_SECS` of quiet), then writes `state/<id>.asleep`.
+While that mark exists and the endpoint is dead or gone, neither the session-start sweep nor the watcher's liveness tick relaunches the mate, and the wake-stall check skips it.
+`wake <id>` reopens it through the guarded relaunch, or through the first launch for a seeded mate that never ran, and clears the mark.
+`bin/fm-send.sh` wakes a marked mate before any delivery except the no-reply fire-and-forget plane, so a steer or a backlog handoff is enough to reopen it, and the watcher runs `sweep` every `FM_SECONDMATE_SLEEP_SECS` (default 300) as the backstop for work that arrived without a send.
+Remote secondmates never sleep.
+To undo, delete the file, run `bin/fm-secondmate-sleep.sh wake <id>` for any mate still marked, or retire the mate.
+
 ## Primary skill loading (config/skill-shortcuts / FM_SKILL_ONCE)
 
 A `/skill:<name>` command makes Pi paste the whole skill into the conversation, and every later request rereads it until the next compaction.

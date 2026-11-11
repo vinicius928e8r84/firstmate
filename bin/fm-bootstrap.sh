@@ -169,6 +169,8 @@
 #          version cannot be read, or it is below LAVISH_AXI_BOARD_MIN, printing
 #          nothing.
 set -u
+# Housekeeping sends never reopen a secondmate closed on purpose (bin/fm-secondmate-sleep.sh).
+export FM_SEND_NO_WAKE=1
 
 TYPESAFE_API_KEY_PRIVATE=${TYPESAFE_API_KEY:-}
 export -n TYPESAFE_API_KEY_PRIVATE 2>/dev/null || true

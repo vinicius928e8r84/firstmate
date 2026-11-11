@@ -164,6 +164,12 @@ fm_sm_live_remote() {  # <id> <fm-command> [args...]
 # `silent` means the meta records no endpoint at all - that shape is owned by
 # secondmate-provisioning recovery, not liveness.
 #
+# `asleep` means state/<id>.asleep marks the mate as closed on purpose
+# (bin/fm-secondmate-sleep.sh) and its endpoint is dead or gone: it is never
+# relaunchable, so neither caller revives it. FM_SM_LIVE_IGNORE_ASLEEP=1 lets
+# the sleep script itself read the raw verdict. A mate that is alive despite
+# the mark probes as alive.
+#
 # The caller must hold fm_secondmate_liveness_lock for <id> whenever a
 # relaunchable verdict could be acted on.
 fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
@@ -273,6 +279,14 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
       ;;
   esac
   FM_SM_LIVE_STATE=$agent_state
+  if [ "${FM_SM_LIVE_IGNORE_ASLEEP:-0}" != 1 ] && [ -e "$STATE/$id.asleep" ]; then
+    case "$agent_state" in
+      dead | missing)
+        FM_SM_LIVE_STATUS=asleep
+        return 0
+        ;;
+    esac
+  fi
   case "$agent_state" in
     alive)
       FM_SM_LIVE_STATUS=alive
