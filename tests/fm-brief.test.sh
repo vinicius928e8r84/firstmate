@@ -1104,7 +1104,7 @@ test_scout_and_secondmate_load_decision_hold_policy() {
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_SECONDMATE_CHARTER='sample reviews' \
     "$ROOT/bin/fm-brief.sh" sample-mate --secondmate --no-projects >/dev/null 2>&1
   charter="$home/data/sample-mate/brief.md"
-  assert_grep "load \`captain-hold-lifecycle\`" "$charter" \
+  assert_grep "$ROOT/.agents/skills/captain-hold-lifecycle/SKILL.md" "$charter" \
     "secondmate charter did not load the shared captain-call policy for detailed investigations"
   pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
 }
