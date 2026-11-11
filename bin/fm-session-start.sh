@@ -205,6 +205,13 @@
 #     harness, which delivers the digest as its own message and marks a cut;
 #     the re-emit header and the read-once contract are one paragraph each; and
 #     a Pi-family re-emit's NEXT STEP is one line.
+#   FM_SESSION_START_LEARNINGS_VIEW - after a compaction (a re-emit that is not a
+#     /clear), data/learnings.md prints one capped line per item and names the
+#     file for the full text; the first start of a session, a /clear, and a bare
+#     read keep the full file. The compaction summary and the system prompt carry
+#     what the learnings taught, the file keeps the detail, and this digest is
+#     reread by every later request. The captain preference files, the held
+#     backlog rows, and every open decision stay whole.
 # A memory budget overrun (bin/fm-startup-memory-budget.sh report) adds one
 # STARTUP_MEMORY line to the bootstrap section while it lasts.
 #
@@ -455,6 +462,10 @@ view_of BACKLOG_VIEW "${FM_SESSION_START_BACKLOG_VIEW:-}"
 view_of SECONDMATES_VIEW "${FM_SESSION_START_SECONDMATES_VIEW:-}"
 view_of SUPERVISION_VIEW "${FM_SESSION_START_SUPERVISION_VIEW:-}"
 view_of FRAME_VIEW "${FM_SESSION_START_FRAME_VIEW:-}"
+view_of LEARNINGS_VIEW "${FM_SESSION_START_LEARNINGS_VIEW:-}"
+# Only a compaction has a summary to lean on: a first start and a /clear keep the full file.
+{ [ "$REEMIT" -eq 1 ] && [ "$SESSION_SOURCE" != clear ]; } || LEARNINGS_VIEW=full
+LEARNINGS_LINE_CAP=160
 PI_FAMILY=0
 case "$PRIMARY_HARNESS" in pi|pi-signed) PI_FAMILY=1 ;; esac
 # One per-task endpoint read may never outlive this bound: a hung backend CLI
@@ -509,6 +520,24 @@ print_secondmates_compact() {
       fm_cap_line "$line" 140
     fi
   done < "$path"
+}
+
+# print_learnings_compact <path>: one line per non-blank line of the file, headings
+# and comments included, each capped by the shared line cap. The full text stays
+# in the file, named in the label, so nothing is dropped without a pointer.
+print_learnings_compact() {
+  local path=$1 line items=0 cut=0
+  subsection "data/learnings.md - one capped line per item (full text: $path - open it before acting on a topic named here)"
+  [ -f "$path" ] || { printf 'ABSENT\n'; return 0; }
+  [ -s "$path" ] || { printf '(present, empty)\n'; return 0; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *[![:space:]]*) ;; *) continue ;; esac
+    items=$((items + 1))
+    fm_cap_line_var "$line" "$LEARNINGS_LINE_CAP"
+    [ "$FM_LINE_CAP_LINE" = "$line" ] || cut=$((cut + 1))
+    printf '%s\n' "$FM_LINE_CAP_LINE"
+  done < "$path"
+  printf '(%s line(s), %s cut at %s characters)\n' "$items" "$cut" "$LEARNINGS_LINE_CAP"
 }
 
 print_backlog_pointer() {
@@ -1251,6 +1280,10 @@ Go to a source directly only when:
 EOF
 fi
 
+if [ "$LEARNINGS_VIEW" = compact ]; then
+  printf 'data/learnings.md is printed as one capped line per item after this compaction; open the file for an item'"'"'s full text.\n'
+fi
+
 # --- 6. fleet-state digest ---------------------------------------------
 # Before CONTEXT: see this file's ORDERING note. Live fleet identity is what a
 # truncated tail must never take.
@@ -1431,7 +1464,11 @@ else
 fi
 print_file_or_absent "$DATA/captain.md" "data/captain.md"
 print_file_or_absent "$DATA/captain-shared.md" "data/captain-shared.md (shared, main-authoritative, read-only in secondmate homes)"
-print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
+if [ "$LEARNINGS_VIEW" = compact ]; then
+  print_learnings_compact "$DATA/learnings.md"
+else
+  print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
+fi
 
 # --- 9. closing reminder -----------------------------------------------
 stage next-step

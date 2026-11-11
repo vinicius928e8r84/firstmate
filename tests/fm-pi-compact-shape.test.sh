@@ -31,7 +31,7 @@ install_stub_fixture() {
 // summarizer does, then answers globalThis.stubSummary or throws globalThis.stubError.
 export async function compact(preparation, model, apiKey, headers, customInstructions, signal, thinkingLevel, streamFn) {
   globalThis.compactCalls.push({ preparation, model, customInstructions, signal, streamFn });
-  if (streamFn) await streamFn(model, { messages: [] }, { cacheRetention: "none" });
+  if (streamFn) await streamFn(model, { messages: [] }, { cacheRetention: "none", ...globalThis.stubStreamOptions });
   if (globalThis.stubError) throw new Error(globalThis.stubError);
   return { summary: globalThis.stubSummary, firstKeptEntryId: preparation.firstKeptEntryId, tokensBefore: preparation.tokensBefore };
 }
@@ -190,6 +190,26 @@ test_the_summary_request_goes_through_the_model_registry() {
   pass "the summary request goes through the model registry's provider stream"
 }
 
+test_the_summary_request_asks_for_no_prompt_cache() {
+  local out
+  out=$(run_case nocache "$STUB_REPO" '
+    await run();
+    const env = streams[0].options?.env;
+    if (env?.DISABLE_PROMPT_CACHING !== "1") throw new Error(`the summary request still allows the provider prompt cache: ${JSON.stringify(env)}`);
+    globalThis.stubStreamOptions = { env: { KEEP_ME: "yes" } };
+    await run();
+    const kept = streams[1].options?.env;
+    if (kept?.KEEP_ME !== "yes" || kept?.DISABLE_PROMPT_CACHING !== "1") throw new Error(`the caller env was not merged: ${JSON.stringify(kept)}`);
+  ')
+  expect_ok "no cache" "$out"
+  out=$(run_case cache-back "$STUB_REPO" '
+    await run();
+    if (streams[0].options?.env?.DISABLE_PROMPT_CACHING !== undefined) throw new Error("FM_COMPACT_SUMMARY_CACHE=1 still disabled the prompt cache");
+  ' FM_COMPACT_SUMMARY_CACHE=1)
+  expect_ok "cache back" "$out"
+  pass "the summary request disables the provider prompt cache, keeps the caller's env, and FM_COMPACT_SUMMARY_CACHE=1 restores the default"
+}
+
 test_the_summary_is_capped_least_needed_sections_first() {
   local out
   out=$(run_case cap "$STUB_REPO" '
@@ -310,6 +330,7 @@ test_pi_compact_builds_the_shaped_request() {
 
 test_the_summarizer_gets_a_shaped_copy_and_the_checkpoint_rules
 test_the_summary_request_goes_through_the_model_registry
+test_the_summary_request_asks_for_no_prompt_cache
 test_the_summary_is_capped_least_needed_sections_first
 test_a_failure_leaves_pi_default_compaction
 test_only_the_lock_owner_shapes_and_the_bridge_needs_the_switch

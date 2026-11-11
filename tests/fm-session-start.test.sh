@@ -3541,6 +3541,52 @@ EOF
   pass "a Pi re-emit prints the compact frame and supervision block, and each switch restores its long form"
 }
 
+# After a compaction the summary and the system prompt carry what the learnings
+# taught, so data/learnings.md prints one capped line per item there; a first
+# start, a /clear and the switch keep the whole file, and the captain's files stay whole.
+test_learnings_print_one_capped_line_per_item_after_a_compaction() {
+  local rec root home fakebin out full compact learnings tail_text
+  rec=$(new_world compact-learnings)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_harness "$fakebin" pi
+  tail_text='THE-LONG-TAIL-OF-THE-LEARNING'
+  {
+    printf '%s\n' '# Fleet learnings' '' '- short rule: never SIGSTOP flock holders.' ''
+    printf -- '- 2026-10-20 incident: %s %s\n' "$(printf 'detail %.0s' $(seq 1 60))" "$tail_text"
+  } > "$home/data/learnings.md"
+  printf '%s\n' "- captain preference kept whole: $(printf 'standing order %.0s' $(seq 1 30)) END-OF-CAPTAIN-LINE" > "$home/data/captain.md"
+
+  full=$(FM_FAKE_HARNESS=pi run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --source startup)
+  assert_contains "$full" "$tail_text" "a first start did not print the whole learnings file"
+  assert_not_contains "$full" "one capped line per item" "a first start used the compact learnings view"
+
+  compact=$(FM_FAKE_HARNESS=pi run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --reemit --source compact)
+  learnings=$(printf '%s\n' "$compact" | awk '/^data\/learnings\.md - one capped line/ { flag = 1 } /^NEXT STEP$/ { flag = 0 } flag')
+  assert_contains "$learnings" "(full text: $home/data/learnings.md - open it before acting on a topic named here)" \
+    "the compact learnings lost its pointer to the file"
+  assert_contains "$learnings" "# Fleet learnings" "the compact learnings dropped a heading"
+  assert_contains "$learnings" "- short rule: never SIGSTOP flock holders." "a short item did not print whole"
+  assert_contains "$learnings" "- 2026-10-20 incident: detail detail" "a long item lost its start"
+  assert_contains "$learnings" " [truncated]" "a long item was not cut with the shared marker"
+  assert_not_contains "$compact" "$tail_text" "the compact learnings still printed a long item's tail"
+  assert_contains "$learnings" "(3 line(s), 1 cut at 160 characters)" "the compact learnings did not count its lines"
+  assert_contains "$compact" "data/learnings.md is printed as one capped line per item after this compaction" \
+    "the read-once contract did not say learnings are an index now"
+  assert_contains "$compact" "END-OF-CAPTAIN-LINE" "the compact re-emit cut the captain's preferences"
+  [ "${#compact}" -lt "${#full}" ] || fail "the compact re-emit is not smaller than the first start"
+
+  out=$(FM_FAKE_HARNESS=pi run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --reemit --source clear)
+  assert_contains "$out" "$tail_text" "a /clear re-emit, which has no summary, did not print the whole learnings file"
+  out=$(FM_SESSION_START_LEARNINGS_VIEW=full FM_FAKE_HARNESS=pi run_pi_session_start "$home" "$root" "$fakebin:$BASE_PATH" --reemit --source compact)
+  assert_contains "$out" "$tail_text" "FM_SESSION_START_LEARNINGS_VIEW=full did not restore the whole file"
+  assert_not_contains "$out" "one capped line per item" "the restored learnings kept the compact label"
+
+  pass "after a compaction data/learnings.md prints one capped line per item; a first start, a /clear and the switch keep the whole file"
+}
+
 test_startup_memory_line_only_while_over_budget() {
   local rec root home fakebin out total
   rec=$(new_world memory-budget-line)
@@ -3663,6 +3709,7 @@ test_compact_task_line_names_identity_liveness_and_newest_event
 test_compact_backlog_shortens_rows_and_counts_ready
 test_compact_secondmates_print_one_line_per_route
 test_pi_reemit_frame_and_supervision_block_are_compact
+test_learnings_print_one_capped_line_per_item_after_a_compaction
 test_startup_memory_line_only_while_over_budget
 test_digest_drain_does_not_repeat_its_drain_instruction
 

@@ -26,6 +26,12 @@
 // trimming its least-needed sections first. Any failure returns nothing, so Pi runs
 // its default compaction on the untouched preparation.
 //
+// The summary request is a one-off that nothing rereads, so it asks the provider for
+// no prompt cache (DISABLE_PROMPT_CACHING in the stream's provider env, which the
+// Claude bridge hands to its isolated Claude Code process): the input is billed once
+// at the plain input rate instead of as a one-hour cache write. FM_COMPACT_SUMMARY_CACHE=1
+// gives the provider's own default back.
+//
 // FM_COMPACT_SHAPE=0 turns this off and FM_COMPACT_SHAPE=1 turns it on. Unset, it is
 // on except for a claude-bridge model: bridge releases before 0.9.3 summarize in
 // their own session_before_compact hook, which runs before any project extension,
@@ -50,6 +56,10 @@ const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root;
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 
 export const SUMMARY_LIMIT_BYTES = 8000;
+
+export function summaryEnv(flag: string | undefined, env: Record<string, string> | undefined): Record<string, string> | undefined {
+  return flag === "1" ? env : { ...env, DISABLE_PROMPT_CACHING: "1" };
+}
 
 // The summarizer's instructions, appended by Pi after its own format as "Additional focus".
 export const CHECKPOINT_RULES = [
@@ -324,7 +334,10 @@ export default function (pi: ExtensionAPI) {
       // The registry's stream is the same class as the one StreamFn names; the cast
       // only bridges the two package copies a consumer install can resolve them from.
       const streamFn: StreamFn = (requestModel, context, options) =>
-        ctx.modelRegistry.streamSimple(requestModel, context, options) as unknown as ReturnType<StreamFn>;
+        ctx.modelRegistry.streamSimple(requestModel, context, {
+          ...options,
+          env: summaryEnv(process.env.FM_COMPACT_SUMMARY_CACHE, options?.env),
+        }) as unknown as ReturnType<StreamFn>;
       const result = await compact(
         shapePreparation(event.preparation),
         model,
