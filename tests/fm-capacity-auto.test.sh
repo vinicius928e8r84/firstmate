@@ -199,6 +199,51 @@ test_ceiling_and_young_lanes() {
   pass "max-lanes is an optional ceiling and a young lane reserves a full lane"
 }
 
+test_settled_lanes_hold_no_ceiling_place() {
+  local home fakebin out now
+  home=$(make_home settled)
+  fakebin=$(make_probes "$TMP_ROOT/p-settled")
+  now=$(date +%s)
+  printf 'auto\nmax-lanes 2\n' > "$home/config/lane-capacity"
+  write_lane "$home" working-lane "$home/none"
+  write_lane "$home" done-lane "$home/none"
+  write_lane "$home" failed-lane "$home/none"
+  write_lane "$home" pr-lane "$home/none" "pr=https://example.invalid/pull/1"
+  write_lane "$home" paused-lane "$home/none"
+  printf 'working [at=%s]: busy\n' "$now" > "$home/state/working-lane.status"
+  printf 'done [at=%s]: ready\n' "$now" > "$home/state/done-lane.status"
+  printf 'failed [at=%s]: gave up\n' "$now" > "$home/state/failed-lane.status"
+  printf 'paused [at=%s]: waiting\n' "$now" > "$home/state/paused-lane.status"
+  assert_equals '[5,3,0]' "$(json "$home" "$fakebin" '[.budget.machine_lanes, .budget.settled, .budget.by.ceiling]')" \
+    "done, failed, and paused lanes must not count against max-lanes, while working and PR-ready lanes do"
+  printf 'working [at=%s]: steered back\n' "$now" > "$home/state/done-lane.status"
+  assert_equals '[2,-1]' "$(json "$home" "$fakebin" '[.budget.settled, .budget.by.ceiling]')" \
+    "a finished lane steered back into work must hold its place again"
+  pass "max-lanes counts only active lanes: done, failed, and paused records hold no ceiling place"
+}
+
+test_heavy_slots_key() {
+  local home fakebin out rc body
+  home=$(make_home heavy)
+  fakebin=$(make_probes "$TMP_ROOT/p-heavy")
+  out=$(run_cap "$home" "$fakebin" --heavy-slots)
+  assert_equals 1 "$out" "an absent config must give one heavy slot"
+  printf '14\n' > "$home/config/lane-capacity"
+  assert_equals 1 "$(run_cap "$home" "$fakebin" --heavy-slots)" "a config without the key must give one heavy slot"
+  for body in '14\nheavy-slots 3\n' 'auto\nheavy-slots 3 # PC\nadmit-spawns\n'; do
+    printf '%b' "$body" > "$home/config/lane-capacity"
+    assert_equals 3 "$(run_cap "$home" "$fakebin" --heavy-slots)" "config '$body' must give three heavy slots"
+    assert_equals 3 "$(json "$home" "$fakebin" '.limits.heavy_slots')" "the published limits must carry heavy-slots"
+  done
+  for body in '14\nheavy-slots 0\n' '14\nheavy-slots many\n' '14\nheavy-slots\n' '14\nheavy-slots 1\nheavy-slots 2\n' '14\nheavy-slots 100\n'; do
+    printf '%b' "$body" > "$home/config/lane-capacity"
+    rc=0
+    run_cap "$home" "$fakebin" --heavy-slots >/dev/null || rc=$?
+    expect_code 1 "$rc" "config '$body' must be invalid"
+  done
+  pass "heavy-slots is a positive per-machine count, defaults to one, and is published in the limits"
+}
+
 test_gates_reopen_after_three_publishes() {
   local home fakebin p i
   home=$(make_home gates)
@@ -740,6 +785,8 @@ test_real_host_auto_smoke() {
 test_fixed_mode_is_unchanged
 test_budget_binds_the_scarcest_resource
 test_ceiling_and_young_lanes
+test_settled_lanes_hold_no_ceiling_place
+test_heavy_slots_key
 test_gates_reopen_after_three_publishes
 test_pressure_thermal_and_battery_gates
 test_unmeasurable_memory_never_admits_on_cpu_alone

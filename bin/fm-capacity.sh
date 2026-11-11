@@ -11,6 +11,9 @@
 #                             declares admit-spawns (bin/fm-spawn.sh's check)
 #   fm-capacity.sh --spawn-gate-enabled  exit 0 when --spawn-gate would judge
 #                             a spawn, 1 when it would admit unconditionally
+#   fm-capacity.sh --heavy-slots  print how many heavy jobs (end-to-end suites,
+#                             builds) this machine runs at once: the
+#                             heavy-slots key, else 1 (bin/fm-heavy-slot.sh)
 #
 # It reads this home's state/*.meta, the optional config/lane-capacity, the
 # pressure files and reserve flags that file names, and the host's own probes.
@@ -112,7 +115,8 @@
 #   quota null | {provider, runway} (the all_models runway status from
 #     quota-axi --json --provider <p> --max-age 15m, bounded to 5 s; unknown
 #     when it cannot be read),
-#   limits {min_avail_gb, min_disk_gb, max_load1} (null when unset),
+#   limits {min_avail_gb, min_disk_gb, max_load1} (null when unset, plus heavy_slots
+#     when the key is set),
 #   verdict {admit, free_lanes, reasons[]}.
 # verdict.admit is true only with a valid cap, lanes under it, and no
 # constraint, or in auto mode as below; its reasons are the constraints in
@@ -137,6 +141,9 @@
 #
 # Auto mode. A first line of `auto` replaces the fixed cap with a lane budget
 # measured on every call; an integer first line keeps everything above exactly.
+# Both modes: heavy-slots N (positive integer, default 1): how many heavy jobs
+# this machine runs at once through bin/fm-heavy-slot.sh, which owns the slot
+# lock; this script only owns the number, read with --heavy-slots.
 # Auto-only keys: max-lanes N (the one optional ceiling, published as
 # cap.target) and min-gpu-free-gb X (count the GPU). admit-spawns (the spawn
 # gate) applies to both modes. Auto mode needs jq; without it nothing is
@@ -171,7 +178,12 @@
 #     disk    per filesystem (the home's, then each one holding a worktree),
 #             floor((free - kept - young x F_disk) / F_disk), kept min-disk-gb
 #             else 10 GB
-#     ceiling max-lanes minus this machine's lanes
+#     ceiling max-lanes minus this machine's ACTIVE lanes, by the definition
+#             bin/fm-lane-active-lib.sh owns (the one the fixed cap counts by):
+#             a finished, paused, held, or dead-endpoint record holds no
+#             ceiling place (budget.settled counts them; lanes and
+#             machine_lanes still list them). Memory, cpu, and disk still see
+#             every real process.
 #   never below 0. Memory is the one probe the budget cannot do without: with
 #   no memory reading it never admits on cpu alone, the budget is the static
 #   max-lanes ceiling alone (or 0 without one), and the verdict's reasons say
@@ -217,7 +229,7 @@
 #   report names the first three with their class, idle age, next step, and
 #   evidence.
 #   The document adds cap.mode "auto", budget {lanes, open, raw,
-#   machine_lanes, by {memory, cpu, disk, ceiling}, binding, young, damped,
+#   machine_lanes, settled, by {memory, cpu, disk, ceiling}, binding, young, damped,
 #   notes[]}, footprint {mem_gb, cpu_cores, disk_gb, source
 #   default|learned, samples}, vitals {load5, psi {cpu_some10,
 #   mem_some10, mem_some60, mem_full10, io_full10, io_full60}, swapin_total,
@@ -273,9 +285,10 @@ case "${1:-}" in
   --admit) mode=admit ;;
   --spawn-gate) mode=spawn_gate ;;
   --spawn-gate-enabled) mode=spawn_gate_enabled ;;
-  *) echo "usage: fm-capacity.sh [--json|--publish|--admit|--spawn-gate|--spawn-gate-enabled|--help]" >&2; exit 2 ;;
+  --heavy-slots) mode=heavy_slots ;;
+  *) echo "usage: fm-capacity.sh [--json|--publish|--admit|--spawn-gate|--spawn-gate-enabled|--heavy-slots|--help]" >&2; exit 2 ;;
 esac
-[ "$#" -le 1 ] || { echo "usage: fm-capacity.sh [--json|--publish|--admit|--spawn-gate|--spawn-gate-enabled|--help]" >&2; exit 2; }
+[ "$#" -le 1 ] || { echo "usage: fm-capacity.sh [--json|--publish|--admit|--spawn-gate|--spawn-gate-enabled|--heavy-slots|--help]" >&2; exit 2; }
 
 is_uint() {
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
@@ -299,6 +312,7 @@ now=$(date +%s)
 case "$mode" in
   admit|publish|spawn_gate) [ -e "$LANE_CONFIG" ] || exit 0 ;;
   spawn_gate_enabled) [ -e "$LANE_CONFIG" ] || exit 1 ;;
+  heavy_slots) [ -e "$LANE_CONFIG" ] || { echo 1; exit 0; } ;;
 esac
 if [ "$mode" = publish ]; then
   interval=${FM_LANE_CAPACITY_PUBLISH_INTERVAL:-30}
@@ -347,6 +361,7 @@ min_disk_gb=
 max_load1=
 max_lanes=
 min_gpu_free_gb=
+heavy_slots=
 admit_spawns=0
 captain_idle=
 scheduled_reserve=$DEFAULT_SCHEDULED_RESERVE
@@ -388,7 +403,7 @@ parse_lane_config() {
     value=${rest%% *}
     case "$key" in
       min-avail-gb|min-disk-gb|max-load1|captain-idle|scheduled-reserve|quota-provider|pressure-file|reserve-flag) ;;
-      admit-spawns) ;;
+      admit-spawns|heavy-slots) ;;
       max-lanes|min-gpu-free-gb)
         [ "$cap_mode" = auto ] || { config_error "$lineno" "$key needs auto on the first line"; return 1; }
         ;;
@@ -421,6 +436,10 @@ parse_lane_config() {
         target=$max_lanes
         ;;
       admit-spawns) admit_spawns=1 ;;
+      heavy-slots)
+        is_uint "$value" && [ "${#value}" -le 2 ] && [ "$((10#$value))" -gt 0 ] || { config_error "$lineno" "heavy-slots needs a positive number of slots (1 to 99)"; return 1; }
+        heavy_slots=$((10#$value))
+        ;;
       captain-idle)
         is_uint "$value" && [ "${#value}" -le 9 ] && [ "$((10#$value))" -gt 0 ] || { config_error "$lineno" "captain-idle needs a positive number of seconds"; return 1; }
         captain_idle=$((10#$value))
@@ -455,10 +474,18 @@ if [ -e "$LANE_CONFIG" ]; then
     target_error="config/lane-capacity: $target_error"
     target_reason="config/lane-capacity: $target_reason"
     target=invalid
-    min_avail_gb='' min_disk_gb='' max_load1='' captain_idle='' quota_provider='' pressure_files='' reserve_flags=''
+    min_avail_gb='' min_disk_gb='' max_load1='' heavy_slots='' captain_idle='' quota_provider='' pressure_files='' reserve_flags=''
     scheduled_reserve=$DEFAULT_SCHEDULED_RESERVE
     cap_mode=fixed max_lanes='' min_gpu_free_gb=''
   fi
+fi
+if [ "$mode" = heavy_slots ]; then
+  if [ "$target" = invalid ]; then
+    echo "fm-capacity: $target_error" >&2
+    exit 1
+  fi
+  echo "${heavy_slots:-1}"
+  exit 0
 fi
 # --spawn-gate is --admit for bin/fm-spawn.sh, and only when the file opts in;
 # a malformed file refuses only when one of its lines asks for the gate, and an
@@ -685,7 +712,7 @@ tsv_field() { printf '%s' "$1" | tr '\t\n\r' '   '; }
 
 # auto_lane_rows <home-index> <state-dir>: one lane-table row per task record.
 auto_lane_rows() {
-  local idx=$1 dir=$2 meta id wt harness kind pr spawn line verb at until sf
+  local idx=$1 dir=$2 meta id wt harness kind pr spawn line verb at until sf active
   for meta in "$dir"/*.meta; do
     [ -f "$meta" ] || continue
     grep -qx 'kind=secondmate' "$meta" 2>/dev/null && continue
@@ -708,8 +735,10 @@ auto_lane_rows() {
         until=$(status_paused_until "$line" 2>/dev/null) || until=
       fi
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$(tsv_field "$id")" "$(tsv_field "$wt")" \
-      "$(tsv_field "$harness")" "$(tsv_field "$kind")" "$pr" "$spawn" "$verb" "$at" "$until"
+    active=1
+    fm_lane_is_active "$dir" "$id" || active=0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$idx" "$(tsv_field "$id")" "$(tsv_field "$wt")" \
+      "$(tsv_field "$harness")" "$(tsv_field "$kind")" "$pr" "$spawn" "$verb" "$at" "$until" "$active"
   done
 }
 
@@ -746,7 +775,7 @@ def nn: map(select(. != null));
 def dur: if . == null then "?" elif . >= 86400 then "\(. / 86400 | floor)d" elif . >= 3600 then "\(. / 3600 | floor)h"
   elif . >= 60 then "\(. / 60 | floor)m" else "\(. | floor)s" end;
 ($lanes_tsv | rows | map({home: (.[0] | tonumber), id: .[1], key: "\(.[0]):\(.[1])", harness: (.[3] // ""),
-  kind: (.[4] // ""), pr: (.[5] == "1"), spawn: (.[6] | num), verb: (.[7] // ""), at: (.[8] | num), until: (.[9] | num)})) as $lanes
+  kind: (.[4] // ""), pr: (.[5] == "1"), spawn: (.[6] | num), verb: (.[7] // ""), at: (.[8] | num), until: (.[9] | num), active: (.[10] != "0")})) as $lanes
 | ($attr_tsv | rows | map({key: .[0], pid: .[1], mem_kb: ((.[2] | num) // 0), cpu_s: ((.[3] | num) // 0)})) as $attr
 | ($disks_tsv | rows | map({label: .[0], free_gb: (.[1] | num)}) | map(select(.free_gb != null))) as $disks
 | ($gpu_tsv | rows | map({name: .[0], util_pct: (.[1] | num), mem_used_gb: (.[2] | num), mem_total_gb: (.[3] | num)})) as $gpu
@@ -815,7 +844,8 @@ def dur: if . == null then "?" elif . >= 86400 then "\(. / 86400 | floor)d" elif
 | ($cfg.min_disk // 10) as $min_disk
 | ($disks | map(. + {open: ((.free_gb - $min_disk - $young * $fp.disk_gb) / $fp.disk_gb | floor)})) as $dopen
 | (if ($dopen | length) == 0 then null else ($dopen | min_by(.open)) end) as $dbind
-| (if $cfg.max_lanes != null then $cfg.max_lanes - $mlanes else null end) as $ceil_open
+| ([ $lanes[] | select(.active | not) ] | length) as $settled
+| (if $cfg.max_lanes != null then $cfg.max_lanes - ($mlanes - $settled) else null end) as $ceil_open
 | {memory: $mem_open, cpu: $cpu_open, disk: $dbind.open, ceiling: $ceil_open} as $by
 | (if $measurable then ($by | to_entries | map(select(.value != null)) | if length == 0 then null else min_by(.value) end)
    elif $ceil_open != null then {key: "ceiling", value: $ceil_open} else null end) as $bind
@@ -879,9 +909,9 @@ def dur: if . == null then "?" elif . >= 86400 then "\(. / 86400 | floor)d" elif
    else [ (if $bind.key == "memory" then "memory: \($avail | n2) GB available, \($min_avail | r2) GB kept, \($young) starting, a lane needs \($fp.mem_gb) GB"
       elif $bind.key == "cpu" then "cpu: load \($cpu_load | n2) of \($cores * 0.85 | r2) usable on \($cores) cores, \($young) starting, a lane needs \($fp.cpu_cores) core"
       elif $bind.key == "disk" then "disk: \($dbind.label) \($dbind.free_gb | n2) GB free, \($min_disk) GB kept, \($young) starting, a lane needs \($fp.disk_gb) GB"
-      else "ceiling: \($mlanes) of \($cfg.max_lanes) lanes on this machine (max-lanes)" end) ] end) as $budget_reasons
+      else "ceiling: \($mlanes - $settled) of \($cfg.max_lanes) lanes on this machine (max-lanes)" end) ] end) as $budget_reasons
 | ($unmeasured_reasons + (if $measurable or ($closed | length) > 0 or $open > 0 or $bind == null then []
-   else ["ceiling: \($mlanes) of \($cfg.max_lanes) lanes on this machine (max-lanes)"] end)) as $unmeasured_reasons
+   else ["ceiling: \($mlanes - $settled) of \($cfg.max_lanes) lanes on this machine (max-lanes)"] end)) as $unmeasured_reasons
 | (if ($closed | length) > 0 then ($closed | map(.name)) elif $open > 0 then ["ok"] elif $damped_out then ["damped"]
    elif $bind == null then ["unmeasurable"] else [$bind.key] end) as $names
 | ($own | map(. as $l | $ll[$l.id] as $e
@@ -908,7 +938,7 @@ def dur: if . == null then "?" elif . >= 86400 then "\(. / 86400 | floor)d" elif
    admit: (($closed | length) == 0 and $open > 0),
    free_lanes: (if ($closed | length) == 0 then $open else 0 end),
    names: $names, reasons: ($gate_reasons + $unmeasured_reasons + $budget_reasons),
-   doc: {budget: {lanes: ($mlanes + $open), open: $open, raw: $raw, machine_lanes: $mlanes, by: $by,
+   doc: {budget: {lanes: ($mlanes + $open), open: $open, raw: $raw, machine_lanes: $mlanes, settled: $settled, by: $by,
            binding: (if ($closed | length) > 0 then "gate" elif $damped_out then "damped" elif $bind == null then "unmeasurable" else $bind.key end),
            young: $young, damped: ($open < $raw),
            notes: (($notes | split("\n") | map(select(. != "")))
@@ -1350,7 +1380,7 @@ doc=$(jq -n \
   --arg new_boot "$new_boot" --argjson kept "$BOOTS_KEPT" --arg watcher_age "$watcher_age" \
   --arg reserve_flag "$reserve_flag" --arg reserve_label "$reserve_label" \
   --arg captain "$captain" --argjson quota "$quota_json" \
-  --arg min_avail "$min_avail_gb" --arg min_disk "$min_disk_gb" --arg max_load1 "$max_load1" \
+  --arg min_avail "$min_avail_gb" --arg min_disk "$min_disk_gb" --arg max_load1 "$max_load1" --arg heavy_slots "$heavy_slots" \
   --arg admit "$admit" --arg free_lanes "$free_lanes" --arg reasons "$verdict_reasons" \
   --argjson auto "${auto_doc:-null}" --arg cap_mode "$cap_mode" '
   def num: if . == "" then null else tonumber + 0 end;
@@ -1374,6 +1404,7 @@ doc=$(jq -n \
    limits: {min_avail_gb: ($min_avail | num), min_disk_gb: ($min_disk | num), max_load1: ($max_load1 | num)},
    verdict: {admit: ($admit == "true"), free_lanes: ($free_lanes | if . == "unknown" then null else tonumber end),
      reasons: ($reasons | lines)}}
+  | (if $heavy_slots == "" then . else .limits.heavy_slots = ($heavy_slots | num) end)
   | if $cap_mode != "auto" then . else (.cap.mode = "auto") + ($auto // {budget: null}) end') || {
   echo "fm-capacity: could not assemble the lane capacity document" >&2
   [ "$mode" = publish ] && exit 0

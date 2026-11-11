@@ -430,7 +430,7 @@ family_for_basename() {
       printf '%s\n' orca
       ;;
     fm-adapter-limits.test.sh|fm-branch-supervision.test.sh|fm-busy-adapter-wiring.test.sh|\
-    fm-busy-state.test.sh|fm-capacity.test.sh|fm-capacity-auto.test.sh|fm-lane-vitals.test.sh|fm-overflow.test.sh|fm-classify-corr-token.test.sh|\
+    fm-busy-state.test.sh|fm-capacity.test.sh|fm-capacity-auto.test.sh|fm-heavy-slot.test.sh|fm-lane-vitals.test.sh|fm-overflow.test.sh|fm-classify-corr-token.test.sh|\
     fm-close-finished-lanes.test.sh|\
     fm-claude-stop-autoarm.test.sh|fm-cursor-harness.test.sh|\
     fm-dispatch-resolve.test.sh|\
@@ -787,6 +787,7 @@ tests/fm-harness-adapter-instructions-live-e2e.test.sh 72
 tests/fm-harness-adapter-references.test.sh 64
 tests/fm-harness-liveness-drift-live-e2e.test.sh 1309
 tests/fm-harness-precedence.test.sh 4083
+tests/fm-heavy-slot.test.sh 45000
 tests/fm-herdr-groups.test.sh 5418
 tests/fm-herdr-pi-stale-registration-live-e2e.test.sh 55
 tests/fm-herdr-session-cleanup.test.sh 7425
@@ -1591,6 +1592,10 @@ families_for_changed_path() {
       printf '%s\n' "__script__:fm-capacity-auto.test.sh"
       printf '%s\n' "__script__:fm-project-capacity.test.sh"
       printf '%s\n' "__script__:fm-lane-capacity-integration.test.sh"
+      printf '%s\n' "__script__:fm-heavy-slot.test.sh"
+      ;;
+    bin/fm-heavy-slot.sh)
+      printf '%s\n' "__script__:fm-heavy-slot.test.sh"
       ;;
     bin/fm-lane-vitals-lib.sh)
       printf '%s\n' "__script__:fm-lane-vitals.test.sh"

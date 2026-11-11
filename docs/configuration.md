@@ -774,6 +774,7 @@ quota-provider claude  # opt-in: publish that provider's quota runway
 max-load1 20           # keep a raw 1-minute load rule while beats replace it
 scheduled-reserve 4    # lanes reserved for scheduled loops, outside the cap (default 4)
 admit-spawns           # opt-in: bin/fm-spawn.sh defers a fresh ship or scout this verdict does not admit
+heavy-slots 2          # heavy jobs (end-to-end suites, builds) this machine runs at once, default 1
 ```
 
 `pressure-file` and `reserve-flag` may repeat and take an absolute or `~/` path; a `reserve-flag` path may be followed by the label it is reported by.
@@ -798,6 +799,8 @@ min-gpu-free-gb 4      # only for work that uses the GPU; agent workers do not
 ```
 
 `max-lanes` and `min-gpu-free-gb` are valid only with `auto`; `min-avail-gb`, `min-disk-gb`, and `max-load1` keep their meaning as the captain's safety floor.
+`max-lanes` counts only active lanes, by the definition `bin/fm-lane-active-lib.sh` shares with the fixed cap: a record that is finished, on a declared pause or a captain hold, or whose endpoint is dead holds no place, and it holds one again if the worker resumes.
+Memory, cpu, and disk still see every real process, so a settled record that keeps an agent running is still paid for there.
 There are no per-lane pins: the script samples each lane's process tree while the watcher publishes, learns the per-lane memory, CPU, and disk cost from this machine's last 30 measured lanes once five are recorded, and keeps that ledger in `state/lane-footprint.json`.
 A lane whose process tree was never attributed is left out of that learning, so a backend that runs its agent outside the recorded worktree cannot teach a near-zero footprint.
 Pressure stall, swap-in rate, macOS memory pressure, thermal limits, battery, and under WSL2 the Windows host's own memory close admission at once and reopen only after three clean readings, and growth after a reopen is damped, so admission does not flap.
@@ -809,6 +812,28 @@ Inside WSL2 the Linux view decides how many lanes fit in the VM and the Windows 
 On Windows itself (Git Bash or MSYS, where `uname -s` is `MINGW*` or `MSYS*`) the same `powershell.exe` view supplies the memory, cores, load, and power readings the MSYS `/proc` lacks.
 The published facts add the budget, the per-lane footprint, the vitals, the gate states, and a ranked reclaim list of idle lanes (finished, no agent, PR handed off, parked, quiet) with their evidence; the list only recommends, and every cleanup or exit still goes through the normal landed-work checks.
 Auto mode needs `jq`, and it never reaches the network.
+
+### Per-machine limits and the heavy slot
+
+The adaptive ceiling is one `config/lane-capacity` per machine, so each machine states its own limits and none inherits another's.
+The 2026-11-11 fleet reorganization chose these starting values, each with `admit-spawns` so that `bin/fm-spawn.sh` stops opening workers on a full machine:
+
+| Machine | `config/lane-capacity` | Heavy jobs at once |
+|---|---|---|
+| Main VPS | `auto`, `admit-spawns`, `max-lanes 10`, `min-avail-gb 3`, `max-load1 6`, `quota-provider claude`, `heavy-slots 1` | 1 |
+| Creative VPS, once its CPU is released | `auto`, `admit-spawns`, `max-lanes 6`, `min-avail-gb 3`, `max-load1 6`, `heavy-slots 2` | 2 |
+| PC under WSL | `auto`, `admit-spawns`, `max-lanes 4`, `min-avail-gb 2`, `heavy-slots 3` | 3 |
+
+With `admit-spawns` a fresh ship or scout that the measured budget does not admit leaves `bin/fm-spawn.sh` with exit 75 and one `deferred:` line before anything is created, so its backlog item stays queued rather than blocked, and the next dispatch pass tries it again.
+To go back to the fixed cap, put the old number back as the first line; to turn only the spawn gate off, remove `admit-spawns`.
+
+A heavy job is one that loads a machine on its own: an end-to-end suite, a full build, a browser or Anki proof.
+`bin/fm-heavy-slot.sh run -- <command...>` runs the command in one of the machine's `heavy-slots` (default 1): a second heavy job waits for the first, or exits 75 after `--wait` seconds without running anything.
+The slots are `flock` files in one per-user directory, shared by every home and every project on the machine, so jobs from different projects queue behind each other instead of each keeping a lock the others cannot see.
+The kernel frees a slot when its holder dies, and a daemon the job leaves behind does not keep it; `bin/fm-heavy-slot.sh status` shows who holds each slot.
+A secondmate home reads the root home's `heavy-slots`, so one machine has one count.
+A host without `flock` runs the job at once and says so on stderr.
+The script's header owns the options, environment, and exit statuses; wrapping a worker's heavy command in it is the caller's choice, and nothing in the spawn path requires it.
 
 While the file exists, the watcher runs `bin/fm-capacity.sh --publish` detached at most every 30 seconds, writing this home's lane facts to `state/lane-capacity.json`: its lanes, its cap and limits, its machine's pressure and boots, its watcher's freshness, and its own admission verdict.
 Publishing is best-effort and never changes what the watcher does.
