@@ -13,6 +13,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), [external memory tiers](#external-memory-tiers-memory-layering-section), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
+| Which machine takes a new worker | [Task placement](#task-placement-configplacement) and [lane capacity](#lane-capacity-configlane-capacity) |
 | Review bots on owned GitHub pull requests | [Contribution review bots](#contribution-review-bots-configcontribution-review-bots) |
 | Per-run overrides and tuning | [Environment variables](#environment-variables) |
 
@@ -827,6 +828,41 @@ A wrapper that spawns its own lane gets `FM_SCHEDULED_LOOP=<loop>` and passes `-
 The helper's header owns the exit codes, the line contract, the retry bounds and their environment overrides, and the record formats; `bin/fm-lane-guard.sh` also records a failed scheduled spawn even when its status is the 75 deferral.
 Work that is CPU-heavy and needs none of this home's data can instead go to a remote secondmate with room: `bin/fm-overflow.sh pick` reads each candidate's published `state/lane-capacity.json` (creative-aux and pc-aux2 by default, so those homes need their own `config/lane-capacity`), skips any host without a free lane, with load per core at or over 3, under critical pressure, reserved, or with stale facts, and prints the pick with its reason or `none free`; `bin/fm-overflow.sh send <text...>` hands the text to the pick as a marked routed request through `bin/fm-send.sh` ([remote second mates](remote-secondmates.md)).
 The script's header owns the report line, the published document's fields, the verdict, the auto budget's rules and thresholds, the beat freshness rules, the host-constraint thresholds, and the probe fallbacks; `bin/fm-lane-vitals-lib.sh` owns how each vital is measured.
+
+## Task placement (config/placement)
+
+The optional local, gitignored `config/placement` file lets `bin/fm-place.sh` choose which machine should take a new worker, from an affinity table the captain writes and the lane facts every home publishes.
+With the file absent nothing changes: `bin/fm-spawn.sh` never reads it and every worker starts on this home as before.
+The chooser is a script with no model, it only reads, and `bin/fm-place.sh --type <task-type> [--needs <a,b>] --dry-run` shows the choice and why each other machine was dropped without launching anything.
+
+```text
+spawn dry-run                         # off (default), dry-run or on
+max-age 600                           # seconds a published document stays usable (default 600)
+machine principal self                # a label for this home
+machine pc pc-aux2 owner-pc           # a remote secondmate home, on the captain's own PC
+machine criativa creative-aux hold    # takes nothing new until the line is edited
+type edit   light principal pc        # task type, its weight, then the machines that may take it
+type scout  light principal pc
+type review light principal pc criativa
+type suite  heavy pc principal criativa
+```
+
+`machine` lines come first: a label, then `self` for this home or the id of a remote secondmate that has a record here and publishes its own `state/lane-capacity.json` (the home needs its own `config/lane-capacity`, as for `bin/fm-overflow.sh`), then the optional flags `owner-pc` and `hold`.
+Every other key may appear once, and a type may name only declared machines; an unknown key, a repeated type or label, or a malformed value makes the whole file invalid and the chooser exits 2 naming the line, because the captain's table is never guessed.
+
+A machine is dropped, with its reason, unless it is on the type's list, is not `hold`, has facts in `fm-lane-capacity.v1` shape no older than `max-age`, and its own verdict admits with a free lane.
+`self` reads `state/lane-capacity.json` while fresh and otherwise asks `bin/fm-capacity.sh --json`, so a stopped publisher cannot silence this home.
+Among the machines left the most free lanes wins, then the lowest load per core, then the order on the type's line.
+The captain's PC rules are built in for any `owner-pc` machine: light work may run beside the owner, heavy work only while the published `captain` state is `idle` or `away` (set `captain-idle 900` in that home's `config/lane-capacity` for fifteen idle minutes; an unreadable or unconfigured state counts as present), and work whose `--needs` names `anki`, `opera`, `adspower`, `dolphin` or port `8766` is never placed there, whatever the type's list says.
+The creative VPS is `hold` until the captain lifts it, so no type reaches it.
+
+`spawn` is the switch for `bin/fm-spawn.sh`, and the default is `off`.
+With `dry-run` a fresh ship or scout prints the choice on stderr and launches as before.
+With `on` it launches only when the choice is `self`, and otherwise prints one `deferred:` line and exits 75 before creating anything, so the backlog item stays queued and the line names the home that should take it; the same exit comes when no machine can take it, and a malformed file refuses the spawn with exit 1.
+The spawn takes the type from `--task-type` (default `edit` for a ship and `scout` for a scout) and what the task touches from `--place-needs`.
+Relaunches and secondmate spawns are never placed.
+Delete the file or set `spawn off` to go back to today's behavior.
+The script's header owns the output line, the exit codes and the environment seams used by tests.
 
 ## PR-ready line after green (config/ready-after-green)
 

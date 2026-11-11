@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--scheduled-loop <name>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--scheduled-loop <name>] [--task-type <type>] [--place-needs <a,b>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--scheduled-loop <name>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
@@ -220,6 +220,14 @@
 #   every place held prints one `deferred:` line and exits 75 before any brief
 #   render, endpoint, worktree, record, or backlog move exists, so the task stays
 #   exactly as queued as it was; an unreadable declaration refuses with exit 1.
+#   Placement: only when config/placement exists and its `spawn` key is dry-run or
+#   on (off when absent, which changes nothing), a fresh ship or scout asks
+#   bin/fm-place.sh which machine should take it, before any lane check. The type
+#   is --task-type (default edit for a ship, scout for a scout) and --place-needs
+#   lists what the task touches. dry-run only prints the choice on stderr; on, a
+#   choice other than this home, or no machine placeable, prints `deferred:` and
+#   exits 75 with the task exactly as queued, and an unreadable declaration
+#   refuses with exit 1. docs/configuration.md "Task placement" owns the format.
 #   Lane capacity: only when this home's config/lane-capacity declares
 #   admit-spawns (bin/fm-capacity.sh --spawn-gate-enabled answers; that script
 #   owns the declaration and the verdict), a fresh ship or
@@ -965,6 +973,8 @@ UPSTREAM_CONSENT=
 UPSTREAM_CONSENT_SET=0
 SCHEDULED_LOOP=
 SCHEDULED_LOOP_SET=0
+TASK_TYPE=
+PLACE_NEEDS=
 TRACEPARENT_SET=0
 RELAUNCH=0
 # Opt-in only: exact-resume presentation-order lock waits instead of refusing.
@@ -1020,6 +1030,12 @@ for a in "$@"; do
     scheduled-loop)
       SCHEDULED_LOOP=$a
       SCHEDULED_LOOP_SET=1
+      ;;
+    task-type)
+      TASK_TYPE=$a
+      ;;
+    place-needs)
+      PLACE_NEEDS=$a
       ;;
     traceparent)
       TRACEPARENT_ARG=$a
@@ -1094,6 +1110,10 @@ for a in "$@"; do
     SCHEDULED_LOOP=${a#--scheduled-loop=}
     SCHEDULED_LOOP_SET=1
     ;;
+  --task-type) want_value="task-type" ;;
+  --task-type=*) TASK_TYPE=${a#--task-type=} ;;
+  --place-needs) want_value="place-needs" ;;
+  --place-needs=*) PLACE_NEEDS=${a#--place-needs=} ;;
   --traceparent) want_value=traceparent ;;
   --traceparent=*)
     TRACEPARENT_ARG=${a#--traceparent=}
@@ -2019,6 +2039,8 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ "$BRANCH_PREFIX_SET" -eq 0 ] || shared_args+=(--branch-prefix "$BRANCH_PREFIX")
   [ "$BASE_BRANCH_SET" -eq 0 ] || shared_args+=(--base-branch "$BASE_BRANCH")
   [ "$SCHEDULED_LOOP_SET" -eq 0 ] || shared_args+=(--scheduled-loop "$SCHEDULED_LOOP")
+  [ -z "$TASK_TYPE" ] || shared_args+=(--task-type "$TASK_TYPE")
+  [ -z "$PLACE_NEEDS" ] || shared_args+=(--place-needs "$PLACE_NEEDS")
   [ "$HERDR_RESUME_LOCK_WAIT" -eq 0 ] || shared_args+=(--herdr-resume-lock-wait)
   for pair in "${POS[@]}"; do
     case "$pair" in
@@ -3828,6 +3850,45 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] &&
   ! git -C "$PROJ_ABS" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
   echo "error: spawn refused: project $PROJ_ABS has no commit yet (unborn HEAD), so there is nothing to branch a worktree from; make one commit in the project, for example 'git -C $PROJ_ABS commit --allow-empty -m \"chore: initial commit\"', then spawn again" >&2
   exit 1
+fi
+# Placement (opt-in; bin/fm-place.sh owns the affinity table, the machines'
+# published facts and the choice). With config/placement absent, or its spawn key
+# off, nothing here runs. dry-run reports the choice and launches anyway; on
+# launches only when the choice is this home and otherwise defers like a capacity
+# limit, before anything is created, so the backlog item stays queued.
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ -e "$CONFIG/placement" ]; then
+  PLACE_MODE=$(FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG \
+    "$SCRIPT_DIR/fm-place.sh" --spawn-mode 2>&1) || {
+    echo "error: spawn refused: the placement declaration is unreadable ($PLACE_MODE); fix config/placement or remove it (docs/configuration.md \"Task placement\")" >&2
+    exit 1
+  }
+  if [ "$PLACE_MODE" != off ]; then
+    PLACE_TYPE=$TASK_TYPE
+    [ -n "$PLACE_TYPE" ] || { [ "$KIND" = scout ] && PLACE_TYPE=scout || PLACE_TYPE=edit; }
+    PLACE_RC=0
+    PLACE_OUT=$(FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG \
+      "$SCRIPT_DIR/fm-place.sh" --type "$PLACE_TYPE" --needs "$PLACE_NEEDS" 2>&1) || PLACE_RC=$?
+    printf 'placement (%s): %s\n' "$PLACE_MODE" "$(printf '%s\n' "$PLACE_OUT" | tr '\n' ' ')" >&2
+    if [ "$PLACE_MODE" = on ]; then
+      case "$PLACE_RC" in
+      0)
+        PLACE_HOME=$(printf '%s\n' "$PLACE_OUT" | sed -n '1s/.* home=\([^ ]*\) .*/\1/p')
+        if [ "$PLACE_HOME" != self ]; then
+          echo "deferred: placement chose home $PLACE_HOME for a $PLACE_TYPE task, not this one; task $ID was not launched and its backlog item stays queued - route it to that home (bin/fm-place.sh --type $PLACE_TYPE --dry-run shows the choice)" >&2
+          exit "$FM_PROJECT_CAPACITY_DEFER_EXIT"
+        fi
+        ;;
+      1)
+        echo "deferred: no machine can take a $PLACE_TYPE task now; task $ID was not launched and its backlog item stays queued - dispatch it again later" >&2
+        exit "$FM_PROJECT_CAPACITY_DEFER_EXIT"
+        ;;
+      *)
+        echo "error: spawn refused: placement could not be decided ($PLACE_OUT); fix config/placement or set its spawn key to off" >&2
+        exit 1
+        ;;
+      esac
+    fi
+  fi
 fi
 # Lane ceiling (bin/fm-capacity.sh owns the count and the config/lane-capacity
 # cap): a fresh ship or scout is deferred, with the same exit and the same
