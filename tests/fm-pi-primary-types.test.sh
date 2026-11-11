@@ -25,6 +25,7 @@ cp "$ROOT/.pi/extensions/fm-branch-supervision.ts" "$TMP_ROOT/fm-branch-supervis
 cp "$ROOT/.pi/extensions/fm-calm.ts" "$TMP_ROOT/fm-calm.ts"
 cp "$ROOT/.pi/extensions/fm-cache-keepalive.ts" "$TMP_ROOT/fm-cache-keepalive.ts"
 cp "$ROOT/.pi/extensions/fm-compact-shape.ts" "$TMP_ROOT/fm-compact-shape.ts"
+cp "$ROOT/.pi/extensions/fm-skill-once.ts" "$TMP_ROOT/fm-skill-once.ts"
 cp "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" "$TMP_ROOT/fm-primary-pi-watch.ts"
 cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$TMP_ROOT/fm-primary-turnend-guard.ts"
 cp "$ROOT/.pi/extensions/lib/fm-branch-dispatch.ts" "$TMP_ROOT/lib/fm-branch-dispatch.ts"

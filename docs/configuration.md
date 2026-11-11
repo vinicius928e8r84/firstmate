@@ -238,6 +238,21 @@ A worktree that already has its own `.pi/settings.json` keeps it, and cleanup an
 The script header of `bin/fm-worker-context-cap.sh` owns the arithmetic and the settings it writes.
 Project settings load only for a trusted worktree, which is the same trust the worker's launch already needs.
 
+## Primary skill loading (config/skill-shortcuts / FM_SKILL_ONCE)
+
+A `/skill:<name>` command makes Pi paste the whole skill into the conversation, and every later request rereads it until the next compaction.
+`.pi/extensions/fm-skill-once.ts`, active only in the session that owns the fleet lock, changes two cases before Pi expands the command:
+
+- A skill whose block is still in the model's context is not pasted again; one line says it is already loaded above and the arguments follow.
+  A skill the compaction removed from the context loads in full again.
+- A shortcut skill is not pasted at all; the primary gets a short instruction to open a scout that reads the skill file by path.
+
+Gitignored `config/skill-shortcuts` lists the shortcut skills, one name per line with `#` comments.
+An absent file means `wayfinder`; an empty file means no shortcut, which is the one-file undo for the shortcut alone.
+`FM_SKILL_ONCE=0` turns the whole extension off, and deleting the extension file removes it.
+A shortcut applies only when Pi has the skill installed, so the instruction can name a real file.
+The extension header owns the exact behavior.
+
 ## Pi supervision branch gate (config/supervision-branch)
 
 One word in gitignored `config/supervision-branch`, or in `FM_SUPERVISION_BRANCH`, which wins over the file, sets whether the branch takes attended wakes:
@@ -3118,6 +3133,7 @@ FM_LIMIT_RESUME_POLL_MS=300000   # interval between those no-model-call limit ch
 FM_LIMIT_RESUME_MAX_ATTEMPTS=4   # resume turns spent per cut; a turn that goes through starts the count over
 FM_COMPACT_SHAPE=   # Pi primary compaction shape (.pi/extensions/fm-compact-shape.ts, whose header owns what the summarizer receives, the 8000-byte summary cap and the fallback to Pi's default): 1 on, 0 off; unset is on except for a claude-bridge model, because bridge releases before 0.9.3 summarize in their own hook first. Only the session that owns the fleet lock shapes
 FM_COMPACT_SUMMARY_CACHE=   # 1 gives the compaction summary request the provider's own prompt cache back; unset, it sets DISABLE_PROMPT_CACHING in the stream's provider env so the one-off summary input is not written to a one-hour cache (.pi/extensions/fm-compact-shape.ts)
+FM_SKILL_ONCE=   # Pi primary skill loading (.pi/extensions/fm-skill-once.ts, whose header owns the rewrite): 0 turns it off, so every /skill: command pastes the full skill as Pi does by default. Only the session that owns the fleet lock is rewritten; config/skill-shortcuts chooses the shortcut skills
 FM_QUOTA_SILENCE_RECHECK=300   # seconds between quota-axi reads while the watcher is not holding its wake for a usage limit (config/quota-silence)
 FM_WAKE_SHADOW=1   # shadow log of check and signal wakes presented by the drain (state/wake-shadow.jsonl, bin/fm-wake-shadow.sh header owns the fields); observational, 0 disables it
 FM_WAKE_SHADOW_MAX_BYTES=4194304   # size at which the shadow log rotates once to wake-shadow.jsonl.1
