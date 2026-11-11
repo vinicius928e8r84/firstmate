@@ -728,7 +728,7 @@ The file is a home-local site choice and is not inherited by secondmate homes; `
 The optional local, gitignored `config/lane-capacity` file says how many ship and scout lanes this home should run at once, and when it should stop taking more.
 `bin/fm-capacity.sh` reads it to report how many lanes are open for queued work, alongside running lanes, 1-minute load against logical cores, free memory, and free disk.
 With the file absent nothing changes: the report prints counts and host figures only, never invents a target, never advises holding dispatch, and nothing is published; a malformed value is reported as invalid rather than guessed.
-Persistent secondmates hold no lane.
+Persistent secondmates hold no lane, and neither does a worker that is no longer active (finished and waiting on its owner, on a declared pause or a captain hold, or with a dead endpoint), by the definition `bin/fm-lane-active-lib.sh` shares with the away spend cap.
 The file is a per-machine choice and is not inherited by secondmate homes, so each home owns its own numbers.
 
 The first non-comment line is the cap, one non-negative integer, so a file holding only that integer keeps its earlier meaning, or the word `auto` for a measured budget instead of a fixed cap (below).

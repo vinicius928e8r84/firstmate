@@ -103,7 +103,7 @@
 #   fm-afk-contract.sh words [--path <record>]
 #   fm-afk-contract.sh validate [--path <record>]  exit 0 when the record is readable and complete
 #   fm-afk-contract.sh live-workers
-#     Print the ordinary worker count this home holds right now (SPEND CAP
+#     Print the active ordinary worker count this home runs right now (SPEND CAP
 #     below). Reads no record, so it answers before an entry as well as during
 #     one.
 #   fm-afk-contract.sh archive              move the record aside; print its path
@@ -130,11 +130,18 @@
 # both the number written at entry and the counting rule behind it).
 # The cap bounds how many ordinary workers this home runs concurrently while an
 # away record stands; bin/fm-spawn.sh enforces it by refusing a fresh ordinary
-# spawn once the home already holds that many. An ordinary worker record is
-# every state/*.meta whose kind is not secondmate, counted by
+# spawn once the home already runs that many. A counted worker is every
+# state/*.meta whose kind is not secondmate and whose task is ACTIVE, counted by
 # fm_afk_contract_live_ordinary_workers and exposed as `live-workers`, which is
 # the one implementation both the entry default and that refusal read, so the
-# two can never count differently.
+# two can never count differently. ACTIVE (bin/fm-lane-active-lib.sh owns the
+# rule, and bin/fm-capacity.sh counts lanes by it too) means a worker that has
+# not ended: a task whose last status event is done, failed, cancelled, a
+# declared pause or a captain hold, or whose endpoint is positively dead, is
+# finished and waiting on its owner, so it does not count; no event yet, a
+# working, blocked or needs-decision event, or any doubt counts. The read stays
+# cheap (last status event plus one endpoint probe for a surviving record),
+# never a per-task bin/fm-crew-state.sh call.
 # Without --spend, entry records the count standing at that moment, so away mode
 # never narrows work already under way; it never records less than
 # FM_AFK_CONTRACT_SPEND_DEFAULT, so an idle home still enters with the ordinary
@@ -155,6 +162,8 @@ FM_AFK_CONTRACT_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-classify-lib.sh
 . "$FM_AFK_CONTRACT_DIR/fm-classify-lib.sh"
+# shellcheck source=bin/fm-lane-active-lib.sh
+. "$FM_AFK_CONTRACT_DIR/fm-lane-active-lib.sh"
 
 FM_AFK_CONTRACT_VERSION=2
 # Older record versions this script still reads (never writes).
@@ -185,15 +194,17 @@ fm_afk_contract_present() {  # [state-dir]
   [ -f "$(fm_afk_contract_path "${1:-$FM_AFK_CONTRACT_STATE}")" ]
 }
 
-# The ordinary worker records this home holds right now (the header's SPEND
-# CAP): every state/*.meta whose kind is not secondmate, because a secondmate is
-# a persistent home rather than spend. This is the one implementation of that
-# count, read by the entry default here and by bin/fm-spawn.sh's refusal.
+# The ordinary workers this home runs right now (the header's SPEND CAP): every
+# state/*.meta whose kind is not secondmate, because a secondmate is a persistent
+# home rather than spend, and that bin/fm-lane-active-lib.sh finds ACTIVE. This
+# is the one implementation of that count, read by the entry default here and by
+# bin/fm-spawn.sh's refusal.
 fm_afk_contract_live_ordinary_workers() {  # [state-dir]
   local state=${1:-$FM_AFK_CONTRACT_STATE} meta live=0
   for meta in "$state"/*.meta; do
     [ -f "$meta" ] || continue
     [ "$(grep '^kind=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)" != secondmate ] || continue
+    fm_lane_is_active "$state" "$(basename "$meta" .meta)" || continue
     live=$((live + 1))
   done
   printf '%s\n' "$live"

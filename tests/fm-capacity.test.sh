@@ -190,6 +190,43 @@ test_scheduled_lanes_form_a_reserved_pool() {
   pass "scheduled lanes are a reserved pool outside the ordinary cap, with a documented default and refused bad values"
 }
 
+# Only ACTIVE lanes count against the target (bin/fm-lane-active-lib.sh owns the
+# definition, shared with the away spend cap): a finished worker kept open for
+# its owner, a declared pause, and a record whose endpoint is dead hold no lane,
+# while every host constraint still decides on top of the count.
+test_finished_paused_and_dead_lanes_hold_no_lane() {
+  local home fakebin out doc stub
+  home=$(make_home active-lanes 0 1)
+  fakebin=$(make_probes "$TMP_ROOT/p-active" 0.50 60 8 20971520)
+  stub=$TMP_ROOT/endpoint-by-window
+  cat > "$stub" <<'SH'
+#!/usr/bin/env bash
+case "$2" in *gone*) echo missing ;; *) echo alive ;; esac
+SH
+  chmod +x "$stub"
+  fm_write_meta "$home/state/working.meta" "kind=ship" "window=fm-working"
+  printf 'working [at=1000]: building\n' > "$home/state/working.status"
+  fm_write_meta "$home/state/fresh.meta" "kind=scout" "window=fm-fresh"
+  fm_write_meta "$home/state/done.meta" "kind=ship" "window=fm-done" "pr=https://example.invalid/pull/1"
+  printf 'done [at=1000]: PR https://example.invalid/pull/1\n' > "$home/state/done.status"
+  fm_write_meta "$home/state/paused.meta" "kind=ship" "window=fm-paused"
+  printf 'paused [at=1000]: waiting on CI\n' > "$home/state/paused.status"
+  fm_write_meta "$home/state/dead.meta" "kind=ship" "window=fm-gone"
+  printf 'working [at=1000]: building\n' > "$home/state/dead.status"
+  printf '3\n' > "$home/config/lane-capacity"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FM_LANE_ENDPOINT_STATE_BIN=$stub "$CAPACITY" 2>&1)
+  assert_contains "$out" 'capacity: free_lanes=1 reason=ok lanes=2 target=3 secondmates=1 ' \
+    "five task records, three of them finished, paused, or dead, must hold two lanes"
+  doc=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_LANE_ENDPOINT_STATE_BIN=$stub "$CAPACITY" --json 2>/dev/null)
+  assert_equals '2|5|1|1' \
+    "$(printf '%s\n' "$doc" | jq -r '[.lanes.count, (.lanes.ids | length), .lanes.pr_ready, .verdict.free_lanes] | map(tostring) | join("|")')" \
+    "the document must count active lanes, keep every record in ids and pr_ready, and report the free lane"
+  fakebin=$(make_probes "$TMP_ROOT/p-active-cpu" 9.00 60 8 20971520)
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FM_LANE_ENDPOINT_STATE_BIN=$stub "$CAPACITY" 2>&1)
+  assert_contains "$out" 'free_lanes=0 reason=cpu lanes=2 ' "a loaded machine must still close the free lane"
+  pass "finished, paused, and dead-endpoint records hold no lane, and host constraints still decide the rest"
+}
+
 test_real_host_smoke() {
   local home out rc
   home=$(make_home real 0 0)
@@ -596,6 +633,7 @@ test_host_constraints_close_lanes
 test_unavailable_probes_degrade
 test_invalid_target_is_reported
 test_scheduled_lanes_form_a_reserved_pool
+test_finished_paused_and_dead_lanes_hold_no_lane
 test_config_keys_parse_and_refuse_guessing
 test_fresh_beat_replaces_probes
 test_late_stale_missing_and_malformed_beats

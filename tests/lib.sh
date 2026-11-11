@@ -856,6 +856,18 @@ fm_git_worktree() {
 
 # --- state/<id>.meta writers ------------------------------------------------
 
+# fm_lane_endpoint_stub <dir> <alive|dead|missing|...>: write an executable that
+# answers the endpoint probe bin/fm-lane-active-lib.sh runs
+# (FM_LANE_ENDPOINT_STATE_BIN) with that fm_backend_agent_state word, and print
+# its path. A suite whose fixtures model live lanes without a real endpoint
+# exports it as alive.
+fm_lane_endpoint_stub() {
+  local stub="$1/endpoint-$2"
+  printf '#!/usr/bin/env bash\necho %s\n' "$2" > "$stub"
+  chmod +x "$stub"
+  printf '%s\n' "$stub"
+}
+
 # fm_write_meta <file> <key=val> ...: write the given key=val lines to a meta
 # file (truncating any prior content).
 fm_write_meta() {

@@ -14,6 +14,8 @@ set -u
 
 CONTRACT="$ROOT/bin/fm-afk-contract.sh"
 TMP_ROOT=$(fm_test_tmproot fm-afk-contract-tests)
+FM_LANE_ENDPOINT_STATE_BIN=$(fm_lane_endpoint_stub "$TMP_ROOT" alive)
+export FM_LANE_ENDPOINT_STATE_BIN
 
 make_home() {  # <name> -> prints the home dir
   local dir="$TMP_ROOT/$1"
@@ -664,6 +666,70 @@ test_entry_without_spend_records_the_live_worker_count_never_below_the_floor() {
   pass "entry without --spend records the live worker count, never below the default floor, and an explicit --spend still wins"
 }
 
+# The spend cap counts only workers that have not ended. A finished worker keeps
+# its record and its open pane until the owner lands it, and a record whose
+# endpoint died is no worker either; both would otherwise hold a slot for work
+# nobody runs. Any doubt counts.
+write_lane() {  # <home> <id> <window> [status-line...]
+  local home=$1 id=$2 window=$3 line
+  shift 3
+  fm_write_meta "$home/state/$id.meta" "window=$window" "kind=ship" "busy_gen=g-$id"
+  : > "$home/state/$id.status"
+  for line in "$@"; do
+    printf '%s\n' "$line" >> "$home/state/$id.status"
+  done
+}
+
+test_live_workers_counts_only_active_workers() {
+  local home stub
+  home=$(make_home spend-active-only)
+  stub=$TMP_ROOT/endpoint-by-window
+  cat > "$stub" <<'SH'
+#!/usr/bin/env bash
+case "$2" in
+  *gone*) echo missing ;;
+  *husk*) echo dead ;;
+  *murky*) echo unreadable ;;
+  *) echo alive ;;
+esac
+SH
+  chmod +x "$stub"
+  # Counted: no event yet, working, blocked, needs-decision, a decision resolved
+  # while it was blocked, an unreadable endpoint (doubt), a remote record, and a
+  # finished worker that resumed (busy since after its done).
+  write_lane "$home" fresh fm-fresh
+  write_lane "$home" working fm-working 'working [at=1000]: building'
+  write_lane "$home" blocked fm-blocked 'blocked [at=1000]: stuck'
+  write_lane "$home" asking fm-asking 'needs-decision [key=pick] [at=1000]: which'
+  write_lane "$home" answered fm-answered 'blocked [key=pick] [at=1000]: stuck' 'resolved [key=pick] [at=1100]: answered'
+  write_lane "$home" doubt fm-murky 'working [at=1000]: building'
+  write_lane "$home" remote fm-gone 'working [at=1000]: building'
+  printf 'remote_host=somewhere\n' >> "$home/state/remote.meta"
+  write_lane "$home" resumed fm-resumed 'done [at=1000]: ready in branch fm/resumed'
+  printf 'g-resumed\n' > "$home/state/resumed.busy-gen"
+  printf 'v1 gen=g-resumed seq=3 state=busy source=pi-ext event=agent-start ts=1500\n' > "$home/state/resumed.busy-state"
+  # Not counted: done, failed, a declared pause, a captain hold, a resolved line
+  # after done, a stale busy record from before the done, a dead endpoint
+  # (agent gone, or endpoint missing), and a secondmate.
+  write_lane "$home" finished fm-finished 'working [at=900]: building' 'done [at=1000]: ready in branch fm/finished'
+  write_lane "$home" failed fm-failed 'failed [at=1000]: broke'
+  write_lane "$home" paused fm-paused 'paused [at=1000]: waiting on CI'
+  write_lane "$home" held fm-held 'captain-held [at=1000]: with the owner'
+  write_lane "$home" closed fm-closed 'done [at=1000]: ready' 'resolved [at=1100]: noted'
+  write_lane "$home" stale fm-stale 'done [at=1000]: ready'
+  printf 'g-stale\n' > "$home/state/stale.busy-gen"
+  printf 'v1 gen=g-stale seq=3 state=busy source=pi-ext event=agent-start ts=500\n' > "$home/state/stale.busy-state"
+  write_lane "$home" husk fm-husk 'working [at=1000]: building'
+  write_lane "$home" vanished fm-gone 'working [at=1000]: building'
+  fm_write_meta "$home/state/mate-1.meta" "window=remote:mate-1" "kind=secondmate"
+  assert_equals 8 "$(FM_LANE_ENDPOINT_STATE_BIN=$stub contract "$home" live-workers)" \
+    "live-workers must count exactly the eight active workers"
+  # With every endpoint answering alive, only the two dead-endpoint records change.
+  assert_equals 10 "$(FM_LANE_ENDPOINT_STATE_BIN=$(fm_lane_endpoint_stub "$TMP_ROOT" alive) contract "$home" live-workers)" \
+    "the dead-endpoint records must be the ones the endpoint rule excluded"
+  pass "live-workers counts working, unknown, blocked, asking, and resumed workers and skips done, failed, paused, held, resolved-after-done, and dead-endpoint ones"
+}
+
 test_readback_renders_words_verbatim_with_the_record_scalars
 test_words_preserve_final_newline_shape
 test_enter_writes_a_v2_record_in_one_step_and_announces_hold_for_return
@@ -685,3 +751,4 @@ test_version_1_record_is_replaced_by_a_version_2_record
 test_record_changes_refuse_while_a_reader_holds_the_lock
 test_quiet_record_reads_as_a_present_captain_holding_nothing
 test_away_entry_over_quiet_mode_becomes_away_and_quiet_never_masks_away
+test_live_workers_counts_only_active_workers

@@ -22,6 +22,8 @@ unset TASKS_AXI_BACKEND || :
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 TMP_ROOT=$(fm_test_tmproot fm-project-capacity)
+FM_LANE_ENDPOINT_STATE_BIN=$(fm_lane_endpoint_stub "$TMP_ROOT" alive)
+export FM_LANE_ENDPOINT_STATE_BIN
 DEFER_EXIT=75
 HAVE_TASKS_AXI=0
 command -v tasks-axi >/dev/null 2>&1 && HAVE_TASKS_AXI=1

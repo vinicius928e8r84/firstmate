@@ -50,6 +50,7 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-test-isolation-proof.sh` | Concurrent isolation harness and portable candidate set owner |
 | `fm-ensure-agents-md.sh` | Manually initialize project agent-memory files (see the helper's header and help) |
 | `fm-capacity.sh`         | Report of open lanes against the optional `config/lane-capacity` target, or a measured `auto` budget, and host headroom for queued-work dispatch; `--publish` writes this home's `state/lane-capacity.json`, and `--spawn-gate` is the opt-in spawn check |
+| `fm-lane-active-lib.sh`  | Single owner of which ordinary task records are active for the lane cap and the away spend cap; a finished, paused, held, or dead-endpoint worker is not |
 | `fm-lane-vitals-lib.sh`  | Read-only host vitals and per-lane process attribution behind `fm-capacity.sh`'s auto budget (Linux, macOS, the Windows host from WSL2, and native Windows under Git Bash/MSYS) |
 | `fm-overflow.sh`         | Pick the remote secondmate host (creative-aux, pc-aux2) with a free lane and light load from its published `state/lane-capacity.json`, and `send` CPU-heavy, main-data-free work to it as a routed request |
 | `fm-close-finished-lanes.sh` | Guarded nightly step: archive the logs of finished, unheld ordinary tasks and close their lanes through `fm-teardown.sh` without `--force`, one at a time under a per-run cap and time budget; lists everything else as `kept` |

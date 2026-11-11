@@ -30,8 +30,13 @@
 # (one physical line). A short human summary follows it. load1, cores,
 # mem_free_pct and disk_free_mb are always this host's own probes.
 #
-# lanes counts task metadata records whose kind is not secondmate (ship and
-# scout work, including records not yet reconciled after an endpoint died).
+# lanes counts the ACTIVE task metadata records whose kind is not secondmate
+# (ship and scout work): a finished worker that stays open waiting on its owner,
+# a declared pause, a captain hold, or a positively dead endpoint holds no lane.
+# bin/fm-lane-active-lib.sh owns that definition, the same one the away spend
+# cap counts by, so the two never differ; CPU, memory, disk and the other
+# constraints below still decide the rest. The auto budget below reads its own
+# lane view and is unchanged.
 # secondmates counts persistent secondmates separately; they hold no lane.
 # scheduled=<N>/<reserve> is the reserved pool for scheduled loops: N is how
 # many lanes carry a scheduled= line in their task record (bin/fm-spawn.sh
@@ -88,8 +93,9 @@
 #   schema, generated_epoch (this host's clock), home ("main", or the id in
 #   .fm-secondmate-home), machine (the first readable beat's host, else the
 #   short host name),
-#   lanes {count, pr_ready (records with a pr= line), ids, scheduled (the
-#     scheduled-loop lanes among them)},
+#   lanes {count (active lanes), pr_ready (records with a pr= line), ids (every
+#     non-secondmate record), scheduled (the scheduled-loop lanes among the
+#     active ones)},
 #   cap {target (number or null), status ok|none|invalid, scheduled_reserve},
 #   projects (clone directory names under projects/),
 #   pressure {level ok|warn|critical|unknown, why[], basis beat|probe|none,
@@ -316,15 +322,18 @@ secondmates=0
 pr_ready=0
 scheduled_lanes=0
 lane_ids=
+# shellcheck source=bin/fm-lane-active-lib.sh
+. "$SCRIPT_DIR/fm-lane-active-lib.sh"
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
   if grep -qx 'kind=secondmate' "$meta" 2>/dev/null; then
     secondmates=$((secondmates + 1))
   else
-    lanes=$((lanes + 1))
     lane_ids="$lane_ids$(basename "$meta" .meta)
 "
     grep -q '^pr=..*' "$meta" 2>/dev/null && pr_ready=$((pr_ready + 1))
+    fm_lane_is_active "$STATE" "$(basename "$meta" .meta)" || continue
+    lanes=$((lanes + 1))
     grep -q '^scheduled=..*' "$meta" 2>/dev/null && scheduled_lanes=$((scheduled_lanes + 1))
   fi
 done

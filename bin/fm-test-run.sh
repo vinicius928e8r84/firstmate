@@ -1592,6 +1592,11 @@ families_for_changed_path() {
       printf '%s\n' "__script__:fm-capacity-auto.test.sh"
       printf '%s\n' "__script__:fm-lane-capacity-integration.test.sh"
       ;;
+    bin/fm-lane-active-lib.sh)
+      printf '%s\n' "__script__:fm-afk-contract.test.sh"
+      printf '%s\n' "__script__:fm-capacity.test.sh"
+      printf '%s\n' "__script__:fm-project-capacity.test.sh"
+      ;;
     bin/fm-scheduled-spawn.sh)
       printf '%s\n' "__script__:fm-scheduled-spawn.test.sh"
       ;;
