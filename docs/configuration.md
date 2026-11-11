@@ -149,6 +149,19 @@ The key is the script's `--slug`, else the `owner/repo` of the worktree's remote
 Without an entry the script refuses and names this file; `--allow-unpinned` opts a project with no authorship rule out for that run.
 The script header owns the lookup order and the environment it sets for the merge.
 
+## Merge queue and mechanical conflicts (config/merge-mechanical)
+
+`bin/fm-merge-queue.sh` joins the base branch into one PR at a time and merges it through `bin/fm-merge-pr.sh`; its header owns the turn-by-turn procedure and exit codes.
+Two gitignored files under the effective config directory shape it.
+`config/merge-queue-off`, when present, makes every queue run print `DISABLED` and do nothing; removing the file re-enables it.
+`config/merge-mechanical` lists the only conflicts `bin/fm-pr-merge-main.sh --mechanical` may settle without a model.
+One rule per line: `<owner/repo | repo-name> <glob> keep-pr|take-main|union|regen [command...]`; blank lines and `#` comments are ignored, the first matching line wins, and the project key follows the same lookup as `config/commit-identity`.
+The glob is a bash pattern over the repo-relative path, so `*` also crosses `/`.
+`keep-pr` keeps the PR branch's side whole, `take-main` takes the base's side whole, `union` keeps the lines of both sides, and `regen` runs its command once from the worktree after every other path is settled.
+Only a content conflict (both sides changed or both added) is eligible, and the merge is settled only when every conflicted path has a rule; otherwise the run reports `MERGE-CONFLICT` with the unruled paths and leaves the merge open exactly as it does without the flag.
+A project with no rule file or no matching line therefore never gets a mechanical resolution.
+A hand-settled merge is not a clean main merge, so the review pin still declines to carry a clean review across it; the queue then stops at `bin/fm-merge-pr.sh`'s refusal.
+
 ## Calm preference (config/calm)
 
 The Pi Calm extension and the Claude Code Calm mod share the local, gitignored `config/calm` preference under the effective Firstmate home.

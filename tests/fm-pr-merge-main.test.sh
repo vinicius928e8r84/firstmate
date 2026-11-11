@@ -242,6 +242,138 @@ test_identity_pinned() {
   pass "identity: unregistered project refused, --allow-unpinned opts out"
 }
 
+# make_mech_world <name> [only-file...]: origin with the files a mechanical resolution
+# touches (a version number, an append-only index, a doc, a generated file with its
+# source, and a code file). Main and the PR branch "feat" each change the named files
+# (default: all of them) the way that conflicts. Prints the world directory.
+make_mech_world() {
+  local w="$TMP_ROOT/$1" f; shift
+  local -a only=("$@")
+  declare -A pr_side=([VERSION]=$'0.4.27\n' [INDEX.md]=$'| a |\n| b |\n| pr |\n' [DOC.md]=$'d-pr\n'
+    [gen.txt]=$'1\n2\n3\n' [code.js]=$'code1\nPR\ncode3\n')
+  declare -A main_side=([VERSION]=$'0.4.26\n' [INDEX.md]=$'| a |\n| b |\n| main |\n' [DOC.md]=$'d-main\n'
+    [gen.txt]=$'1\n2\nZ\n' [code.js]=$'code1\nMAIN\ncode3\n')
+  [ ${#only[@]} -gt 0 ] || only=(VERSION INDEX.md DOC.md gen.txt code.js)
+  mkdir -p "$w/seed"
+  git init -q -b main "$w/seed"
+  printf '0.4.25\n' > "$w/seed/VERSION"
+  printf '| a |\n| b |\n' > "$w/seed/INDEX.md"
+  printf 'd1\n' > "$w/seed/DOC.md"
+  printf '2\n1\n' > "$w/seed/src.txt"
+  printf '1\n2\n' > "$w/seed/gen.txt"
+  printf 'code1\ncode2\ncode3\n' > "$w/seed/code.js"
+  git -C "$w/seed" add . && git -C "$w/seed" commit -qm seed
+  git clone -q --bare "$w/seed" "$w/origin.git"
+  git clone -q "file://$w/origin.git" "$w/pr"
+  git clone -q "file://$w/origin.git" "$w/pusher"
+  git -C "$w/pr" checkout -q -b feat
+  printf '3\n2\n1\n' > "$w/pr/src.txt"
+  for f in "${only[@]}"; do
+    printf '%s' "${pr_side[$f]}" > "$w/pr/$f"
+    printf '%s' "${main_side[$f]}" > "$w/pusher/$f"
+  done
+  git -C "$w/pr" commit -qam 'own change'
+  git -C "$w/pusher" commit -qam 'main moves'
+  git -C "$w/pusher" push -q origin main
+  fm_test_remove_tree "$w/pusher"
+  printf '%s\n' "$w"
+}
+
+write_rules() { # <rule>...: the home's merge-mechanical file
+  printf '%s\n' '# mechanical rules' "$@" > "$FM_HOME/config/merge-mechanical"
+}
+RULES_ALL=('origin VERSION keep-pr' 'origin INDEX.md union' 'origin DOC.md take-main' 'origin gen.txt regen sort src.txt > gen.txt')
+
+test_mechanical_settles_by_rule() {
+  local w out rc before
+  w=$(make_mech_world mech-ok VERSION INDEX.md DOC.md gen.txt)
+  write_rules "${RULES_ALL[@]}"
+  before=$(origin_refs "$w")
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --mechanical --check 'grep -q 0.4.27 VERSION && echo CHECK-RAN' 2>&1); rc=$?
+  expect_code 0 "$rc" "mechanical merge exit"
+  assert_contains "$out" "MERGE-MECHANICAL" "mechanical merge is reported"
+  assert_contains "$out" "  resolved: VERSION (keep-pr)" "version path and rule are listed"
+  assert_contains "$out" "  resolved: gen.txt (regen)" "generated path and rule are listed"
+  assert_contains "$out" "CHECK-RAN" "checks run after a mechanical merge"
+  assert_equals 3 "$(git -C "$w/pr" rev-list --parents -n1 HEAD | wc -w | tr -d ' ')" "head is a two-parent merge commit"
+  assert_equals "" "$(git -C "$w/pr" status --porcelain --untracked-files=no)" "worktree is clean after the commit"
+  assert_equals "0.4.27" "$(cat "$w/pr/VERSION")" "keep-pr keeps the PR's number"
+  assert_equals "d-main" "$(cat "$w/pr/DOC.md")" "take-main takes the base's text"
+  assert_equals "| a |,| b |,| pr |,| main |" "$(paste -sd, "$w/pr/INDEX.md")" "union keeps both sides' lines"
+  assert_equals "1 2 3" "$(tr '\n' ' ' < "$w/pr/gen.txt" | sed 's/ $//')" "regen rewrote the generated file from its source"
+  assert_no_regex '^(<<<<<<<|>>>>>>>) ' "$w/pr/INDEX.md" "no conflict marker is left"
+  assert_equals "pinned@example.com" "$(git -C "$w/pr" log -1 --format=%ae)" "the merge commit carries the registered identity"
+  assert_equals "$before" "$(origin_refs "$w")" "nothing was pushed"
+  pass "mechanical: every conflict settled by its rule, committed with the identity, not pushed"
+}
+
+test_mechanical_stops_on_code() {
+  local w out rc head
+  w=$(make_mech_world mech-code)
+  write_rules "${RULES_ALL[@]}"
+  head=$(git -C "$w/pr" rev-parse HEAD)
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --mechanical 2>&1); rc=$?
+  expect_code 10 "$rc" "a code conflict stops the run"
+  assert_contains "$out" "MERGE-CONFLICT" "reported as a conflict"
+  assert_contains "$out" "  code: code.js" "the path without a rule is named"
+  assert_not_contains "$out" "code: VERSION" "a path with a rule is not called code"
+  [ -e "$(git -C "$w/pr" rev-parse --absolute-git-dir)/MERGE_HEAD" ] || fail "the merge is left open for the model"
+  assert_grep '<<<<<<< ' "$w/pr/VERSION" "no partial resolution: the covered file is still conflicted"
+  assert_equals "$head" "$(git -C "$w/pr" rev-parse HEAD)" "head unchanged"
+  pass "mechanical: a code conflict leaves the whole merge to the model"
+}
+
+test_mechanical_is_opt_in_and_rule_bound() {
+  local w out rc
+  w=$(make_mech_world mech-optin VERSION)
+  write_rules "${RULES_ALL[@]}"
+  out=$("$MERGE_MAIN" --worktree "$w/pr" 2>&1); rc=$?
+  expect_code 10 "$rc" "rules alone resolve nothing without the flag"
+  assert_not_contains "$out" "code:" "no mechanical classification without the flag"
+  git -C "$w/pr" merge --abort
+  rm -f "$FM_HOME/config/merge-mechanical"
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --mechanical 2>&1); rc=$?
+  expect_code 10 "$rc" "no rule file means nothing is mechanical"
+  assert_contains "$out" "  code: VERSION" "every path is code without a rule"
+  git -C "$w/pr" merge --abort
+  write_rules 'other-repo VERSION keep-pr'
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --mechanical 2>&1); rc=$?
+  expect_code 10 "$rc" "another project's rule does not apply"
+  git -C "$w/pr" merge --abort
+  write_rules 'origin VERSION keep-pr'
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --mechanical 2>&1); rc=$?
+  expect_code 0 "$rc" "the project's own rule applies"
+  pass "mechanical: opt-in per run, bound to the project's rules"
+}
+
+test_mechanical_failed_regen_restores_the_conflict() {
+  local w out rc
+  w=$(make_mech_world mech-regen VERSION gen.txt)
+  write_rules 'origin VERSION keep-pr' 'origin gen.txt regen false'
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --mechanical 2>&1); rc=$?
+  expect_code 10 "$rc" "a failing generator stops the run"
+  assert_contains "$out" "  conflicted: VERSION" "the plain conflict is reported"
+  assert_grep '<<<<<<< ' "$w/pr/VERSION" "the version file is back to its conflicted form"
+  [ -e "$(git -C "$w/pr" rev-parse --absolute-git-dir)/MERGE_HEAD" ] || fail "the merge is open again"
+  pass "mechanical: a failing regen command restores the plain conflict"
+}
+
+test_mechanical_delete_modify_is_code() {
+  local w out rc
+  w=$(make_world delmod)
+  git clone -q "file://$w/origin.git" "$w/pusher"
+  git -C "$w/pusher" rm -q a.txt
+  git -C "$w/pusher" commit -qm 'main deletes a.txt'
+  git -C "$w/pusher" push -q origin main
+  fm_test_remove_tree "$w/pusher"
+  write_rules 'origin a.txt keep-pr'
+  out=$("$MERGE_MAIN" --worktree "$w/pr" --mechanical 2>&1); rc=$?
+  expect_code 10 "$rc" "a delete/modify conflict is never mechanical"
+  assert_contains "$out" "  code: a.txt" "the path is named as code"
+  git -C "$w/pr" merge --abort
+  pass "mechanical: delete/modify conflicts are left to the model"
+}
+
 test_clean_merge
 test_identity_pinned
 test_already_current
@@ -253,5 +385,10 @@ test_verify_only_refuses_an_open_merge
 test_failed_merge_without_conflict_says_why
 test_missing_option_value_is_a_usage_error
 test_pin_report_sees_unpushed_merge
+test_mechanical_settles_by_rule
+test_mechanical_stops_on_code
+test_mechanical_is_opt_in_and_rule_bound
+test_mechanical_failed_regen_restores_the_conflict
+test_mechanical_delete_modify_is_code
 
 echo '# all fm-pr-merge-main tests passed'

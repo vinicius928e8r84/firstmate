@@ -4,12 +4,13 @@
 # Usage:
 #   fm-pr-merge-main.sh --worktree DIR [--remote origin] [--base main]
 #                       [--check CMD]... [--slug OWNER/REPO --pr N] [--verify-only]
-#                       [--allow-unpinned]
+#                       [--allow-unpinned] [--mechanical]
 #
 # The routine "bring this PR up to date with main" step, done by a script so a
 # model is only needed when the merge truly conflicts. It is run by the worker
-# that owns the PR, in that worker's own worktree: it commits inside a project
-# worktree, so firstmate itself never runs it. In the PR branch worktree
+# that owns the PR, in that worker's own worktree, or by bin/fm-merge-queue.sh in
+# its own scratch clone: it commits inside a project worktree, so firstmate itself
+# never runs it. In the PR branch worktree
 # DIR it fetches <remote>/<base>, runs `git merge --no-edit` on it, then runs
 # each --check command (the project's own cheap checks, such as typecheck or
 # lint) from DIR. It never pushes: the worker that owns the PR pushes.
@@ -37,6 +38,22 @@
 # identity for a project that has no authorship rule. --verify-only creates no
 # commit and needs no identity.
 #
+# --mechanical settles a conflicting merge without a model when EVERY conflicted
+# path is a content conflict (both sides modified, or both added) that a rule in
+# gitignored $FM_HOME/config/merge-mechanical covers; one line per rule:
+#   <owner/repo | repo-name> <glob> keep-pr|take-main|union|regen [command...]
+# (same project key lookup as commit-identity; the glob is a bash pattern over
+# the repo-relative path, so `*` also crosses `/`; the first matching line wins).
+# keep-pr takes the PR branch's side whole (version numbers), take-main takes the
+# base's side whole, union keeps the lines of both sides (append-only tables and
+# indexes), regen runs the command from DIR after every other path is settled
+# (a generated file; the command runs once per distinct line and must rewrite the
+# conflicted files). Nothing is guessed: a path without a rule, a delete/modify
+# conflict, a leftover conflict marker, a command that fails or a regen that
+# dirties any other tracked file makes the run behave exactly as without the
+# flag (MERGE-CONFLICT, the merge left open in DIR, exit 10), with the unruled
+# paths named as "  code: <path>". No rule file means nothing is mechanical.
+#
 # --verify-only skips the fetch and merge and runs only the checks and the pin
 # report on DIR's current head, for use after a model resolved a conflict and
 # committed; like a merge it refuses a worktree with a merge still in progress
@@ -45,6 +62,9 @@
 # Result lines (one is always printed first after the work starts):
 #   ALREADY-CURRENT <remote>/<base>   nothing to merge
 #   MERGE-CLEAN <old> -> <new>        merged without conflict
+#   MERGE-MECHANICAL <old> -> <new>   --mechanical settled every conflict by rule
+#                                     and committed; "  resolved: <path> (<rule>)"
+#                                     follows per path
 #   MERGE-CONFLICT                    stopped; the merge is left in progress in
 #                                     DIR and the conflicted files follow, one
 #                                     per line as "  conflicted: <path>"
@@ -60,9 +80,9 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-usage-ledger-lib.sh
 . "$FM_ROOT/bin/fm-usage-ledger-lib.sh"
 
-usage() { sed -n 2,53p "$0"; }
+usage() { sed -n 2,74p "$0"; }
 
-wt= remote=origin base=main slug= pr= verify_only=0 allow_unpinned=0 usage_outcome=
+wt='' remote=origin base=main slug='' pr='' verify_only=0 allow_unpinned=0 mechanical=0 usage_outcome=''
 # One usage line per run (bin/fm-usage-ledger-lib.sh): the result line, or the exit status of a refused run.
 trap 'fm_usage_record fm-pr-merge-main "${usage_outcome:-exit-$?}" "$pr" merge' EXIT
 checks=()
@@ -79,6 +99,7 @@ while [ $# -gt 0 ]; do
     --pr) pr=$2; shift 2 ;;
     --verify-only) verify_only=1; shift ;;
     --allow-unpinned) allow_unpinned=1; shift ;;
+    --mechanical) mechanical=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -94,18 +115,25 @@ case "$git_dir" in /*) ;; *) git_dir=$wt/$git_dir ;; esac
 
 [ ! -e "$git_dir/MERGE_HEAD" ] || { echo "a merge is in progress in $wt; resolve and commit it first" >&2; exit 3; }
 [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] || { echo "worktree has uncommitted changes: $wt" >&2; exit 3; }
-# commit_identity: print "<email>\t<name>" for this project from
-# config/commit-identity, or nothing when none is registered.
-commit_identity() {
-  local file=${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/commit-identity key url short
-  [ -r "$file" ] || return 0
+# project_keys: set keys=() to the registry keys of this project, most specific first.
+keys=()
+project_keys() {
+  local url short owner
   url=$(git -C "$wt" remote get-url "$remote" 2>/dev/null || true)
   short=${url%.git}
   short=${short##*[/:]}
-  local owner=${url%.git}
+  owner=${url%.git}
   owner=${owner%/*}
   owner=${owner##*[/:]}
-  for key in "$slug" "${owner:+$owner/$short}" "$short"; do
+  keys=("$slug" "${owner:+$owner/$short}" "$short")
+}
+project_keys
+# commit_identity: print "<email>\t<name>" for this project from
+# config/commit-identity, or nothing when none is registered.
+commit_identity() {
+  local file=${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/commit-identity key
+  [ -r "$file" ] || return 0
+  for key in "${keys[@]}"; do
     [ -n "$key" ] || continue
     awk -v k="$key" '
       /^[[:space:]]*(#|$)/ { next }
@@ -113,6 +141,84 @@ commit_identity() {
       END { exit !found }' "$file" && return 0
   done
   return 0
+}
+
+# mechanical_rule <path>: print "<strategy>\t<command>" of the first config/merge-mechanical
+# line whose project key and glob match the path; status 1 when none does.
+mechanical_rule() {
+  local file=${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/merge-mechanical proj glob strat cmd key
+  [ -r "$file" ] || return 1
+  while read -r proj glob strat cmd; do
+    case $proj in ''|'#'*) continue ;; esac
+    for key in "${keys[@]}"; do
+      [ -n "$key" ] && [ "$proj" = "$key" ] || continue
+      # shellcheck disable=SC2053 # the rule's glob is a pattern on purpose
+      if [[ $1 == $glob ]]; then
+        case $strat in keep-pr|take-main|union|regen) printf '%s\t%s\n' "$strat" "$cmd"; return 0 ;; esac
+      fi
+    done
+  done < "$file"
+  return 1
+}
+
+# resolve_mechanical: settle every unmerged path through its rule, all or nothing.
+# On success the merge is committed and resolved_lines holds the report; on failure
+# the merge is back in its plain conflicted state and unruled lists paths without a rule.
+resolved_lines=() unruled=()
+resolve_mechanical() {
+  local -a paths=() strategies=() commands=() ran=()
+  local p r stages i tmp rc c seen
+  while IFS= read -r p; do paths+=("$p"); done < <(git -C "$wt" diff --name-only --diff-filter=U)
+  [ ${#paths[@]} -gt 0 ] || return 1
+  for p in "${paths[@]}"; do
+    stages=$(git -C "$wt" ls-files -u -- "$p" | awk '{ print $3 }' | sort -u | tr -d '\n')
+    if [ "$stages" != 123 ] && [ "$stages" != 23 ]; then unruled+=("$p"); continue; fi
+    r=$(mechanical_rule "$p") || { unruled+=("$p"); continue; }
+    strategies+=("${r%%$'\t'*}"); commands+=("${r#*$'\t'}")
+  done
+  [ ${#unruled[@]} = 0 ] || return 1
+  tmp=$(mktemp -d)
+  rc=0
+  for i in "${!paths[@]}"; do
+    p=${paths[$i]}
+    case ${strategies[$i]} in
+      keep-pr) git -C "$wt" checkout -q --ours -- "$p" || rc=1 ;;
+      take-main) git -C "$wt" checkout -q --theirs -- "$p" || rc=1 ;;
+      union)
+        git -C "$wt" show ":2:$p" > "$tmp/pr" 2>/dev/null && git -C "$wt" show ":3:$p" > "$tmp/main" 2>/dev/null || rc=1
+        git -C "$wt" show ":1:$p" > "$tmp/base" 2>/dev/null || : > "$tmp/base"
+        if [ $rc = 0 ] && git merge-file -p --union "$tmp/pr" "$tmp/base" "$tmp/main" > "$tmp/out" 2>/dev/null; then
+          cat "$tmp/out" > "$wt/$p"
+        else rc=1; fi ;;
+    esac
+    [ $rc = 0 ] || break
+  done
+  if [ $rc = 0 ]; then
+    for i in "${!paths[@]}"; do
+      [ "${strategies[$i]}" = regen ] || continue
+      c=${commands[$i]}
+      seen=0; for r in "${ran[@]+"${ran[@]}"}"; do [ "$r" = "$c" ] && seen=1; done
+      [ $seen = 1 ] && continue
+      ran+=("$c")
+      if [ -z "$c" ] || ! ( cd "$wt" && bash -c "$c" >/dev/null 2>&1 ); then rc=1; break; fi
+    done
+  fi
+  if [ $rc = 0 ]; then
+    for p in "${paths[@]}"; do
+      if [ ! -f "$wt/$p" ] || grep -Iq '^\(<<<<<<<\|>>>>>>>\) ' "$wt/$p"; then rc=1; break; fi
+      git -C "$wt" add -- "$p" || { rc=1; break; }
+    done
+  fi
+  if [ $rc = 0 ] && git -C "$wt" status --porcelain --untracked-files=no | grep -qv '^[MADRC] '; then rc=1; fi
+  if [ $rc = 0 ] && ! env "${merge_env[@]+"${merge_env[@]}"}" git -C "$wt" commit -q --no-edit >/dev/null 2>&1; then rc=1; fi
+  rm -rf "$tmp"
+  if [ $rc != 0 ]; then
+    # back to the plain conflicted merge, so the caller reports it as it always did
+    git -C "$wt" merge --abort >/dev/null 2>&1 || git -C "$wt" reset -q --hard "$old"
+    env "${merge_env[@]+"${merge_env[@]}"}" git -C "$wt" merge --no-edit "$target" >/dev/null 2>&1
+    return 1
+  fi
+  for i in "${!paths[@]}"; do resolved_lines+=("  resolved: ${paths[$i]} (${strategies[$i]})"); done
 }
 
 merge_env=()
@@ -139,15 +245,22 @@ if [ "$verify_only" = 0 ]; then
     usage_outcome=MERGE-CLEAN
     echo "MERGE-CLEAN ${old:0:8} -> $(git -C "$wt" rev-parse --short=8 HEAD)"
   else
-    if [ -e "$git_dir/MERGE_HEAD" ]; then
+    if [ ! -e "$git_dir/MERGE_HEAD" ]; then
+      echo "merge failed without a conflict state in $wt:" >&2
+      printf '%s\n' "$merge_out" >&2
+      exit 3
+    fi
+    if [ "$mechanical" = 1 ] && resolve_mechanical; then
+      usage_outcome=MERGE-MECHANICAL
+      echo "MERGE-MECHANICAL ${old:0:8} -> $(git -C "$wt" rev-parse --short=8 HEAD)"
+      printf '%s\n' "${resolved_lines[@]}"
+    else
       usage_outcome=MERGE-CONFLICT
       echo "MERGE-CONFLICT"
       git -C "$wt" diff --name-only --diff-filter=U | sed 's/^/  conflicted: /'
+      [ ${#unruled[@]} = 0 ] || printf '  code: %s\n' "${unruled[@]}"
       exit 10
     fi
-    echo "merge failed without a conflict state in $wt:" >&2
-    printf '%s\n' "$merge_out" >&2
-    exit 3
   fi
 fi
 
