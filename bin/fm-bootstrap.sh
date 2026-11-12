@@ -1342,7 +1342,18 @@ backlog_inflight_listed() {  # <id> <newline-separated-ids>
   return 1
 }
 
+# The sweep resolves paths cheaply (fm_backlog_sweep_begin owns how) rather than
+# with a perl run per path per record check, which cost a minute on a contended
+# host with 33 tasks.
 backlog_record_reconcile() {
+  local status=0
+  fm_backlog_sweep_begin
+  backlog_record_reconcile_sweep || status=$?
+  fm_backlog_sweep_end
+  return "$status"
+}
+
+backlog_record_reconcile_sweep() {
   local marker meta control_lock meta_lock id row label has_record=0 gate_status
   local inflight_ids='' inflight_known=0
   # A fresh home with no state directory has no physical task records to pair.

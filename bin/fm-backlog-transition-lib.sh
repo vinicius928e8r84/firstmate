@@ -659,16 +659,47 @@ fm_backlog_canonical_existing() {
   ' "$1" 2>/dev/null
 }
 
+# Cheap resolution for a sweep over many task records. While
+# fm_backlog_sweep_begin is open (until fm_backlog_sweep_end), an authorized
+# directory is resolved by the shell itself (`cd -P`, a fork and no exec) rather
+# than by a perl realpath, and a record that is not a symlink takes its final
+# path from its resolved parent. Nothing is remembered between checks: a
+# directory swapped after an earlier check is resolved afresh by the next one, so
+# the re-check a caller makes after taking a lock still sees the swap. Anything
+# the shell cannot enter falls back to the perl realpath.
+_FM_BACKLOG_SWEEP_OPEN=0
+
+fm_backlog_sweep_begin() {
+  _FM_BACKLOG_SWEEP_OPEN=1
+}
+
+fm_backlog_sweep_end() {
+  _FM_BACKLOG_SWEEP_OPEN=0
+}
+
+# Result in FM_BACKLOG_CANONICAL_RESULT; fails when the path cannot be resolved.
+# shellcheck disable=SC2034 # Output global, read by fm_backlog_record_parent_authorized.
+FM_BACKLOG_CANONICAL_RESULT=
+fm_backlog_canonical_directory() {  # <path>
+  FM_BACKLOG_CANONICAL_RESULT=
+  if [ "$_FM_BACKLOG_SWEEP_OPEN" = 1 ] && [ -d "$1" ]; then
+    FM_BACKLOG_CANONICAL_RESULT=$(CDPATH='' cd -P -- "$1" 2>/dev/null && pwd -P) \
+      && [ -n "$FM_BACKLOG_CANONICAL_RESULT" ] && return 0
+  fi
+  FM_BACKLOG_CANONICAL_RESULT=$(fm_backlog_canonical_existing "$1")
+}
+
 fm_backlog_record_parent_authorized() {  # <path> <label> <root> [parent-only]
   local path=$1 label=$2 root=$3 parent_only=${4:-} parent base parent_resolved expected_path
   local path_resolved root_resolved root_prefix home_resolved final_matches=1
   parent=${path%/*}
   [ "$parent" != "$path" ] || parent=.
   base=${path##*/}
-  root_resolved=$(fm_backlog_canonical_existing "$root") || {
+  fm_backlog_canonical_directory "$root" || {
     FM_BACKLOG_TRANSITION_ERROR="$label authorized directory cannot be resolved at $root"
     return 1
   }
+  root_resolved=$FM_BACKLOG_CANONICAL_RESULT
   [ -d "$root_resolved" ] || {
     FM_BACKLOG_TRANSITION_ERROR="$label authorized directory is not a directory at $root"
     return 1
@@ -676,10 +707,11 @@ fm_backlog_record_parent_authorized() {  # <path> <label> <root> [parent-only]
   if [ -n "${FM_HOME:-}" ]; then
     case "$root" in
       "$FM_HOME"|"$FM_HOME"/*)
-        home_resolved=$(fm_backlog_canonical_existing "$FM_HOME") || {
+        fm_backlog_canonical_directory "$FM_HOME" || {
           FM_BACKLOG_TRANSITION_ERROR="$label home directory cannot be resolved at $FM_HOME"
           return 1
         }
+        home_resolved=$FM_BACKLOG_CANONICAL_RESULT
         case "$root_resolved" in
           "$home_resolved"|"$home_resolved"/*) ;;
           *)
@@ -690,16 +722,22 @@ fm_backlog_record_parent_authorized() {  # <path> <label> <root> [parent-only]
         ;;
     esac
   fi
-  parent_resolved=$(fm_backlog_canonical_existing "$parent") || {
+  fm_backlog_canonical_directory "$parent" || {
     FM_BACKLOG_TRANSITION_ERROR="$label parent directory cannot be resolved at $path"
     return 1
   }
+  parent_resolved=$FM_BACKLOG_CANONICAL_RESULT
   expected_path=${parent_resolved%/}/$base
   if [ -z "$parent_only" ] && { [ -e "$path" ] || [ -L "$path" ]; }; then
-    path_resolved=$(fm_backlog_canonical_existing "$path") || {
-      FM_BACKLOG_TRANSITION_ERROR="$label cannot be resolved at $path"
-      return 1
-    }
+    if [ "$_FM_BACKLOG_SWEEP_OPEN" = 1 ] && [ -n "$base" ] \
+       && [ "$base" != . ] && [ "$base" != .. ] && [ ! -L "$path" ]; then
+      path_resolved=$expected_path
+    else
+      path_resolved=$(fm_backlog_canonical_existing "$path") || {
+        FM_BACKLOG_TRANSITION_ERROR="$label cannot be resolved at $path"
+        return 1
+      }
+    fi
     [ "$path_resolved" = "$expected_path" ] || final_matches=0
   else
     path_resolved=$expected_path
