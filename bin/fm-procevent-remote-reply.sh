@@ -32,7 +32,10 @@
 # the exit status, and the first error line, and ONE keyed blocker
 # `remote-reply-listener-<id>` is raised in the parent's state/<id>.status. While
 # that blocker is open a repeat of the same failure raises nothing more, and the
-# next successful arm or copy removes the record and closes the blocker.
+# next successful arm or copy removes the record and closes the blocker. A cause
+# (phase plus first error line) is alerted once: when it recurs after that close,
+# no new blocker is raised until the cause text changes, an operator re-arms by
+# hand (`arm`), or `listener-ok` confirms recovery.
 #
 # `autohandle` is the runner's own entry into that same `handle`: it takes the
 # canonical source id instead of the secondmate id and is called by the runner
@@ -277,6 +280,7 @@ remote_route_exists() {
 }
 
 listener_error_path() { printf '%s/%s.listener-error\n' "$CURSOR_DIR" "$1"; }
+listener_alerted_path() { printf '%s/%s.listener-alerted\n' "$CURSOR_DIR" "$1"; }
 listener_key() { printf 'remote-reply-listener-%s\n' "$1"; }
 
 # One line of plain text from arbitrary error output: control bytes dropped, the
@@ -292,9 +296,10 @@ listener_alert_open() { # <id>
 
 # Record why the reply listener for <id> stopped copying or could not be armed,
 # and raise one alert. A failure that is already alerted and still open adds no
-# second blocker; a new failure after the blocker closed raises a new one.
+# second blocker; a new cause after the blocker closed raises a new one, and the
+# same cause recurring after that close stays quiet (see the header).
 record_listener_error() { # <id> <arm|copy> <detail> [<sequence> <exit-status>]
-  local id=$1 phase=$2 detail rec dir tmp status_file line key append_rc=0
+  local id=$1 phase=$2 detail rec dir tmp status_file line key cause append_rc=0
   detail=$(listener_detail "$3")
   [ -n "$detail" ] || detail='no error output'
   dir=$CURSOR_DIR
@@ -311,11 +316,19 @@ record_listener_error() { # <id> <arm|copy> <detail> [<sequence> <exit-status>]
   status_file="$STATE/$id.status"
   [ ! -L "$status_file" ] || return 1
   listener_alert_open "$id" && return 0
+  cause="$phase|$detail"
+  [ "$(cat "$(listener_alerted_path "$id")" 2>/dev/null)" != "$cause" ] || return 0
   key=$(listener_key "$id")
   line="blocked [key=$key]: remote reply listener for $id stopped copying replies ($phase failed: $detail); its status here goes stale until the listener is re-armed (fm-procevent-remote-reply.sh arm $id); error recorded in state/remote-replies/$id.listener-error"
   append_status_once "$status_file" "$(status_stamp_line "$line")" || append_rc=$?
   [ "$append_rc" -ne 2 ] || return 1
+  printf '%s\n' "$cause" > "$(listener_alerted_path "$id")" 2>/dev/null || true
   return 0
+}
+
+# Forget which cause was alerted, so the next failure raises a fresh blocker.
+forget_listener_alerted() { # <id>
+  rm -f -- "$(listener_alerted_path "$1")"
 }
 
 # The listener for <id> armed or copied successfully: drop the error record and
@@ -342,6 +355,7 @@ cmd_listener_error() { # <id> <arm|copy> <detail...>
 
 cmd_listener_ok() { # <id>
   validate_id "${1:-}"
+  forget_listener_alerted "$1"
   clear_listener_error "$1"
 }
 
@@ -371,6 +385,7 @@ cmd_arm() {
   (
     fm_lock_acquire_wait "$lock" || die "cannot lock remote reply lifecycle for $id"
     trap 'fm_lock_release "$lock"' EXIT
+    forget_listener_alerted "$id"
     cmd_arm_locked "$id"
   )
 }
@@ -892,6 +907,7 @@ cmd_retire_finalize_locked() {
   write_retirement_count "$id" "$((RETIREMENT_COUNT + 1))" \
     || die "cannot record remote reply retirement"
   rm -f -- "$CURSOR_DIR/$id".*.ingested
+  forget_listener_alerted "$id"
   rm -f -- "$(fm_pending_reply_remote_channel_watermark_path "$STATE" "$id")"
 }
 

@@ -1474,6 +1474,43 @@ EOF
   pass "a secondmate home publishes each hold occurrence and its answer on the parent channel"
 }
 
+# Repeating the hold of a question the parent channel already shows open updates
+# the card without a second status line, and a question the channel shows as
+# resolved is not reopened by repeating its hold.
+test_hold_repeat_updates_card_and_closed_key_is_not_reopened() {
+  local parent mate channel
+  parent=$(make_home repeat-parent)
+  mate="$TMP_ROOT/repeat-mate-home"
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects"
+  fm_test_tasks_toml "$mate/.tasks.toml"
+  printf '# Synthetic secondmate home\n' > "$mate/AGENTS.md"
+  printf 'repeat-mate\n' > "$mate/.fm-secondmate-home"
+  printf 'schema=fm-secondmate-parent.v1\nroute=local\nparent_home=%s\n' "$parent" \
+    > "$mate/.fm-secondmate-parent"
+  printf '## In flight\n\n## Queued\n\n## Done\n' > "$mate/data/backlog.md"
+  fm_fake_exit0 "$(fm_fakebin "$mate")" tmux treehouse no-mistakes gh gh-axi
+  channel="$parent/state/repeat-mate.status"
+
+  run_captain "$mate" hold repeat-call --title "Choose the repeat release" \
+    --reason "first summary" --repo sample >/dev/null || fail "first hold failed"
+  run_captain "$mate" hold repeat-call --reason "first summary and a longer cumulative summary" >/dev/null \
+    || fail "repeat hold with a changed summary failed"
+  [ "$(grep -c 'captain-hold-repeat-call-1' "$channel")" = 1 ] \
+    || fail "a repeat hold with a changed summary added a status line: $(cat "$channel")"
+  assert_grep "$(bash -c '. "$1/bin/fm-hold-reason-lib.sh"; fm_hold_reason_encode "$2"' _ "$ROOT" \
+    "first summary and a longer cumulative summary")" "$mate/data/backlog.md" \
+    "the repeat hold did not update the card reason"
+
+  printf 'resolved [key=captain-hold-repeat-call-1] [at=1]: captain hold repeat-call: closed outside the script\n' >> "$channel"
+  if run_captain "$mate" hold repeat-call --reason "same question again" > "$mate/reopen.out" 2> "$mate/reopen.err"; then
+    fail "a closed question was reopened by repeating its hold"
+  fi
+  assert_grep 'already closed' "$mate/reopen.err" "the refusal did not name the closed question"
+  [ "$(grep -c 'captain-hold-repeat-call-1' "$channel")" = 2 ] \
+    || fail "the refused hold changed the parent channel: $(cat "$channel")"
+  pass "a repeated hold updates its card without a new status line and never reopens a closed question"
+}
+
 test_secondmate_reconcile_publishes_before_request_retirement() {
   local parent mate channel evidence out show rc request
   parent=$(make_home reconcile-parent-channel)
@@ -4797,6 +4834,7 @@ test_none_inventory_and_resolved_prose_do_not_create_holds
 test_terminal_single_owner_status_decision_does_not_block_empty_inventory
 test_secondmate_hold_stays_in_authoritative_home
 test_secondmate_home_publishes_holds_and_answers
+test_hold_repeat_updates_card_and_closed_key_is_not_reopened
 test_secondmate_reconcile_publishes_before_request_retirement
 test_bound_channel_answers_close_at_answer_time
 test_reconcile_never_closes_through_the_keyed_answer_intake

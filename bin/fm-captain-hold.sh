@@ -210,7 +210,10 @@
 # <n> is the count of resolution records the body already carries plus one, so
 # a released and re-held task opens and closes a distinct parent decision with
 # no new persisted state, and an exact retry republishes the same line, which
-# the channel deduplicates. A main home has no channel and publishes nothing.
+# the channel deduplicates. Repeating a hold whose key the channel already shows
+# open updates the card and adds no status line, and repeating one whose key the
+# channel shows closed is refused: a new question needs its own task. A main
+# home has no channel and publishes nothing.
 # The hold or answer is already durable in the backlog, so a channel that
 # cannot be written is reported as `actionable:` on stderr rather than undoing
 # the record; bin/fm-inactive-reconcile.sh's diagnostics name a broken binding.
@@ -251,6 +254,18 @@ publish_parent_hold() {  # <task-id> <occurrence> <verb> <note>
     0|1) PARENT_HOLD_PUBLISHED=1 ;;
     *) printf 'actionable: task %s is held for the captain in this home but that did not reach the parent channel (rc=%s)\n' "$id" "$rc" >&2 ;;
   esac
+}
+
+# This home's outbound parent channel file, printed; empty in a main home or
+# when the binding is unusable (publish_parent_hold reports that case itself).
+parent_hold_stream() {
+  fm_parent_channel_destination "$FM_HOME" "$STATE" 2>/dev/null || true
+}
+
+# Whether the parent channel already carries <key> as an open decision.
+parent_hold_key_open() {  # <stream> <key>
+  [ -f "$1" ] || return 1
+  status_open_decisions "$1" | cut -f1 | grep -Fqx -- "$2"
 }
 
 CAPTAIN_META_LOCK=
@@ -1049,7 +1064,7 @@ verify_entry_durable() {  # <origin-or-empty> <entry>; prints "<id> <how> <origi
 
 command_hold() {
   local id=${1:-} title='' reason='' repo='' origin='' until='' show state existing_title body='' hold_kind hold_set occurrence
-  local existing_hold_kind='' existing_held='' preserve_hold_set=0 stored_reason previous_origin='' hold_status=0
+  local existing_hold_kind='' existing_held='' preserve_hold_set=0 stored_reason previous_origin='' hold_status=0 stream='' key closing
   [ "$#" -ge 1 ] || { usage >&2; exit 2; }
   shift
   while [ "$#" -gt 0 ]; do
@@ -1092,6 +1107,18 @@ command_hold() {
     existing_held=$(show_field_value "$show" held)
     if [ "$existing_hold_kind" = captain ] && [ "$existing_held" = yes ]; then
       preserve_hold_set=1
+    fi
+    # A question the parent channel already shows as resolved is not reopened
+    # by repeating its hold: the repeat would reuse the closed key and present
+    # an answered question as new. An answer opens a fresh occurrence on its
+    # own; a call that is genuinely new needs its own task.
+    stream=$(parent_hold_stream)
+    if [ -n "$stream" ]; then
+      key="captain-hold-$id-$(( $(resolution_record_count "$(show_field "$show" body)") + 1 ))"
+      closing=$(status_key_closing_verb "$stream" "$key")
+      # The verb is the key's open verb while it is still open.
+      [ -z "$closing" ] || parent_hold_key_open "$stream" "$key" \
+        || fail "$key is already closed ($closing) on the parent channel; hold a new task for a new question"
     fi
     if [ -n "$title" ]; then
       existing_title=$(show_field_value "$show" title)
@@ -1154,7 +1181,13 @@ command_hold() {
   occurrence=$(( $(resolution_record_count "$(show_field "$show" body)") + 1 ))
   [ -n "$(body_hold_set_timestamp "$(show_field_value "$show" body)")" ] \
     || fail "task $id lost its hold-set stamp while being held"
-  publish_parent_hold "$id" "$occurrence" needs-decision "$reason"
+  # Repeating the hold of a question the parent channel already shows open
+  # updates the card above and adds no second status line.
+  if [ "$preserve_hold_set" = 1 ] && parent_hold_key_open "$stream" "captain-hold-$id-$occurrence"; then
+    :
+  else
+    publish_parent_hold "$id" "$occurrence" needs-decision "$reason"
+  fi
   printf '%s\n' "$id"
 }
 

@@ -1349,4 +1349,19 @@ remote_env "$ADAPTER" listener-error ios arm "ssh: connection refused" >/dev/nul
 remote_env "$ADAPTER" listener-ok ios >/dev/null 2>&1
 pass "a listener that cannot copy or arm records its error and raises one alert until it recovers"
 
+# The same cause recurring after its alert closed (a flapping listener) raises nothing more; a changed cause does.
+remote_env "$ADAPTER" listener-error ios copy "error: remote reply generation conflicts with its ingestion receipt" >/dev/null 2>&1
+flap_before=$(listener_blockers)
+echo "resolved [key=remote-reply-listener-ios] [at=1]: copying again" >> "$LISTENER_STATUS"
+remote_env "$ADAPTER" listener-error ios copy "error: remote reply generation conflicts with its ingestion receipt" >/dev/null 2>&1
+[ "$(listener_blockers)" -eq "$flap_before" ] || fail "the same cause recurring after its alert closed raised another alert"
+echo "resolved [key=remote-reply-listener-ios] [at=2]: copying again" >> "$LISTENER_STATUS"
+remote_env "$ADAPTER" listener-error ios copy "error: remote reply generation conflicts with its ingestion receipt" >/dev/null 2>&1
+[ "$(listener_blockers)" -eq "$flap_before" ] || fail "a second recurrence of the same cause raised another alert"
+echo "resolved [key=remote-reply-listener-ios] [at=3]: copying again" >> "$LISTENER_STATUS"
+remote_env "$ADAPTER" listener-error ios copy "error: a different failure" >/dev/null 2>&1
+[ "$(listener_blockers)" -eq $((flap_before + 1)) ] || fail "a changed cause did not raise a new alert"
+remote_env "$ADAPTER" listener-ok ios >/dev/null 2>&1
+pass "a cause already alerted is not alerted again after it closes unless its text changes"
+
 echo "ALL TESTS PASSED"
