@@ -539,6 +539,10 @@ That carve-out is scoped to provider registration alone:
 - The copy is never persisted.
 - A provider whose registration fails to compose is simply unavailable.
 
+The claude-bridge provider serves only system prompts that a session recorded, and the bridge extension is not loaded into the branch.
+The branch therefore hands its own session to the recorder the bridge publishes under `Symbol.for("claude-bridge:recordSessionPrompts")`.
+A bridge release without that recorder refuses every branch turn with a `prompt-capture: no capture` error.
+
 `tests/fm-pi-branch-extension.test.sh` pins the pin-and-fallthrough behavior.
 
 ### No further caching machinery

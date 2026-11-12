@@ -165,6 +165,10 @@ const BRANCH_TOOL_NAMES = ["read", "bash", "fm_branch_report"] as const;
 // from the home path so it survives restarts; main keeps its own session key.
 const branchCacheKey = `fm-branch-${createHash("sha256").update(fmHome).digest("hex").slice(0, 24)}`;
 
+// pi-claude-bridge's recorder for a session it was not loaded into; absent
+// from a bridge without it and when no claude-bridge extension is loaded.
+const CLAUDE_BRIDGE_RECORD_SESSION_PROMPTS = Symbol.for("claude-bridge:recordSessionPrompts");
+
 const MIRROR_MESSAGE_CAP = 4000;
 const MERGE_NOTE_BOAT = "⛵";
 const VISIBLE_OUTCOME_ANCHOR = "⚓";
@@ -1377,7 +1381,9 @@ export default function (pi: ExtensionAPI) {
     // The branch loads no project resources at all: extensions off (so it can
     // never spawn its own branch), skills/context files off (they vary per
     // home and would destabilize the byte-stable prefix). Its whole standing
-    // context is the generator's prompt.
+    // context is the generator's prompt. The claude-bridge provider serves
+    // only prompts a session recorded, so the branch declares its own through
+    // the recorder the bridge publishes; without one nothing is recorded.
     const loader = new DefaultResourceLoader({
       cwd: fmRoot,
       agentDir: getAgentDir(),
@@ -1400,6 +1406,13 @@ export default function (pi: ExtensionAPI) {
                 return { ...(payload as Record<string, unknown>), prompt_cache_key: branchCacheKey };
               }
             });
+          },
+        },
+        {
+          name: "fm-branch-claude-bridge-prompt",
+          factory: (branchPi: ExtensionAPI) => {
+            const record = (globalThis as Record<symbol, unknown>)[CLAUDE_BRIDGE_RECORD_SESSION_PROMPTS];
+            if (typeof record === "function") record(branchPi);
           },
         },
       ],

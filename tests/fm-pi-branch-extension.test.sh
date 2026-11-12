@@ -723,6 +723,26 @@ const untouched = cacheHandler({ type: "before_provider_request", payload: { mod
 if (untouched !== undefined) throw new Error("cache-key hook rewrote a provider payload with no prompt_cache_key");
 console.log(`CACHE_KEY=${rewriteA.prompt_cache_key}`);
 
+// 3b. The branch declares its own prompt to a loaded claude-bridge: every
+// factory hands the branch's extension API to the recorder the bridge
+// publishes, and without a published recorder the branch still builds.
+const recorderKey = Symbol.for("claude-bridge:recordSessionPrompts");
+const runFactories = () => {
+  const branchApi = { on: () => {} };
+  for (const entry of loader.options.extensionFactories) {
+    (typeof entry === "function" ? entry : entry.factory)(branchApi);
+  }
+  return branchApi;
+};
+runFactories();
+const recorded = [];
+globalThis[recorderKey] = (api) => recorded.push(api);
+const recordedApi = runFactories();
+delete globalThis[recorderKey];
+if (recorded.length !== 1 || recorded[0] !== recordedApi) {
+  throw new Error(`branch did not hand its session to the claude-bridge prompt recorder exactly once (${recorded.length})`);
+}
+
 // 4. Two-stage filter, stage 2: routine while main is idle appends with no
 // turn; routine while main is busy defers to after the captain's next prompt;
 // captain-relevant persists a visible entry with no model turn. Store rows are
