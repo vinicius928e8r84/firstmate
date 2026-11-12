@@ -36,6 +36,12 @@
 #
 # Sourced by those scripts and by tests. No side effects on source beyond its
 # sourced libraries.
+#
+# fm_merge_authority_resolve reuses the verdict of one `fm-afk-contract.sh
+# validate` run within a process while the home, the state directory, and the
+# size, inode and mtime of state/.afk-contract and state/.afk all stay the same,
+# so a loop over every task validates the record once instead of once per task.
+# Any change to those inputs, or a signature that cannot be read, validates again.
 
 _FM_MERGE_AUTHORITY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-pr-lib.sh
@@ -50,6 +56,39 @@ FM_MERGE_AUTHORITY_REASON=
 # shellcheck disable=SC2034 # Public results consumed by sourcing callers.
 FM_MERGE_AUTHORITY_RECORD_IDENTITY=
 
+_FM_MERGE_AUTHORITY_VALIDATE_KEY=
+_FM_MERGE_AUTHORITY_VALIDATE_STATUS=
+
+# Print the identity of the files the validate verdict depends on. An absent
+# state/.afk is a normal answer (stat reports it and still lists the record), so
+# only an empty signature means the record could not be read at all.
+_fm_merge_authority_record_signature() {  # <state>
+  case "$OSTYPE" in
+    darwin*) /usr/bin/stat -f '%i:%z:%Fm' "$1/.afk-contract" "$1/.afk" 2>/dev/null ;;
+    *) stat -c '%i:%s:%y' "$1/.afk-contract" "$1/.afk" 2>/dev/null ;;
+  esac
+}
+
+# Run `fm-afk-contract.sh validate` for <home>/<state>, at most once per
+# unchanged record within this process. Returns the validate status.
+_fm_merge_authority_record_valid() {  # <home> <state>
+  local home=$1 state=$2 signature key status=0
+  signature=$(_fm_merge_authority_record_signature "$state" || :)
+  if [ -n "$signature" ]; then
+    key=$home$'\n'$state$'\n'$signature
+    if [ "$key" = "$_FM_MERGE_AUTHORITY_VALIDATE_KEY" ]; then
+      return "$_FM_MERGE_AUTHORITY_VALIDATE_STATUS"
+    fi
+  fi
+  FM_HOME="$home" FM_STATE_OVERRIDE="$state" \
+    "$_FM_MERGE_AUTHORITY_LIB_DIR/fm-afk-contract.sh" validate >/dev/null 2>&1 || status=$?
+  if [ -n "$signature" ]; then
+    _FM_MERGE_AUTHORITY_VALIDATE_KEY=$key
+    _FM_MERGE_AUTHORITY_VALIDATE_STATUS=$status
+  fi
+  return "$status"
+}
+
 fm_merge_authority_resolve() {  # <home> <state> <meta> <task-id>
   local home=${1-} state=${2-} meta=${3-} id=${4-}
   FM_MERGE_AUTHORITY=
@@ -61,8 +100,7 @@ fm_merge_authority_resolve() {  # <home> <state> <meta> <task-id>
     FM_MERGE_AUTHORITY_REASON='attended'
     return 0
   fi
-  if ! FM_HOME="$home" FM_STATE_OVERRIDE="$state" \
-    "$_FM_MERGE_AUTHORITY_LIB_DIR/fm-afk-contract.sh" validate >/dev/null 2>&1; then
+  if ! _fm_merge_authority_record_valid "$home" "$state"; then
     FM_MERGE_AUTHORITY_REASON='record-unreadable'
     return 1
   fi
