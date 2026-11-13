@@ -980,6 +980,39 @@ test_sleep_sweep_opens_a_sleeping_mate_that_has_work_and_closes_idle_opted_in_ma
   pass "sleep sweep: only opted-in idle mates close, and a sleeping mate with work reopens"
 }
 
+# A per-repo mate is registered dormant: seeded, never launched, marked. The
+# registry line is its only record, so sleep must accept it without a task
+# record, and the first routed work must be its first launch.
+test_sleep_marks_a_seeded_mate_that_was_never_launched() {
+  local w fb tmuxfb log out status
+  w=$(new_world sleep-seeded)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+  rm -f "$w/home/state/sm1.meta"
+  mkdir -p "$w/home/data"
+  printf -- '- sm1 - Own the widget pipeline. (home: %s; scope: widget pull requests; projects: p; added 2026-11-13)\n' \
+    "$w/sm1" > "$w/home/data/secondmates.md"
+
+  out=$(run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" sleep ghost); status=$?
+  expect_code 3 "$status" "an id with no registry line must be refused: $out"
+  assert_absent "$w/home/state/ghost.asleep" "an unregistered id was marked"
+
+  printf '# Backlog\n\n## Queued\n- [ ] job-1 - a queued job (repo: p) (kind: ship) (since 2026-11-13)\n' > "$w/sm1/data/backlog.md"
+  out=$(run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" sleep sm1); status=$?
+  expect_code 3 "$status" "a seeded mate that already holds work must not be marked: $out"
+  assert_contains "$out" "open item" "the refusal must name the queued job"
+  assert_absent "$w/home/state/sm1.asleep" "a refused sleep left a mark"
+
+  printf '# Backlog\n\n## Queued\n' > "$w/sm1/data/backlog.md"
+  out=$(run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" sleep sm1); status=$?
+  expect_code 0 "$status" "a registered mate that never ran should be marked: $out"
+  assert_present "$w/home/state/sm1.asleep" "the sleeping mark was not written"
+  assert_contains "$(run_sleep "$tmuxfb:$fb" "$w/home" zsh "$log" status sm1)" "sm1 never-launched" "status must say it never ran"
+  [ ! -s "$log" ] || fail "marking a mate that never ran must not touch any endpoint: $(cat "$log")"
+  pass "sleep: a seeded mate that never ran is marked dormant from its registry line alone"
+}
+
 test_send_reopens_a_sleeping_mate_first() {
   local w fb tmuxfb log out status
   w=$(new_world send-wakes)
@@ -1029,6 +1062,7 @@ test_sleep_closes_an_idle_mate_and_refuses_one_with_work
 test_sleep_refuses_a_live_mate_that_is_not_provably_idle
 test_wake_reopens_a_sleeping_mate_and_clears_the_mark
 test_sleep_sweep_opens_a_sleeping_mate_that_has_work_and_closes_idle_opted_in_mates
+test_sleep_marks_a_seeded_mate_that_was_never_launched
 test_send_reopens_a_sleeping_mate_first
 test_remote_poll_probe_maps_states
 test_remote_poll_probe_unreachable_preserves_route

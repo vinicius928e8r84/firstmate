@@ -285,6 +285,7 @@ A home with its own settings file keeps it.
 An idle secondmate still costs tokens: every notice wakes the model with its whole context.
 Gitignored `config/secondmate-sleep` lists, one id per line (`*` for every local secondmate, `#` starts a comment), the secondmates that close while they have no work and reopen when work arrives; an absent file sleeps none.
 `bin/fm-secondmate-sleep.sh` owns the contract: `sleep <id>` closes a local mate only when it provably has no work (no crewmate record in its home, no open backlog item, no unresolved parent request, no inbox message, a recorded idle busy state, and `FM_SECONDMATE_SLEEP_IDLE_SECS` of quiet), then writes `state/<id>.asleep`.
+A seeded mate that was never launched has nothing to close, so `sleep <id>` only writes the mark once its home holds no work, and it stays dormant until work is routed to it.
 While that mark exists and the endpoint is dead or gone, neither the session-start sweep nor the watcher's liveness tick relaunches the mate, and the wake-stall check skips it.
 `wake <id>` reopens it through the guarded relaunch, or through the first launch for a seeded mate that never ran, and clears the mark.
 `bin/fm-send.sh` wakes a marked mate before any delivery except the no-reply fire-and-forget plane, so a steer or a backlog handoff is enough to reopen it, and the watcher runs `sweep` every `FM_SECONDMATE_SLEEP_SECS` (default 300) as the backstop for work that arrived without a send.

@@ -162,6 +162,7 @@ A per-repo secondmate owns one repo's PR pipeline on the machine its workers run
 Print its charter with `bin/fm-repo-charter.sh <project> [--merge-script <path>] [--rule-file <file>]` and seed it with `FM_SECONDMATE_CHARTER` and `FM_SECONDMATE_SCOPE` set from that output, so no repo reuses another repo's text; the script header owns the options and the seed command.
 Seeding writes the route and leaves the mate unlaunched, which is the ready-to-switch-on state; launching it is a separate `bin/fm-spawn.sh <id> --secondmate`.
 List its id in `config/secondmate-sleep` so it closes while it has no work, and give it a compaction point with a `secondmate <cap> <model> <window>` line in `config/worker-context-cap`; [`docs/configuration.md` "Secondmate sleep"](../../../docs/configuration.md#secondmate-sleep-configsecondmate-sleep) owns both.
+To register a repo's mate without opening it, seed it and run `bin/fm-secondmate-sleep.sh sleep <id>` instead of launching it; its first routed work is then its first launch.
 A mate closed on purpose carries `state/<id>.asleep`: liveness recovery leaves it closed, and `bin/fm-send.sh` or `bin/fm-secondmate-sleep.sh wake <id>` reopens it.
 Retiring the mate, as below, undoes the whole route.
 

@@ -9,6 +9,8 @@
 #
 # Usage:
 #   fm-secondmate-sleep.sh sleep <id>   close <id> if it is provably idle, then mark it asleep
+#                                       (a seeded mate never launched is only marked, so it
+#                                       stays closed until work is routed to it)
 #   fm-secondmate-sleep.sh wake <id>    reopen <id> (first launch for a seeded mate never launched) and clear the mark
 #   fm-secondmate-sleep.sh sweep        sleep every idle opted-in mate; wake every sleeping mate that has work
 #   fm-secondmate-sleep.sh status [id]  one line per marked or opted-in mate: <id> asleep|awake|never-launched [opted-in]
@@ -155,11 +157,32 @@ lock_mate() {  # <id>
   done
 }
 
+# A mate that is registered here but was never launched has no endpoint to
+# stop: marking it is the whole act, and its first launch is then the wake.
+cmd_sleep_seeded() {  # <id>
+  local id=$1 reg="$DATA_DIR/secondmates.md" home reason
+  secondmate_registry_field "$reg" "$id" home >/dev/null 2>&1 \
+    || { echo "refused: $id is not a secondmate of this home" >&2; return 3; }
+  [ -z "$(secondmate_registry_field "$reg" "$id" host 2>/dev/null)" ] \
+    || { echo "refused: $id runs on a remote host; only local secondmates sleep" >&2; return 3; }
+  home=$(home_of "$id") || { echo "error: cannot resolve the home of $id" >&2; return 1; }
+  if ! reason=$(idle_check "$id" "$home" owned); then
+    echo "refused: $id stays unmarked: $reason" >&2
+    return 3
+  fi
+  date +%s > "$(marker_of "$id")" || { echo "error: could not write $(marker_of "$id")" >&2; return 1; }
+  echo "$id asleep (never launched)"
+}
+
 cmd_sleep() {  # <id>
   local id=$1 meta="$STATE/$1.meta" home reason rc=0 out
   valid_id "$id" || usage
+  if [ ! -e "$meta" ]; then
+    cmd_sleep_seeded "$id"
+    return
+  fi
   [ -f "$meta" ] && [ "$(fm_meta_get "$meta" kind)" = secondmate ] \
-    || { echo "refused: $id is not a launched secondmate of this home" >&2; return 3; }
+    || { echo "refused: $id is not a secondmate of this home" >&2; return 3; }
   [ -z "$(fm_meta_get "$meta" remote_host)" ] \
     || { echo "refused: $id runs on a remote host; only local secondmates sleep" >&2; return 3; }
   home=$(home_of "$id") || { echo "error: cannot resolve the home of $id" >&2; return 1; }
