@@ -49,11 +49,22 @@ rm -f "$T/state/.lane-guard-alerts"
 "$ROOT/bin/fm-spawn.sh" gone /nonexistent/proj --mode local-only --yolo off >/dev/null 2>&1; spawn_rc=$?
 check spawn-fails "$([ "$spawn_rc" -ne 0 ] && echo yes)" yes
 ls "$T"/state/spawn-failures/gone.*.fail >/dev/null 2>&1; check spawn-recorded $? 0
+grep -q '^stderr=.\+' "$T"/state/spawn-failures/gone.*.fail; check spawn-stderr-recorded $? 0
 out=$("$LG" scan spawn); rc=$?
 check spawn-warn-exit "$rc" 1
+printf '%s' "$out" | grep -q 'stderr: '; check spawn-warn-has-stderr $? 0
 printf '%s' "$out" | grep -q 'worker creation failed: task gone exited'; check spawn-warn-text $? 0
 grep -q '^add --key lane-guard-spawn-gone' "$T/asks.calls"; check spawn-ask $? 0
 "$LG" scan spawn >/dev/null; check spawn-warn-once "$?" 0
+# stderr text: redacted, newline-folded, truncated to the tail
+printf 'first line\nlogin https://u:pw0rd@h/x token=abc123XYZ Bearer tok.en-9 ghp_abcdefghij1234\n%s\nlast words\n' "$(head -c 5000 /dev/zero | tr '\0' 'a')" > "$T/err.txt"
+FM_LG_STDERR_FILE="$T/err.txt" "$LG" record-spawn-failure errcase 1 ship; ef=$(ls "$T"/state/spawn-failures/errcase.*.fail)
+[ "$(grep -c '' "$ef")" = 9 ]; check stderr-one-line-field $? 0
+grep -q 'pw0rd\|abc123XYZ\|tok.en-9\|ghp_abc' "$ef"; check stderr-no-secret $? 1
+grep -q '^stderr=a*\\nlast words' "$ef"; check stderr-tail-kept $? 0
+grep -q 'first line' "$ef"; check stderr-truncated $? 1
+[ "$(sed -n 's/^stderr=//p' "$ef" | wc -c)" -le 2100 ]; check stderr-bounded $? 0
+rm -f "$ef"
 "$LG" record-spawn-failure ok1 1 ship proj herdr pi; : > "$T/state/ok1.meta"   # a later spawn published its record
 "$LG" scan spawn >/dev/null; check spawn-recovered-quiet "$?" 0
 "$LG" record-spawn-failure '../bad' 1 >/dev/null 2>&1; check spawn-bad-id "$?" 1

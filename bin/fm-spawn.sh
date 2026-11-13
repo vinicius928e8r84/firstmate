@@ -1634,18 +1634,38 @@ spawn_orca_reclaim_launch_file() {
 # capacity deferral of an ordinary spawn is a queue wait, not a failure; a
 # scheduled loop's is a missed run, so it is recorded too. bin/fm-scheduled-spawn.sh
 # retries and alerts on its own record, so a spawn it runs records nothing.
+# Everything this process writes to stderr is also teed to SPAWN_STDERR_FILE so a
+# failure record carries the reason (fm-lane-guard.sh truncates and redacts it).
+# spawn_stderr_flush restores the real stderr, which ends the tee, and waits for it.
+SPAWN_STDERR_FILE=""; SPAWN_STDERR_TEE_PID=""
+spawn_stderr_capture() {
+  SPAWN_STDERR_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-spawn-stderr.XXXXXX" 2>/dev/null) || { SPAWN_STDERR_FILE=""; return 0; }
+  chmod 600 "$SPAWN_STDERR_FILE" 2>/dev/null || true
+  exec 8>&2
+  exec 2> >(tee -a "$SPAWN_STDERR_FILE" >&8 2>/dev/null)
+  SPAWN_STDERR_TEE_PID=$!
+}
+spawn_stderr_flush() {
+  [ -n "$SPAWN_STDERR_TEE_PID" ] || return 0
+  exec 2>&8
+  wait "$SPAWN_STDERR_TEE_PID" 2>/dev/null || true
+  SPAWN_STDERR_TEE_PID=""
+}
 spawn_failure_record() {  # <status>
   [ "$1" -ne 0 ] || return 0
   [ "$1" -ne "${FM_PROJECT_CAPACITY_DEFER_EXIT:-75}" ] || [ -n "${SCHEDULED_LOOP:-}" ] || return 0
   [ -z "${FM_SCHEDULED_SPAWN_HELPER:-}" ] || return 0
   [ -n "${ID:-}" ] && [ -n "${STATE:-}" ] || return 0
-  FM_HOME="${FM_HOME:-}" FM_STATE_OVERRIDE="$STATE" "$FM_ROOT/bin/fm-lane-guard.sh" record-spawn-failure \
+  spawn_stderr_flush
+  FM_LG_STDERR_FILE="${SPAWN_STDERR_FILE:-}" FM_HOME="${FM_HOME:-}" FM_STATE_OVERRIDE="$STATE" "$FM_ROOT/bin/fm-lane-guard.sh" record-spawn-failure \
     "$ID" "$1" "${KIND:-}" "${PROJ_ABS:-}" "${BACKEND:-}" "${HARNESS:-}" "${SCHEDULED_LOOP:-}" </dev/null >/dev/null 2>&1 || true
 }
 
 spawn_abort_cleanup() {
   local status=$?
   spawn_failure_record "$status"
+  spawn_stderr_flush
+  [ -z "$SPAWN_STDERR_FILE" ] || rm -f "$SPAWN_STDERR_FILE"
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] &&
     [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] &&
     [ -n "$SPAWN_META_TMP" ] &&
@@ -1864,6 +1884,7 @@ spawn_abort_cleanup() {
   fi
   return "$status"
 }
+spawn_stderr_capture
 trap spawn_abort_cleanup EXIT
 
 # One lock per live Herdr session/socket, shared across all homes. <session>
