@@ -1087,7 +1087,7 @@ test_pi_worker_context_files_flag_follows_the_config() {
   out=$(run_control "$dir" "$id" relaunch --note "on"); rc=$?
   expect_code 0 "$rc" "a Pi relaunch with the flag on should succeed"$'\n'"$out"
   assert_contains "$(cat "$dir/fake/literal")" "--no-context-files --append-system-prompt" "the worker in a Firstmate copy must launch without AGENTS.md"
-  assert_contains "$(cat "$dir/fake/literal")" "Read AGENTS.md in your worktree yourself" "the worker was not told how to reach the file"
+  assert_contains "$(cat "$dir/fake/literal")" "read the relevant section of AGENTS.md in your worktree" "the worker was not told how to reach the file"
 
   # on, but the worktree is another project's: untouched.
   rm "$dir/wt/bin/fm-spawn.sh"

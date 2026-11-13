@@ -490,7 +490,8 @@
 #   AGENTS.md) launches with --no-context-files, so the supervisor's AGENTS.md
 #   (about 17.8k tokens on every request) is not loaded into a worker that
 #   follows its brief instead, plus a one-line --append-system-prompt telling it
-#   to read AGENTS.md itself before editing shared tracked material. Secondmates,
+#   to read the relevant section of AGENTS.md itself before changing that file or
+#   behavior one of its rules describes. Secondmates,
 #   raw launch commands, worktrees of any other project, and a Pi that does not
 #   advertise the flag are never touched. Any other value refuses the spawn
 #   before any mutation. Read on every spawn and relaunch; not inherited. Delete
@@ -6781,7 +6782,7 @@ if [ "$PI_NOCTX" = on ] && [ "$KIND" != secondmate ] && [ "$RAW_LAUNCH" -eq 0 ] 
   { [ "$HARNESS" = pi ] || [ "$HARNESS" = pi-signed ]; } &&
   [ -n "${WT:-}" ] && [ -f "$WT/bin/fm-spawn.sh" ] && [ -f "$WT/AGENTS.md" ] &&
   pi_supports_no_context_files "$PI_BIN"; then
-  PI_CONTEXT=" --no-context-files --append-system-prompt $(shell_quote "The supervisor's AGENTS.md is not loaded in this worker; your launch brief is your contract. Read AGENTS.md in your worktree yourself before editing AGENTS.md, bin/ or .agents/skills/.")"
+  PI_CONTEXT=" --no-context-files --append-system-prompt $(shell_quote "The supervisor's AGENTS.md is not loaded in this worker; your launch brief is your contract. Before you change AGENTS.md or behavior one of its rules describes, read the relevant section of AGENTS.md in your worktree (search it; it is long).")"
 fi
 LAUNCH=${LAUNCH//__PICONTEXT__/$PI_CONTEXT}
 LAUNCH=${LAUNCH//__CLAUDEPERMFLAG__/$CLAUDE_PERM_FLAG}

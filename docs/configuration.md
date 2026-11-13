@@ -1432,7 +1432,7 @@ Neither fallback is unrestricted execution, and Firstmate does not change vendor
 
 A Pi worker launched in a Firstmate copy loads this repository's `AGENTS.md`, the supervisor's contract, into every request: about 52 KB, 17.8 thousand tokens, though the worker follows its launch brief instead.
 The optional local, gitignored `config/pi-worker-no-context-files` holds one token, `on` or `off`, and absent means `off`, so with no file every launch is exactly as before.
-With `on`, a Pi or pi-signed ship or scout whose worktree holds both `bin/fm-spawn.sh` and `AGENTS.md` launches with `--no-context-files` and a one-line appended system prompt telling it to read `AGENTS.md` in its worktree before editing `AGENTS.md`, `bin/` or `.agents/skills/`.
+With `on`, a Pi or pi-signed ship or scout whose worktree holds both `bin/fm-spawn.sh` and `AGENTS.md` launches with `--no-context-files` and a one-line appended system prompt telling it to read the relevant section of `AGENTS.md` in its worktree before changing that file or behavior one of its rules describes.
 Secondmates, raw launch commands, worktrees of any other project, and a Pi that does not advertise `--no-context-files` are never touched.
 Any other value refuses the spawn or relaunch before anything changes, and a relaunch refuses before the running worker stops.
 The file is read on every spawn and relaunch and is not inherited by a secondmate home.
