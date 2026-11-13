@@ -188,7 +188,12 @@
 #     line per task: id, kind, delivery mode, yolo, remote host, endpoint
 #     liveness (ep=), open=N when N decisions or blockers are still open, and the
 #     newest status line that is not pending-reply bookkeeping (capped), plus a
-#     pr= line. The full record stays in state/<id>.meta and state/<id>.status.
+#     pr= line unless that status line already shows the same URL. An orphan log
+#     whose newest event is `resolved` with no decision left open is closed
+#     history, so it is named in one line of ids instead of a line of its own;
+#     every other verb, `done` included, keeps its line because it can still
+#     name a ready branch or PR. The full record stays in state/<id>.meta and
+#     state/<id>.status.
 #     A locked digest lists every open decision in the drain's OPEN DECISIONS
 #     section; a read-only one, which runs no drain, lists them under the task.
 #   FM_SESSION_START_BACKLOG_VIEW - the tasks-axi listing caps titles and hold
@@ -877,7 +882,14 @@ EOF
   [ ! -f "$status" ] || last=$(newest_task_event "$status")
   fm_cap_line_var "${last:-no status event yet}" 200
   printf '%s | %s\n' "$line" "$FM_LINE_CAP_LINE"
-  [ -z "$pr" ] || printf '  pr=%s\n' "$pr"
+  # The recorded URL is repeated only when the line above does not already show
+  # it whole: a longer number sharing its digits is another PR.
+  if [ -n "$pr" ]; then
+    case "$FM_LINE_CAP_LINE " in
+      *"$pr"[!0-9]*) ;;
+      *) printf '  pr=%s\n' "$pr" ;;
+    esac
+  fi
   # A read-only digest runs no drain, so it has no OPEN DECISIONS section.
   [ "$READ_ONLY" -eq 1 ] && [ "$n" -gt 0 ] || return 0
   while IFS=$'\t' read -r key verb note; do
@@ -1408,6 +1420,8 @@ subsection "Orphan status logs (state/*.status without matching .meta)"
 # FM_SESSION_START_ORPHAN_DAYS days.
 ORPHAN_STATUS_FOUND=0
 ORPHAN_STATUS_OMITTED=0
+ORPHAN_RESOLVED=''
+ORPHAN_RESOLVED_COUNT=0
 ORPHAN_NOW=$(date +%s 2>/dev/null || printf 0)
 for status in "$STATE"/*.status; do
   [ -f "$status" ] || continue
@@ -1424,12 +1438,23 @@ for status in "$STATE"/*.status; do
   fi
   ORPHAN_STATUS_FOUND=1
   if [ "$TASK_VIEW" = compact ]; then
-    print_task_line "$id" '' '' "$status" "$orphan_open"
+    orphan_verb=
+    [ -n "$orphan_open" ] || status_line_verb "$(newest_task_event "$status")" orphan_verb
+    if [ "$orphan_verb" = resolved ]; then
+      ORPHAN_RESOLVED="$ORPHAN_RESOLVED $id"
+      ORPHAN_RESOLVED_COUNT=$((ORPHAN_RESOLVED_COUNT + 1))
+    else
+      print_task_line "$id" '' '' "$status" "$orphan_open"
+    fi
     continue
   fi
   printf '\n--- %s ---\n' "$id"
   print_status_tail "$status"
 done
+if [ "$ORPHAN_RESOLVED_COUNT" -gt 0 ]; then
+  printf '%s orphan status log(s) closed by a resolved event, no open decision (state/<id>.status has each one):%s\n' \
+    "$ORPHAN_RESOLVED_COUNT" "$ORPHAN_RESOLVED"
+fi
 if [ "$ORPHAN_STATUS_OMITTED" -gt 0 ]; then
   printf '\n%s older orphan status log(s) with no open decision omitted (idle more than %s day(s); logs in %s).\n' \
     "$ORPHAN_STATUS_OMITTED" "$ORPHAN_DAYS" "$STATE"

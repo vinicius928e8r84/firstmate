@@ -1385,9 +1385,25 @@ EOF
   printf 'working [at=%s]: stale worker\n' "$old" > "$home/state/orph-stale2.status"
   printf 'needs-decision [at=%s] [key=k1]: old but unanswered\n' "$old" > "$home/state/orph-open.status"
   printf 'working [at=%s]: fresh orphan\n' "$((now - 3600))" > "$home/state/orph-fresh.status"
+  # Recent logs closed by a resolved event are history; a recent done one may
+  # still name a ready branch, and a resolved one with another key open is not closed.
+  printf 'needs-decision [at=%s] [key=k2]: pick\nresolved [at=%s] [key=k2]: answered: closed history A\n' \
+    "$((now - 7200))" "$((now - 3600))" > "$home/state/orph-closed-a.status"
+  printf 'blocked [at=%s] [key=k3]: stuck\nresolved [at=%s] [key=k3]: auto-closed history B\n' \
+    "$((now - 7200))" "$((now - 3600))" > "$home/state/orph-closed-b.status"
+  printf 'done [at=%s]: ready in branch fm/orph-ready\n' "$((now - 3600))" > "$home/state/orph-ready.status"
+  printf 'needs-decision [at=%s] [key=k4]: still open\nneeds-decision [at=%s] [key=k5]: other\nresolved [at=%s] [key=k5]: answered\n' \
+    "$((now - 7200))" "$((now - 7100))" "$((now - 3600))" > "$home/state/orph-half.status"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   orphans=$(printf '%s\n' "$out" | awk '/^Orphan status logs/ { flag = 1 } /^AFK$/ { flag = 0 } flag')
+  assert_contains "$orphans" "2 orphan status log(s) closed by a resolved event, no open decision (state/<id>.status has each one): orph-closed-a orph-closed-b" \
+    "recent orphan logs closed by a resolved event were not named in one line"
+  assert_not_contains "$orphans" "closed history" "a closed orphan log still printed its resolved event"
+  assert_contains "$orphans" "orph-ready | done [at=$((now - 3600))]: ready in branch fm/orph-ready" \
+    "a recent done orphan log lost the line that names its ready branch"
+  assert_contains "$orphans" "orph-half open=1 | resolved [at=$((now - 3600))] [key=k5]: answered" \
+    "an orphan log with a decision still open was folded into the closed ids"
   assert_not_contains "$orphans" "orph-stale " "an idle orphan log with no open decision was still listed"
   assert_not_contains "$orphans" "orph-stale2" "a second idle orphan log was still listed"
   assert_contains "$orphans" "orph-open open=1 | needs-decision [at=$old] [key=k1]: old but unanswered" \
@@ -1403,6 +1419,8 @@ EOF
 
   out=$(FM_SESSION_START_TASK_VIEW=full run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   assert_not_contains "$out" "--- orph-stale ---" "the full view listed an idle orphan log"
+  assert_contains "$out" "--- orph-closed-a ---" "the full view folded a recent closed orphan log"
+  assert_not_contains "$out" "closed by a resolved event" "the full view printed the compact closed-ids line"
   assert_contains "$out" "--- orph-open ---" "the full view omitted an orphan log with an open decision"
   assert_contains "$out" "--- orph-fresh ---" "the full view omitted a recent orphan log"
 
@@ -3485,9 +3503,19 @@ EOF
   long="done [at=6]: a long result line$(awk 'BEGIN { while (i++ < 60) printf " padding" }')"
   printf '%s\n' "$long" > "$home/state/mate-c.status"
   printf 'kind=scout\n' > "$home/state/scout-c.meta"
+  # The newest event already shows this task's recorded URL, and the next one
+  # shows a longer number that only shares its digits.
+  printf 'kind=ship\nmode=direct-PR\npr=https://example.test/pull/9\n' > "$home/state/task-d.meta"
+  printf '%s\n' 'done [at=7]: PR https://example.test/pull/9 ready' > "$home/state/task-d.status"
+  printf 'kind=ship\nmode=direct-PR\npr=https://example.test/pull/4\n' > "$home/state/task-e.meta"
+  printf '%s\n' 'done [at=8]: see https://example.test/pull/43 first' > "$home/state/task-e.status"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   work=$(printf '%s\n' "$out" | awk '/^Work under way/ { flag = 1 } /^Orphan status logs/ { flag = 0 } flag')
+  assert_contains "$work" "| done [at=7]: PR https://example.test/pull/9 ready" "the task line lost the event that shows its PR"
+  assert_not_contains "$work" "  pr=https://example.test/pull/9" "a URL the newest event already shows was printed twice"
+  assert_contains "$work" "$(printf '\n  pr=https://example.test/pull/4\n')" \
+    "a different PR sharing the recorded URL's digits hid the recorded URL"
   assert_contains "$work" "Work under way - one line per task (full record: state/<id>.meta and state/<id>.status; read them only before steering, controlling, or cleaning up that task):" \
     "the compact task view lost its header"
   assert_contains "$work" "task-c ship direct-PR yolo=on host=box-1 ep=alive open=1 | needs-decision [key=pick] [at=3]: pick A or B" \
