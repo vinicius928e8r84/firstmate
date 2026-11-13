@@ -228,6 +228,11 @@
 #   choice other than this home, or no machine placeable, prints `deferred:` and
 #   exits 75 with the task exactly as queued, and an unreadable declaration
 #   refuses with exit 1. docs/configuration.md "Task placement" owns the format.
+#   Self-work budget: only when config/self-work-budget exists, a fresh ship or
+#   scout on this repository asks bin/fm-self-budget.sh admit; over the ceiling
+#   in `mode defer` it prints `deferred:` and exits 75 with the task exactly as
+#   queued, and an unreadable declaration refuses with exit 1.
+#   docs/configuration.md "Self-work budget" owns the format.
 #   Lane capacity: only when this home's config/lane-capacity declares
 #   admit-spawns (bin/fm-capacity.sh --spawn-gate-enabled answers; that script
 #   owns the declaration and the verdict), a fresh ship or
@@ -3890,6 +3895,29 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ -e "$CONFIG/placement
       esac
     fi
   fi
+fi
+# Self-work budget (opt-in; bin/fm-self-budget.sh owns the measurement, the
+# ceiling and the verdict). With config/self-work-budget absent nothing here
+# runs. A fresh ship or scout on this repository is deferred like a capacity
+# limit, before anything is created, once the measured share is over the ceiling
+# in `mode defer`; `mode report` only prints the share.
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ -e "$CONFIG/self-work-budget" ]; then
+  SELF_BUDGET_ARGS=(admit --project "$PROJ_ABS")
+  [ -z "$SCHEDULED_LOOP" ] || SELF_BUDGET_ARGS+=(--scheduled)
+  SELF_BUDGET_RC=0
+  SELF_BUDGET_OUT=$(FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG \
+    "$SCRIPT_DIR/fm-self-budget.sh" "${SELF_BUDGET_ARGS[@]}" 2>&1) || SELF_BUDGET_RC=$?
+  case "$SELF_BUDGET_RC" in
+  0) [ -z "$SELF_BUDGET_OUT" ] || printf '%s\n' "$SELF_BUDGET_OUT" >&2 ;;
+  "$FM_PROJECT_CAPACITY_DEFER_EXIT")
+    echo "deferred: $SELF_BUDGET_OUT; task $ID was not launched and its backlog item stays queued - raise the percent, set mode report, or wait for the week to turn (bin/fm-self-budget.sh report)" >&2
+    exit "$FM_PROJECT_CAPACITY_DEFER_EXIT"
+    ;;
+  *)
+    echo "error: spawn refused: the self-work budget is unreadable ($SELF_BUDGET_OUT); fix config/self-work-budget or remove it (docs/configuration.md \"Self-work budget\")" >&2
+    exit 1
+    ;;
+  esac
 fi
 # Lane ceiling (bin/fm-capacity.sh owns the count and the config/lane-capacity
 # cap): a fresh ship or scout is deferred, with the same exit and the same

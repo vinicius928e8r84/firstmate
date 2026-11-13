@@ -14,6 +14,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
 | Which machine takes a new worker | [Task placement](#task-placement-configplacement) and [lane capacity](#lane-capacity-configlane-capacity) |
+| How much of the week the fleet spends on its own repository | [Self-work budget](#self-work-budget-configself-work-budget) |
 | Review bots on owned GitHub pull requests | [Contribution review bots](#contribution-review-bots-configcontribution-review-bots) |
 | Per-run overrides and tuning | [Environment variables](#environment-variables) |
 
@@ -928,6 +929,33 @@ The spawn takes the type from `--task-type` (default `edit` for a ship and `scou
 Relaunches and secondmate spawns are never placed.
 Delete the file or set `spawn off` to go back to today's behavior.
 The script's header owns the output line, the exit codes and the environment seams used by tests.
+
+## Self-work budget (config/self-work-budget)
+
+The optional local, gitignored `config/self-work-budget` file puts a ceiling on the share of the week that workers spend on this repository itself, so the fleet's upkeep cannot crowd out the projects it serves.
+With the file absent nothing changes: `bin/fm-spawn.sh` never reads it and nothing is measured.
+
+```text
+percent 15               # the ceiling, a whole percent from 1 to 100
+mode report              # report (default) only prints the share; defer holds new self-work over the ceiling
+week-weight 1140000000   # optional: the week's quota in weight units; without it the share is of measured usage
+max-age 7200             # seconds a measurement stays usable (default 7200)
+repo firstmate           # optional: the directory name of this repository's copies (default the code root's name)
+```
+
+Every key may appear once, and an unknown key, a repeated key, or a malformed value makes the whole file invalid: the commands exit 1 naming the line and a spawn on this repository is refused, because the captain's ceiling is never guessed.
+
+`bin/fm-self-budget.sh measure` reads the last seven days of Claude Code session transcripts, weighs each response once by token price (input 1, cache write 2, cache read 0.1, output 5), and writes `state/self-work-budget.json` with the weight spent in copies of this repository that are not a home and the weight of everything measured.
+The primary's own turns and the secondmates' are therefore not self-work, and sessions of other harnesses are not measured.
+`bin/fm-self-budget.sh report` prints the share against the ceiling in one line.
+
+Before a fresh ship or scout on this repository, `bin/fm-spawn.sh` asks `bin/fm-self-budget.sh admit`.
+In `mode report` a share at or over the ceiling prints one `note:` line and the spawn goes on.
+In `mode defer` it prints one `deferred:` line and exits 75 before creating anything, so the backlog item stays queued; a spawn with `--scheduled-loop` is admitted with a note, since the captain's recurring loops are counted and never held.
+A missing or stale measurement admits with a note and starts one `measure` in the background, so no schedule is needed and a budget that cannot be read never stops work.
+Spawns on other repositories, relaunches, and secondmate spawns are never asked.
+Delete the file to go back to no ceiling.
+The script's header owns the definition of self-work, the weights, the cache, the exit codes and the environment seams used by tests.
 
 ## PR-ready line after green (config/ready-after-green)
 

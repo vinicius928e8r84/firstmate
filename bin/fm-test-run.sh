@@ -397,7 +397,7 @@ family_for_basename() {
     fm-trace-context-spawn.test.sh|fm-spawn-worktree-settle.test.sh|\
     fm-spawn-compact-adviser-disable.test.sh|\
     fm-spawn-compact-adviser-disable-remote.test.sh|\
-    fm-project-capacity.test.sh|fm-lane-capacity-integration.test.sh|fm-place.test.sh|\
+    fm-project-capacity.test.sh|fm-lane-capacity-integration.test.sh|fm-place.test.sh|fm-self-budget.test.sh|\
     fm-teardown-endpoint-safety.test.sh)
       printf '%s\n' backend-dispatch
       ;;
@@ -832,6 +832,7 @@ tests/fm-pi-seeded-home-trust-live-e2e.test.sh 45
 tests/fm-pi-watch-extension.test.sh 56515
 tests/fm-pi-windows-shell-invocation.test.sh 5121
 tests/fm-place.test.sh 35000
+tests/fm-self-budget.test.sh 40000
 tests/fm-polytoken-harness.test.sh 21090
 tests/fm-polytoken-signals-live-e2e.test.sh 103
 tests/fm-pr-check-security.test.sh 300675
@@ -1616,6 +1617,9 @@ families_for_changed_path() {
       ;;
     bin/fm-place.sh)
       printf '%s\n' "__script__:fm-place.test.sh"
+      ;;
+    bin/fm-self-budget.sh)
+      printf '%s\n' "__script__:fm-self-budget.test.sh"
       ;;
     bin/fm-env-lib.sh)
       # The one .env accessor, sourced by bin/fm-x-lib.sh (Relay token) and
