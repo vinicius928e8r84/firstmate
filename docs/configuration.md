@@ -3144,7 +3144,7 @@ FM_SESSION_START_QUEUED_LIMIT=20   # plain queued backlog rows in the session-st
 FM_SESSION_START_ENDPOINT_TIMEOUT=10   # seconds bounding each per-task endpoint liveness read in the session-start digest (bin/fm-session-start.sh); nonpositive or invalid values fall back to 10; a read that hits the bound or dies becomes that task's own endpoint error (`ep=error(...)`, or an `endpoint: error` line in the full task view) and the digest continues
 FM_SESSION_START_FLEET_CARD=1   # 0 stops a context re-emit from printing the fleet card (bin/fm-fleet-card.sh) before the digest
 FM_SESSION_START_CARD_TIMEOUT=10   # seconds bounding that card on its own, so it can never be the slow stage
-FM_SESSION_START_DRAIN_TIMEOUT=45   # seconds bounding the digest's wake-queue drain on its own, so one slow queue cannot spend the whole FM_SESSION_START_TIMEOUT; a cut drain is disclosed in the digest and leaves every row queued. 0 removes this bound
+FM_SESSION_START_DRAIN_TIMEOUT=45   # seconds bounding the digest's wake-queue drain on its own, so one slow queue cannot spend the whole FM_SESSION_START_TIMEOUT; it shrinks to the time left once a quarter of that whole budget is set aside for the later stages (never below 5); a cut drain is disclosed in the digest and leaves every row queued. 0 removes this bound
 FM_CARD_MAX_BYTES=5000   # ceiling for the fleet card; lower-priority sections shorten first and the open decisions never do (also `bin/fm-fleet-card.sh --max-bytes N`)
 FM_CARD_QUEUED_ROWS=5   # queued backlog rows the fleet card lists
 FM_CARD_TZ=   # time zone the fleet card uses for "asked today" (unset: the host's)

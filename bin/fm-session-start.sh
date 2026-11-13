@@ -242,7 +242,10 @@
 # cannot carry survives a truncation. And the wake-queue drain has its own stage
 # bound, FM_SESSION_START_DRAIN_TIMEOUT (default 45s, 0 removes it): a drain that
 # hits it is disclosed, leaves every row queued and unacknowledged, and the later
-# stages still run inside the whole-digest bound.
+# stages still run inside the whole-digest bound. That bound also shrinks to what
+# is left once a quarter of the whole budget is set aside for those later stages
+# (never below 5s), so slow stages before the drain cannot add up with it past
+# the whole-digest bound.
 # Hosts without timeout, gtimeout, or perl use the shared pure-Bash watchdog, so
 # the digest never runs without the same hard bound and process-group cleanup.
 #
@@ -371,6 +374,11 @@ if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
     [ "$CARD_RC" -eq 0 ] || printf 'FLEET CARD UNAVAILABLE (exit %s); the digest below is the whole record.\n' "$CARD_RC"
     printf '\n'
   fi
+  # The instant by which the child's wake-queue drain must be over so the stages
+  # after it keep a quarter of the whole budget (the drain stage caps its own
+  # bound to it).
+  FM_SESSION_START_DRAIN_BY=$(($(date +%s) + SESSION_START_BUDGET - SESSION_START_BUDGET / 4))
+  export FM_SESSION_START_DRAIN_BY
   if [ "$REEMIT" -eq 1 ]; then
     if [ -n "$SESSION_SOURCE" ]; then
       fm_run_timed "$SESSION_START_BUDGET" \
@@ -1182,10 +1190,20 @@ else
   # 45s; 0 removes it), so one slow queue can no longer spend the whole digest
   # budget and cut every later stage. A cut drain loses nothing: its rows stay
   # queued until acknowledged, and the notice below names the command that
-  # presents them.
+  # presents them. When the stages before it already ran long, the bound shrinks
+  # to the time left before FM_SESSION_START_DRAIN_BY (floor 5s), so the stages
+  # after the drain are not the ones the whole-digest bound cuts.
   DRAIN_BOUND=${FM_SESSION_START_DRAIN_TIMEOUT:-45}
   case "$DRAIN_BOUND" in ''|*[!0-9]*) DRAIN_BOUND=45 ;; esac
   if [ "$DRAIN_BOUND" -gt 0 ]; then
+    case "${FM_SESSION_START_DRAIN_BY:-}" in
+      ''|*[!0-9]*) ;;
+      *)
+        DRAIN_LEFT=$((FM_SESSION_START_DRAIN_BY - $(date +%s)))
+        [ "$DRAIN_LEFT" -ge 5 ] || DRAIN_LEFT=5
+        [ "$DRAIN_BOUND" -le "$DRAIN_LEFT" ] || DRAIN_BOUND=$DRAIN_LEFT
+        ;;
+    esac
     DRAIN_OUT=$(fm_run_timed "$DRAIN_BOUND" env FM_OPEN_DECISIONS_VIEW=all FM_GUARD_QUEUE_PRESENTED="${FM_GUARD_QUEUE_PRESENTED:-1}" \
       "$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
   else

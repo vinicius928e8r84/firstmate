@@ -2713,6 +2713,58 @@ EOF
   pass "a slow wake drain is cut by its own stage bound and the later stages still run; FM_SESSION_START_DRAIN_TIMEOUT=0 undoes it"
 }
 
+test_the_drain_bound_shrinks_to_leave_the_later_stages_their_share() {
+  local rec root home fakebin w bindir out status=0 cut before by
+  rec=$(new_world drain-share)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  w=${root%/root}
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  bindir="$w/bin"
+  cp -R "$ROOT/bin" "$bindir"
+  cp -R "$ROOT/docs" "$w/docs"
+  printf '#!/usr/bin/env bash\nprintf "DRAIN-BY=%%s\\n" "${FM_SESSION_START_DRAIN_BY:-unset}"\nsleep 300\nprintf "SLOW-DRAIN-FINISHED\\n"\n' > "$bindir/fm-wake-drain.sh"
+  chmod +x "$bindir/fm-wake-drain.sh"
+
+  # The bounded launcher names the instant the drain must be over by: three
+  # quarters of the whole budget from its own start.
+  before=$(date +%s)
+  out=$(FM_SESSION_START_TIMEOUT=400 FM_SESSION_START_DRAIN_TIMEOUT=1 FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
+    FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT "$bindir/fm-session-start.sh") || status=$?
+  expect_code 0 "$status" "a cut drain must not fail the start"
+  by=$(printf '%s\n' "$out" | sed -n 's/^DRAIN-BY=\([0-9][0-9]*\)$/\1/p' | head -n 1)
+  [ -n "$by" ] || fail "the launcher did not hand the drain its deadline"$'\n'"$out"
+  [ "$by" -ge $((before + 300)) ] && [ "$by" -le $(($(date +%s) + 300)) ] ||
+    fail "the drain deadline $by is not three quarters of the 400s budget after the start at $before"
+
+  # The digest stage itself, handed a deadline 8s away and a 200s bound of its
+  # own: the bound shrinks to the time left (never below the 5s floor), so the
+  # drain is cut by then and the later stages still run.
+  status=0
+  out=$(FM_SESSION_START_STAGE_FILE="$w/stage" FM_SESSION_START_DRAIN_BY=$(($(date +%s) + 8)) \
+    FM_SESSION_START_DRAIN_TIMEOUT=200 FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
+    FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT "$bindir/fm-session-start.sh") || status=$?
+  expect_code 0 "$status" "a drain cut by the later stages' share must not fail the start"
+  cut=$(printf '%s\n' "$out" | sed -n 's/^WAKE DRAIN CUT AT \([0-9][0-9]*\)s.*/\1/p' | head -n 1)
+  [ -n "$cut" ] || fail "a drain bound past its deadline was not shrunk: no cut was disclosed"$'\n'"$out"
+  [ "$cut" -ge 5 ] && [ "$cut" -le 8 ] || fail "the drain was cut at ${cut}s, expected between the 5s floor and the 8s left"
+  assert_not_contains "$out" "SLOW-DRAIN-FINISHED" "the slow drain was not cut"
+  assert_contains "$out" "NEXT STEP" "the stages after the drain did not run"
+
+  # FM_SESSION_START_DRAIN_TIMEOUT=0 removes the deadline along with the bound.
+  printf '#!/usr/bin/env bash\nsleep 7\nprintf "SLOW-DRAIN-FINISHED\\n"\n' > "$bindir/fm-wake-drain.sh"
+  out=$(FM_SESSION_START_STAGE_FILE="$w/stage" FM_SESSION_START_DRAIN_BY=$(($(date +%s) + 1)) \
+    FM_SESSION_START_DRAIN_TIMEOUT=0 FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
+    FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT "$bindir/fm-session-start.sh")
+  assert_contains "$out" "SLOW-DRAIN-FINISHED" "FM_SESSION_START_DRAIN_TIMEOUT=0 did not remove the deadline"
+  pass "the drain bound shrinks to the deadline the launcher sets at three quarters of the whole budget, and FM_SESSION_START_DRAIN_TIMEOUT=0 removes both"
+}
+
 test_agents_baseline_stays_at_true_start_and_reemits_on_every_drifted_pi_compact() {
   local rec root home fakebin startup compact_equal compact_first compact_second clear_out resume_out reset_out baseline baseline_after expected_hash refresh_line bootstrap_line
   rec=$(new_world agents-refresh)
@@ -3769,6 +3821,7 @@ test_agents_baseline_requires_sha256_and_successful_completion
 test_reemit_keeps_repair_ownership_with_the_lock_holder
 test_reemit_prints_the_fleet_card_first_and_the_switch_removes_it
 test_a_slow_wake_drain_is_cut_by_its_own_stage_bound
+test_the_drain_bound_shrinks_to_leave_the_later_stages_their_share
 test_compact_task_line_names_identity_liveness_and_newest_event
 test_compact_backlog_shortens_rows_and_counts_ready
 test_compact_secondmates_print_one_line_per_route
