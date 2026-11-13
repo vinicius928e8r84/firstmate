@@ -423,6 +423,26 @@ case "$repeat_out" in
 esac
 pass "an unhandled result survives restart and repeat drains, and only explicit acknowledgement stops its re-announcement"
 
+# An unhandled result nobody drains must not add a row per reconcile: the queue
+# held 2,298 rows for 85 keys once, and every drain and digest paid per row.
+HDUP="$TMP_ROOT/hdup"; new_home "$HDUP"
+mkdir -p "$HDUP/state/procevent-inbox"
+printf 'stranded result\n' > "$HDUP/state/procevent-inbox/src-dup.3.result"
+printf 'lavish\n' > "$HDUP/state/procevent-inbox/src-dup.3.adapter"
+chmod 0600 "$HDUP/state/procevent-inbox/src-dup.3.result" "$HDUP/state/procevent-inbox/src-dup.3.adapter"
+for _ in 1 2 3; do
+  out=$(pe "$HDUP" reconcile)
+  assert_contains "$out" "published=1" "a still-queued result stays reported as announced"
+done
+[ "$(wake_payloads "$HDUP" | wc -l | tr -d ' ')" = 1 ] \
+  || fail "three reconciles queued $(wake_payloads "$HDUP" | wc -l | tr -d ' ') rows for one unhandled result, expected 1"
+mv "$HDUP/state/.wake-queue" "$HDUP/state/.wake-queue.consumed"
+pe "$HDUP" reconcile >/dev/null
+[ "$(wake_payloads "$HDUP" | wc -l | tr -d ' ')" = 1 ] || fail "a consumed announcement was not queued again while the result stays unhandled"
+FM_WAKE_DEDUP=0 pe "$HDUP" reconcile >/dev/null
+[ "$(wake_payloads "$HDUP" | wc -l | tr -d ' ')" = 2 ] || fail "FM_WAKE_DEDUP=0 did not restore one row per reconcile"
+pass "reconcile queues an unhandled result once while its row waits, again after it is consumed, and FM_WAKE_DEDUP=0 undoes it"
+
 HRACE="$TMP_ROOT/hrace"; new_home "$HRACE"
 mkdir -p "$HRACE/state/procevent-inbox"
 printf 'racing result\n' > "$HRACE/state/procevent-inbox/racing-src.1.result"

@@ -24,6 +24,43 @@ GUARD="$ROOT/bin/fm-guard.sh"
 TMP_ROOT=$(fm_test_tmproot fm-wake-tests)
 
 
+test_append_once_queues_an_announcement_a_single_time() {
+  local dir state lib
+  dir=$(make_case append-once)
+  state="$dir/state"
+  lib="$ROOT/bin/fm-wake-lib.sh"
+  once() {  # <kind> <key> <payload> [FM_WAKE_DEDUP]
+    FM_STATE_OVERRIDE="$state" FM_WAKE_DEDUP="${4:-1}" bash -c '
+      # shellcheck disable=SC1090,SC1091
+      . "$1"
+      fm_wake_append_once "$2" "$3" "$4"
+    ' _ "$lib" "$1" "$2" "$3" || fail "fm_wake_append_once failed for $2"
+  }
+  rows() { awk -F '\t' 'NF >= 5 { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null; }
+
+  once check "procevent:src:1" "check: page answer"
+  once check "procevent:src:1" "check: page answer"
+  once check "procevent:src:1" "check: page answer"
+  [ "$(rows)" = 1 ] || fail "three identical announcements left $(rows) rows, expected 1"
+  once check "procevent:src:1" "check: page answer, edited"
+  [ "$(rows)" = 2 ] || fail "a changed payload under the same key must queue again"
+  once check "procevent:src:2" "check: page answer"
+  [ "$(rows)" = 3 ] || fail "another key must queue"
+  once stale "procevent:src:1" "check: page answer"
+  [ "$(rows)" = 4 ] || fail "another kind must queue"
+
+  # Consumed rows are gone from the queue, so the same announcement queues again.
+  : > "$state/.wake-queue"
+  once check "procevent:src:1" "check: page answer"
+  [ "$(rows)" = 1 ] || fail "an announcement consumed by the supervisor must be queueable again"
+
+  # The undo switch restores one row per pass.
+  once check "procevent:src:1" "check: page answer" 0
+  once check "procevent:src:1" "check: page answer" 0
+  [ "$(rows)" = 3 ] || fail "FM_WAKE_DEDUP=0 must append every time, got $(rows) rows"
+  pass "fm_wake_append_once queues a still-waiting announcement a single time and FM_WAKE_DEDUP=0 undoes it"
+}
+
 test_concurrent_append_and_drain() {
   local dir state out1 out2 pids i pid count unique malformed sequence generation
   dir=$(make_case concurrent)
@@ -3651,6 +3688,7 @@ test_stale_enqueue_before_suppressor
 test_not_working_stale_enqueue_before_suppressor
 test_check_output_is_queued
 test_atomic_double_drain
+test_append_once_queues_an_announcement_a_single_time
 test_drain_dedupes_obvious_duplicates
 test_drain_asserts_watcher_liveness
 test_structural_signal_enrichment_preserves_raw_rows

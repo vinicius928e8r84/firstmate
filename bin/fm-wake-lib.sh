@@ -2758,6 +2758,33 @@ fm_wake_append_locked() {
   return "$status"
 }
 
+# fm_wake_append_once <kind> <key> <payload>
+# fm_wake_append for a publisher that re-announces durable state on every pass:
+# when an unacknowledged row of the same kind, key and payload is already
+# queued, nothing is appended and the call still succeeds, because that
+# announcement is durable and still waiting for the supervisor. The queue stays
+# the authority (no separate ledger), so once the supervisor consumes the row a
+# later pass queues it again and the re-announcement contract is unchanged. This
+# keeps a result nobody handles from adding one more identical row every pass,
+# which made the queue, its drain and every digest that presents it grow without
+# bound. Set FM_WAKE_DEDUP=0 to append every time, as fm_wake_append does.
+fm_wake_append_once() {
+  local kind=$1 key=$2 payload=$3 status=0 clean_key clean_payload
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  clean_key=$(printf '%s' "$key" | fm_wake_clean_field)
+  clean_payload=$(printf '%s' "$payload" | fm_wake_clean_field)
+  if [ "${FM_WAKE_DEDUP:-1}" != 0 ] \
+    && awk -F '\t' -v kind="$kind" -v key="$clean_key" -v payload="$clean_payload" \
+      'NF >= 5 && $3 == kind && $4 == key && $5 == payload { found = 1; exit } END { exit !found }' \
+      "$FM_WAKE_QUEUE" 2>/dev/null; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 0
+  fi
+  fm_wake_append_locked "$kind" "$key" "$payload" || status=$?
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
+}
+
 # fm_wake_queued_keys <kind>
 # Print the distinct keys currently queued for <kind>, oldest first. Read under
 # the append lock so a concurrent append is never observed half-written. The

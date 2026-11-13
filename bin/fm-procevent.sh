@@ -889,7 +889,7 @@ EOF
       esac
     fi
     unset FM_PROCEVENT_CAPTURE_SOURCE_LOCK_HELD
-    if fm_wake_append check "procevent:$id:$seq" "check: $line"; then
+    if fm_wake_append_once check "procevent:$id:$seq" "check: $line"; then
       status=0
     fi
   fi
