@@ -1064,6 +1064,64 @@ test_pi_exclude_tools_follow_the_relaunch() {
   pass "fm-control relaunch: a Pi replacement keeps the home's tool exclusions"
 }
 
+test_pi_worker_context_files_flag_follows_the_config() {
+  local dir out rc id=rl-pi-noctx
+  dir=$(new_case pi-noctx "$id")
+  add_ship_task "$dir" "$id" pi
+  printf pi > "$dir/fake/command"
+  printf pi > "$dir/fake/becomes"
+  printf '#!/usr/bin/env bash\nprintf "Options: --tui-mode --no-context-files\\n"\n' > "$dir/fakebin/pi"
+  chmod +x "$dir/fakebin/pi"
+  mkdir -p "$dir/home/config" "$dir/wt/bin"
+  : > "$dir/wt/bin/fm-spawn.sh"
+  : > "$dir/wt/AGENTS.md"
+
+  # Absent file: the launch is untouched.
+  out=$(run_control "$dir" "$id" relaunch --note "default"); rc=$?
+  expect_code 0 "$rc" "a Pi relaunch with no config should succeed"$'\n'"$out"
+  assert_not_contains "$(cat "$dir/fake/literal")" "--no-context-files" "no config file must leave the launch untouched"
+
+  # on: a Firstmate copy launches without the supervisor's AGENTS.md and is told to read it itself.
+  printf 'on\n' > "$dir/home/config/pi-worker-no-context-files"
+  : > "$dir/fake/literal"; printf pi > "$dir/fake/command"
+  out=$(run_control "$dir" "$id" relaunch --note "on"); rc=$?
+  expect_code 0 "$rc" "a Pi relaunch with the flag on should succeed"$'\n'"$out"
+  assert_contains "$(cat "$dir/fake/literal")" "--no-context-files --append-system-prompt" "the worker in a Firstmate copy must launch without AGENTS.md"
+  assert_contains "$(cat "$dir/fake/literal")" "Read AGENTS.md in your worktree yourself" "the worker was not told how to reach the file"
+
+  # on, but the worktree is another project's: untouched.
+  rm "$dir/wt/bin/fm-spawn.sh"
+  : > "$dir/fake/literal"; printf pi > "$dir/fake/command"
+  out=$(run_control "$dir" "$id" relaunch --note "other project"); rc=$?
+  expect_code 0 "$rc" "a relaunch in another project should succeed"$'\n'"$out"
+  assert_not_contains "$(cat "$dir/fake/literal")" "--no-context-files" "a project that is not a Firstmate copy keeps its own AGENTS.md"
+  : > "$dir/wt/bin/fm-spawn.sh"
+
+  # on, but this Pi does not advertise the flag: untouched.
+  printf '#!/usr/bin/env bash\nprintf "Options: --tui-mode\\n"\n' > "$dir/fakebin/pi"
+  : > "$dir/fake/literal"; printf pi > "$dir/fake/command"
+  out=$(run_control "$dir" "$id" relaunch --note "old pi"); rc=$?
+  expect_code 0 "$rc" "a relaunch on an older Pi should succeed"$'\n'"$out"
+  assert_not_contains "$(cat "$dir/fake/literal")" "--no-context-files" "a Pi without the flag must launch as before"
+  printf '#!/usr/bin/env bash\nprintf "Options: --tui-mode --no-context-files\\n"\n' > "$dir/fakebin/pi"
+
+  # A malformed value refuses before the running agent stops.
+  printf 'maybe\n' > "$dir/home/config/pi-worker-no-context-files"
+  : > "$dir/fake/literal"; printf pi > "$dir/fake/command"
+  out=$(run_control "$dir" "$id" relaunch --note "bad"); rc=$?
+  expect_code 1 "$rc" "a malformed value must refuse the relaunch"
+  assert_contains "$out" "config/pi-worker-no-context-files holds 'maybe'" "the refusal must name the file and the value"
+  [ "$(cat "$dir/fake/command")" = pi ] || fail "a refused relaunch stopped the running agent"
+  [ ! -s "$dir/fake/literal" ] || fail "a refused relaunch sent lifecycle input"
+
+  # Undo: off, and deleting the file, both restore the plain launch.
+  printf 'off\n' > "$dir/home/config/pi-worker-no-context-files"
+  out=$(run_control "$dir" "$id" relaunch --note "off"); rc=$?
+  expect_code 0 "$rc" "off should relaunch"$'\n'"$out"
+  assert_not_contains "$(cat "$dir/fake/literal")" "--no-context-files" "off must restore the plain launch"
+  pass "fm-control relaunch: config/pi-worker-no-context-files keeps the supervisor's AGENTS.md from a Pi worker in a Firstmate copy, and off or removal undoes it"
+}
+
 test_exclude_tools_refusals_happen_before_the_agent_stops() {
   local dir out rc id=rl-excl-refuse
   dir=$(new_case excl-refuse "$id")
@@ -3007,6 +3065,7 @@ test_relaunch_below_the_memory_floor_refuses_before_the_agent_stops
 test_worker_account_pin_follows_the_relaunch
 test_secondmate_account_pin_follows_relaunch_and_refuses_before_stop
 test_pi_exclude_tools_follow_the_relaunch
+test_pi_worker_context_files_flag_follows_the_config
 test_exclude_tools_refusals_happen_before_the_agent_stops
 test_explicit_model_wins_over_the_recorded_one
 test_relaunch_onto_an_unverified_harness_is_refused

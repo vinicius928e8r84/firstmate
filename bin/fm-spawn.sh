@@ -475,6 +475,19 @@
 #   docs/configuration.md "Worker tool exclusions" owns config/crew-exclude-tools
 #   and its operator contract. Resolve it with bin/fm-exclude-tools-lib.sh
 #   before provisioning; __PIEXCLUDE__ below owns the Pi launch substitution.
+# Pi worker context files (config/pi-worker-no-context-files):
+#   Opt-in. One whitespace-trimmed token: `on` or `off` (absent is `off`, and
+#   every launch is then byte-identical to before). With `on`, a Pi or pi-signed
+#   ship or scout whose worktree is a Firstmate copy (it holds bin/fm-spawn.sh and
+#   AGENTS.md) launches with --no-context-files, so the supervisor's AGENTS.md
+#   (about 17.8k tokens on every request) is not loaded into a worker that
+#   follows its brief instead, plus a one-line --append-system-prompt telling it
+#   to read AGENTS.md itself before editing shared tracked material. Secondmates,
+#   raw launch commands, worktrees of any other project, and a Pi that does not
+#   advertise the flag are never touched. Any other value refuses the spawn
+#   before any mutation. Read on every spawn and relaunch; not inherited. Delete
+#   the file (or write `off`) to undo. docs/configuration.md "Pi worker context
+#   files" owns the operator contract.
 # Worker account pin (config/claude-account, config/pi-account):
 #   Opt-in. With no file, a Claude or Pi launch is unchanged: Claude still
 #   receives this process's own CLAUDE_CONFIG_DIR when it is set, and Pi the
@@ -509,6 +522,10 @@
 #     __PIEXCLUDE__ optional ` --exclude-tools '<comma-joined names>'` from
 #                  config/crew-exclude-tools on Pi/pi-signed ship and scout
 #                  launches (supplies its own leading space, empty otherwise)
+#     __PICONTEXT__ optional ` --no-context-files --append-system-prompt '<note>'`
+#                  from config/pi-worker-no-context-files on a Pi/pi-signed
+#                  ship or scout in a Firstmate copy (supplies its own leading
+#                  space, empty otherwise)
 #     __PIRESUME__ optional relaunch-only `--session <reference>` that keeps a
 #                  Pi replacement on the session the endpoint's runtime already
 #                  reports (relaunch_resume_args below owns it; it supplies its
@@ -855,6 +872,10 @@ if [ "$LAVISH_AXI_HOST_CONFIG_PRESENT" = 1 ]; then
       ;;
   esac
 fi
+# config/pi-worker-no-context-files (header above): validated before any
+# mutation so a malformed value refuses instead of launching on a posture the
+# captain did not choose.
+PI_NOCTX=$(fm_pi_noctx_mode "$CONFIG") || exit 1
 if ! KEEP_AI_TRAILERS=$(fm_config_source_present "$CONFIG/keep-ai-trailers"); then
   exit 1
 fi
@@ -2495,6 +2516,13 @@ pi_supports_approve() {
   printf '%s\n' "$help" | grep -Eq -- '(^|[[:space:]])--approve([^[:alnum:]_-]|$)'
 }
 
+# Same help-probe shape for the flag that stops Pi loading AGENTS.md/CLAUDE.md.
+pi_supports_no_context_files() {
+  local executable=$1 help
+  help=$("$executable" --help 2>&1) || return 1
+  printf '%s\n' "$help" | grep -Eq -- '(^|[[:space:]])--no-context-files([^[:alnum:]_-]|$)'
+}
+
 # omp pre-launch model validation. `omp models --json` (omp 18.1.11) prints
 # {"models":[{"provider","id","selector":"<provider>/<id>",...}]} for built-in and
 # auto-discovered providers only; it never lists a provider an extension
@@ -2704,7 +2732,7 @@ launch_template() {
     ;;
   opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}__EFFORTFLAG__}'\'' __OPENCODEBIN__ __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
   pi | pi-signed)
-    printf '%s' '__PIBIN____PITUIMODE____PIAPPROVE____PIEXCLUDE____PIRESUME__'
+    printf '%s' '__PIBIN____PITUIMODE____PIAPPROVE____PIEXCLUDE____PICONTEXT____PIRESUME__'
     if [ "$kind" = secondmate ]; then
       # The two primary extensions supervise the mate's own home. __PIEXT__ is
       # the parent-home busy contract, loaded from outside the home so Pi's
@@ -6675,6 +6703,16 @@ if [ "$RELAUNCH" -eq 1 ]; then
   RESUME_ARGS=$(relaunch_resume_args "$HARNESS" "$BACKEND" "$T") || RESUME_ARGS=
 fi
 LAUNCH=${LAUNCH//__PIRESUME__/$RESUME_ARGS}
+# config/pi-worker-no-context-files: opt-in, Pi-family ship/scout in a Firstmate
+# copy only (see the header). Every other launch substitutes the empty string.
+PI_CONTEXT=
+if [ "$PI_NOCTX" = on ] && [ "$KIND" != secondmate ] && [ "$RAW_LAUNCH" -eq 0 ] &&
+  { [ "$HARNESS" = pi ] || [ "$HARNESS" = pi-signed ]; } &&
+  [ -n "${WT:-}" ] && [ -f "$WT/bin/fm-spawn.sh" ] && [ -f "$WT/AGENTS.md" ] &&
+  pi_supports_no_context_files "$PI_BIN"; then
+  PI_CONTEXT=" --no-context-files --append-system-prompt $(shell_quote "The supervisor's AGENTS.md is not loaded in this worker; your launch brief is your contract. Read AGENTS.md in your worktree yourself before editing AGENTS.md, bin/ or .agents/skills/.")"
+fi
+LAUNCH=${LAUNCH//__PICONTEXT__/$PI_CONTEXT}
 LAUNCH=${LAUNCH//__CLAUDEPERMFLAG__/$CLAUDE_PERM_FLAG}
 case "$LAUNCH" in
 *__CLAUDESETTINGS__*)

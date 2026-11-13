@@ -1050,6 +1050,8 @@ resolve_relaunch_profile() {
   # agent stops. Secondmate agents are not covered.
   if [ "$KIND" != secondmate ]; then
     fm_exclude_tools_check "$TARGET_HARNESS" 0 "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}" >/dev/null || return 1
+    # And config/pi-worker-no-context-files, for the same reason.
+    fm_pi_noctx_mode "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}" >/dev/null || return 1
   fi
 }
 

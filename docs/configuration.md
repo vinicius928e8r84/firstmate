@@ -9,7 +9,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | --- | --- |
 | Firstmate's code, private files, or project location | [FM_HOME](#fm_home) and [operational home layout](#operational-home-layout-and-state) |
 | Task windows and worker tools | [Runtime backend](#runtime-backend-configbackend--fm_backend) and [harness support](#harness-support) |
-| Worker permissions, accounts, or environment | [Codex approval review](#codex-automatic-approval-review), [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [Codex permission mode](#codex-permission-mode-configcodex-permission-mode), [persistent managed-policy failover](#persistent-managed-policy-failover), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist), and its [Orca environment source](#orca-environment-source-configlaunch-env-tmux-session) |
+| Worker permissions, accounts, or environment | [Codex approval review](#codex-automatic-approval-review), [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [Codex permission mode](#codex-permission-mode-configcodex-permission-mode), [persistent managed-policy failover](#persistent-managed-policy-failover), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), [Pi worker context files](#pi-worker-context-files-configpi-worker-no-context-files), [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist), and its [Orca environment source](#orca-environment-source-configlaunch-env-tmux-session) |
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), [external memory tiers](#external-memory-tiers-memory-layering-section), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
@@ -1332,6 +1332,16 @@ To retain a secondmate's remedy across convergence, select it in the primary hom
 Recovery uses the existing [lifecycle control plane](agent-control.md), respecting its leases and supported-runtime limits; incomplete recovery is reported with the saved setting and work preserved.
 Generic login failures do not establish a defeated bypass, and managed hook review remains a separate operator decision.
 Neither fallback is unrestricted execution, and Firstmate does not change vendor or security-agent settings.
+
+## Pi worker context files (config/pi-worker-no-context-files)
+
+A Pi worker launched in a Firstmate copy loads this repository's `AGENTS.md`, the supervisor's contract, into every request: about 52 KB, 17.8 thousand tokens, though the worker follows its launch brief instead.
+The optional local, gitignored `config/pi-worker-no-context-files` holds one token, `on` or `off`, and absent means `off`, so with no file every launch is exactly as before.
+With `on`, a Pi or pi-signed ship or scout whose worktree holds both `bin/fm-spawn.sh` and `AGENTS.md` launches with `--no-context-files` and a one-line appended system prompt telling it to read `AGENTS.md` in its worktree before editing `AGENTS.md`, `bin/` or `.agents/skills/`.
+Secondmates, raw launch commands, worktrees of any other project, and a Pi that does not advertise `--no-context-files` are never touched.
+Any other value refuses the spawn or relaunch before anything changes, and a relaunch refuses before the running worker stops.
+The file is read on every spawn and relaunch and is not inherited by a secondmate home.
+To undo it, write `off` or delete the file; workers already running keep the launch they had until their next relaunch.
 
 ## Worker tool exclusions (config/crew-exclude-tools)
 

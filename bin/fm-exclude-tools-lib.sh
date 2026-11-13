@@ -7,6 +7,37 @@
 # Name verification belongs inside the worker's loaded-tool registry, never
 # in an out-of-band server connection from these launch-time checks.
 
+# fm_pi_noctx_mode <config-dir>: print `on` or `off` for
+# config/pi-worker-no-context-files (absent is `off`). Non-zero with the reason
+# on stderr when the file is unreadable or holds anything else. It lives here
+# because spawn and relaunch both validate worker-launch config before any
+# mutation; bin/fm-spawn.sh's header owns the meaning.
+fm_pi_noctx_mode() {
+  local config=$1 file present value
+  file=$config/pi-worker-no-context-files
+  present=$(perl -MErrno=ENOENT -e '
+    if (lstat $ARGV[0]) { print 1 }
+    elsif ($! == ENOENT) { print 0 }
+    else { die "error: cannot inspect config/pi-worker-no-context-files: $!\n" }
+  ' -- "$file") || return 1
+  if [ "$present" != 1 ]; then
+    printf 'off'
+    return 0
+  fi
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    echo "error: config/pi-worker-no-context-files must be a readable regular file holding one of: on, off" >&2
+    return 1
+  fi
+  value=$(tr -d '[:space:]' <"$file") || value=
+  case "$value" in
+  on | off) printf '%s' "$value" ;;
+  *)
+    echo "error: config/pi-worker-no-context-files holds '$value'; accepted values are: on, off (the default when the file is absent)" >&2
+    return 1
+    ;;
+  esac
+}
+
 # fm_exclude_tools_names <config-dir>: print the comma-joined names, empty when
 # the file is absent or lists nothing. Non-zero with the reason on stderr when
 # the file or an entry is invalid.
