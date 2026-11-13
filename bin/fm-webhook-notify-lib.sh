@@ -2,7 +2,7 @@
 # fm-webhook-notify-lib.sh - the captain's out-of-band webhook notice, with a fallback that cannot go silent.
 # Source it (do not run it) from bin/fm-silent-watcher.sh and bin/fm-lane-guard.sh. The caller defines F (the
 # firstmate home), S (its state directory), HERE (bin/) and log(); this file defines fm_webhook_notify.
-# fm_webhook_notify <event> <message>
+# fm_webhook_notify <event> <message> [critical|retry]
 #   Posts {"event","message"} to ~/.config/fm/watcher-webhook.url with the bearer key in watcher-webhook.key. No
 #   configuration, or FM_SW_NO_NOTIFY set, is a silent skip (return 0). A reply outside 2xx is a failure and is
 #   logged as "notify failed http=<code> <short reply>" with every uuid and the key masked.
@@ -11,6 +11,11 @@
 #   queued for firstmate through bin/fm-inbox.sh (a durable `check` wake) naming the status, and from then on every
 #   non-recovery notice is also queued as an inbox note, at most one per FM_NOTIFY_FALLBACK_GAP seconds (3600).
 #   The webhook is still tried every time; the first success clears the streak and the degraded mark.
+#   A third argument changes what a failure does. `critical` is for a one-shot notice nobody repeats (the weekly
+#   quota hitting zero): the failure is queued as an inbox note at once, without waiting for the streak or the hourly
+#   gap, so the owner's notice cannot die with the channel. `retry` re-sends a notice that already failed: a failure
+#   is logged but neither counts toward the streak nor queues a note (the first attempt already did); a success
+#   clears the streak like any other. Return 0 on delivery (or no channel configured), 1 on failure.
 # State (in $S): .webhook-notify.fails (streak), .webhook-notify.degraded (epoch of the one warning),
 #   .webhook-notify.fallback-at (epoch of the last fallback note).
 # Env: FM_NOTIFY_INBOX (command that takes a note text; tests), FM_NOTIFY_FAIL_MAX, FM_NOTIFY_FALLBACK_GAP,
@@ -25,7 +30,7 @@ fm_notify_inbox() { # <text>: queue one inbox note for firstmate; best effort
 }
 
 fm_webhook_notify() { # <event> <message>
-  local event=$1 msg=$2 u k m body code rc fails now max gap last note
+  local event=$1 msg=$2 mode=${3:-} u k m body code rc fails now max gap last note
   u=$(cat "$HOME/.config/fm/watcher-webhook.url" 2>/dev/null); k=$(cat "$HOME/.config/fm/watcher-webhook.key" 2>/dev/null)
   { [ -n "$u" ] && [ -n "$k" ] && [ -z "${FM_SW_NO_NOTIFY:-}" ]; } || return 0
   now=$(fm_notify_now); max=${FM_NOTIFY_FAIL_MAX:-3}; gap=${FM_NOTIFY_FALLBACK_GAP:-3600}
@@ -44,8 +49,14 @@ fm_webhook_notify() { # <event> <message>
   note=${note//"$k"/<key>}
   rm -f "$body"
   log "notify failed http=${code:-000} ${note}"
+  [ "$mode" != retry ] || return 1
   fails=$(cat "$S/.webhook-notify.fails" 2>/dev/null); case $fails in ''|*[!0-9]*) fails=0 ;; esac
   fails=$((fails + 1)); echo "$fails" > "$S/.webhook-notify.fails"
+  if [ "$mode" = critical ] && ! { [ "$fails" -ge "$max" ] && [ ! -e "$S/.webhook-notify.degraded" ]; }; then
+    echo "$now" > "$S/.webhook-notify.fallback-at"
+    fm_notify_inbox "Aviso ao dono [$event] NAO saiu pelo webhook (http=${code:-000} ${note}); vale repassar por outro canal: $msg"
+    return 1
+  fi
   [ "$fails" -ge "$max" ] || return 1
   if [ ! -e "$S/.webhook-notify.degraded" ]; then
     echo "$now" > "$S/.webhook-notify.degraded"

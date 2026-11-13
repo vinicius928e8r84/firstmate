@@ -16,7 +16,9 @@
 # No self-heal: re-arming the watcher belongs to the captain's session (fm-watch-arm.sh is session-bound).
 # Also, independent of watcher health: when bin/fm-quota-silence.sh status reports the Claude weekly quota
 #   exhausted, ONE captain ask (--key quota-zero) names the renewal in Fortaleza time, and a webhook notice goes with
-#   it. state/.quota-exhausted-notified holds the renewal epoch it was raised for, so later runs stay silent until the
+#   it. If the webhook refuses it, an inbox note goes out at once and the notice stays pending
+#   (state/.quota-notice-pending) and is re-sent each run until the channel answers or the quota is clear.
+#   state/.quota-exhausted-notified holds the renewal epoch it was raised for, so later runs stay silent until the
 #   quota is read as clear again (the renewal), which also closes the ask. An unreadable quota changes nothing. While
 #   exhausted, bin/fm-dispatch-resolve.sh already refuses Claude candidates, so the fleet runs on the rest.
 # Env: FM_HOME, FM_SW_NOW (epoch, tests), FM_SW_PGREP (command, tests), FM_SW_ASKS (fm-asks path, tests),
@@ -37,19 +39,25 @@ notify() { fm_webhook_notify "$@" || true; }
 quota_status() {
   if [ -n "${FM_SW_QUOTA_STATUS:-}" ]; then $FM_SW_QUOTA_STATUS; else FM_HOME=$F "$(dirname "${BASH_SOURCE[0]}")/fm-quota-silence.sh" status; fi
 }
-QMARK=$S/.quota-exhausted-notified
+QMARK=$S/.quota-exhausted-notified; QPEND=$S/.quota-notice-pending
 qline=$(quota_status 2>/dev/null </dev/null | head -1)
 case "$qline" in
   "exhausted "[0-9]*)
     qreset=${qline#exhausted }; qlast=$(cat "$QMARK" 2>/dev/null)
     case "$qlast" in ''|*[!0-9]*) qlast=0 ;; esac
+    qmsg="A cota semanal do Claude zerou. Renova em $(TZ=America/Fortaleza date -d "@$qreset" '+%d/%m às %H:%M') (Fortaleza). Até lá a frota segue só com o que não gasta Claude."
     if [ $(( qreset - qlast )) -gt 3600 ]; then
-      qmsg="A cota semanal do Claude zerou. Renova em $(TZ=America/Fortaleza date -d "@$qreset" '+%d/%m às %H:%M') (Fortaleza). Até lá a frota segue só com o que não gasta Claude."
       echo "$qreset" > "$QMARK"
-      log "QUOTA $qmsg"; notify quota "$qmsg"
+      log "QUOTA $qmsg"
+      # critical: a webhook failure queues the inbox note at once. The notice is also kept pending and re-sent on
+      # later runs until the channel answers (self-heal), so a channel the owner fixes later still gets it.
+      if fm_webhook_notify quota "$qmsg" critical; then rm -f "$QPEND"; else echo "$qreset" > "$QPEND"; fi
       [ -x "$ASKS" ] && FM_HOME=$F "$ASKS" add --key quota-zero "$qmsg" >/dev/null 2>&1
+    elif [ -e "$QPEND" ]; then
+      if fm_webhook_notify quota "$qmsg" retry; then rm -f "$QPEND"; log "quota notice delivered late: the webhook answers again"; fi
     fi ;;
   clear)
+    rm -f "$QPEND"
     if [ -e "$QMARK" ]; then
       rm -f "$QMARK"; log "quota back"
       [ -x "$ASKS" ] && FM_HOME=$F "$ASKS" 'done' quota-zero >/dev/null 2>&1

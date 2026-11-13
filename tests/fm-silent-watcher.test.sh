@@ -99,4 +99,50 @@ export FAKE_CODE=200 FAKE_BODY=''
 nrun $((NOW+5100)) "$alive"                        # a delivered notice clears the streak
 [ ! -e "$T/state/.webhook-notify.fails" ] && [ ! -e "$T/state/.webhook-notify.degraded" ]; check success-clears-streak $? 0
 grep -q 'notify recovered' "$T/state/.silent-watcher.log"; check success-logs-recovery $? 0
+# --- simulated zero quota, end to end: real fm-quota-silence.sh over a fake quota-axi, the webhook dead (the
+# --- owner's automation disabled), then fixed. The owner's notice must not die with the channel.
+mkdir -p "$T/config"; printf 'claude\n' > "$T/config/quota-silence"
+fake_axi() { # <pct>: one claude row, all_models at <pct>% remaining, five_hour window resetting at RESET_ISO
+  local runway=through_reset; [ "$1" -ne 0 ] || runway=exhausted_now
+  cat > "$W/bin/quota-axi" <<SH
+#!/usr/bin/env bash
+cat <<'JSON'
+{"schemaVersion":5,"providers":[{"provider":"claude","windows":[{"id":"five_hour","resetsAt":"$RESET_ISO","percentRemaining":$1}],"quotaSemantics":{"status":"known","effectiveAvailability":[{"scope":"all_models","status":"known","effectivePercentRemaining":$1,"limitingWindowIds":["five_hour"],"runway":{"status":"$runway"}}]}}]}
+JSON
+SH
+  chmod +x "$W/bin/quota-axi"
+}
+RESET_EPOCH=$(( $(date +%s) + 7200 )); RESET_ISO=$(date -u -d "@$RESET_EPOCH" +%Y-%m-%dT%H:%M:%S.000000+00:00)
+qrun() { # <now>: a healthy watcher run reading the real quota probe through the fake quota-axi and fake curl
+  setbeat $(($1 - 60))
+  HOME=$W/home PATH=$W/bin:$PATH FM_HOME=$T FM_SW_NOW=$1 FM_SW_PGREP="$alive" FM_QUOTA_SILENCE_AXI=$W/bin/quota-axi FM_NOTIFY_INBOX=$W/inbox.sh env -u FM_SW_NO_NOTIFY -u FM_SW_QUOTA_STATUS bash "$SW" >/dev/null; }
+rm -f "$T/state/".silent-watcher* "$T/state/".webhook-notify.* "$T/state/.quota-exhausted-notified" "$T/state/.quota-notice-pending" "$T/inbox.notes" "$T/asks.calls"
+Q0=$(date +%s)
+fake_axi 60; FAKE_CODE=400 FAKE_BODY='{"success":false,"error":"Automation x is disabled"}'; export FAKE_CODE FAKE_BODY
+qrun $Q0; check qsim-clear-no-ask "$(asks_n)" 0; check qsim-clear-no-note "$(notes)" 0
+fake_axi 0
+qrun $Q0                                           # quota zero, webhook refuses (http 400)
+check qsim-zero-ask "$(asks_n)" 1
+grep -q 'Renova em' "$T/asks.calls"; check qsim-zero-ask-renewal $? 0
+check qsim-zero-inbox-note-at-once "$(notes)" 1    # first failure: no streak yet, the critical notice still reaches the inbox
+grep -q 'NAO saiu pelo webhook' "$T/inbox.notes"; check qsim-note-says-undelivered $? 0
+grep -q 'http=400' "$T/state/.silent-watcher.log"; check qsim-logs-status $? 0
+[ -e "$T/state/.quota-notice-pending" ]; check qsim-pending-kept $? 0
+qrun $((Q0+300)); qrun $((Q0+600))                 # later runs: no second ask, no inbox spam, the webhook is retried
+check qsim-no-repeat-ask "$(asks_n)" 1; check qsim-no-repeat-note "$(notes)" 1
+[ -e "$T/state/.quota-notice-pending" ]; check qsim-still-pending $? 0
+check qsim-retry-not-counted "$(cat "$T/state/.webhook-notify.fails")" 1
+export FAKE_CODE=200 FAKE_BODY=''                  # the owner re-enabled the automation
+qrun $((Q0+900))
+[ ! -e "$T/state/.quota-notice-pending" ]; check qsim-delivered-late-clears-pending $? 0
+grep -q 'quota notice delivered late' "$T/state/.silent-watcher.log"; check qsim-logs-late-delivery $? 0
+check qsim-late-no-new-ask "$(asks_n)" 1
+fake_axi 60
+qrun $((Q0+1200))                                  # the quota is back: the ask closes
+grep -q '^done quota-zero' "$T/asks.calls"; check qsim-clear-closes-ask $? 0
+[ ! -e "$T/state/.quota-exhausted-notified" ]; check qsim-clear-marker-gone $? 0
+# a webhook that never recovers: pending is dropped when the quota clears, so the next week starts clean
+export FAKE_CODE=400 FAKE_BODY='{}'; fake_axi 0
+qrun $((Q0+1500)); [ -e "$T/state/.quota-notice-pending" ]; check qsim-week2-pending $? 0
+fake_axi 60; qrun $((Q0+1800)); [ ! -e "$T/state/.quota-notice-pending" ]; check qsim-clear-drops-pending $? 0
 exit $fail
