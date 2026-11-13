@@ -1442,7 +1442,14 @@ backlog_record_reconcile_sweep() {
       echo "BACKLOG_RECONCILE: unsafe worker record refused: $FM_BACKLOG_TRANSITION_ERROR"
       return 2
     fi
-    id=$(basename "$meta" .meta)
+    id=${meta##*/}
+    id=${id%.meta}
+    # The only repair below is moving a queued row In flight, so a record whose
+    # row the one In flight listing already names has nothing to heal and does
+    # not need its lock, which costs a dozen processes to take and release.
+    if [ "$inflight_known" = 1 ] && backlog_inflight_listed "$id" "$inflight_ids"; then
+      continue
+    fi
     meta_lock=$(fm_meta_lock_path "$meta") || continue
     fm_lock_try_acquire "$meta_lock" || continue
     if [ -e "$STATE/$id.backlog-close" ] || [ -L "$STATE/$id.backlog-close" ]; then

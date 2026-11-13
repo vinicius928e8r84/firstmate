@@ -20,6 +20,11 @@
 # Prints one `closed: <task> [key=<key>] <reason>` line per close, nothing else;
 # --dry-run prints `would-close:` and changes nothing. A per-decision failure is
 # skipped and the exit status stays 0, so a drain is never blocked by it.
+# The whole-file fold of a long retired log costs far more than everything else
+# here, and a retired log does not change, so a real (non dry-run) pass keeps the
+# fold result per log in state/.decision-autoclose-open/<task>, keyed by the
+# log's cksum and size. An unchanged log reuses its stored open set; any change
+# to the log refolds it. Every close condition above is still checked afresh.
 # FM_HOME and the FM_STATE_OVERRIDE / FM_DATA_OVERRIDE overrides select the home.
 set -u
 
@@ -52,13 +57,40 @@ note_close() {
   fi
 }
 
+CACHE_DIR="$STATE/.decision-autoclose-open"
+
+# Print the open decisions of status log $1; reuse the stored fold when the log
+# is byte-identical to the one it was folded from.
+open_decisions_cached() {  # <status-file> <task>
+  local f=$1 task=$2 sig stored_sig rest cache tmp open
+  case "$task" in ''|*[!A-Za-z0-9._-]*) status_open_decisions "$f"; return ;; esac
+  sig=$(cksum < "$f" 2>/dev/null) || { status_open_decisions "$f"; return; }
+  cache="$CACHE_DIR/$task"
+  if [ -f "$cache" ] && [ ! -L "$cache" ]; then
+    { IFS= read -r stored_sig && IFS= read -r -d '' rest; } < "$cache" 2>/dev/null
+    if [ "$stored_sig" = "v1 $sig" ]; then
+      printf '%s' "${rest%$'\n'}"
+      return 0
+    fi
+  fi
+  open=$(status_open_decisions "$f")
+  if [ "$DRY" != true ] && mkdir -p "$CACHE_DIR" 2>/dev/null; then
+    if tmp=$(mktemp "$CACHE_DIR/.tmp.XXXXXX" 2>/dev/null); then
+      if ! { printf 'v1 %s\n%s\n' "$sig" "$open" > "$tmp" && mv -f "$tmp" "$cache"; } 2>/dev/null; then
+        rm -f "$tmp"
+      fi
+    fi
+  fi
+  printf '%s' "$open"
+}
+
 exclude=$(status_scan_parent_channel_exclude "$STATE")
 for f in "$STATE"/*.status; do
   [ -e "$f" ] || continue
   [ "$f" = "$exclude" ] && continue
   task=$(basename "$f"); task="${task%.status}"
   [ ! -e "$STATE/$task.meta" ] || continue
-  open=$(status_open_decisions "$f") || continue
+  open=$(open_decisions_cached "$f" "$task") || continue
   [ -n "$open" ] || continue
   while IFS=$(printf '\t') read -r key verb _note; do
     [ -n "$key" ] || continue

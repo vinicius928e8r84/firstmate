@@ -126,6 +126,36 @@ test_pending_reply_to_live_destination_stays_open() {
   pass "a pending reply to a live destination stays open"
 }
 
+# A retired log's fold is stored per log and reused while the log is
+# byte-identical, but every close condition is still checked afresh and any
+# change to the log refolds it.
+test_unchanged_log_reuses_its_fold_and_a_changed_log_refolds() {
+  local dir out cache
+  dir=$(make_home fold-cache)
+  printf 'needs-decision [key=old-q]: pick one\n' > "$dir/state/retired1.status"
+  out=$(run_autoclose "$dir" --dry-run) || fail "dry run failed"
+  [ ! -e "$dir/state/.decision-autoclose-open" ] || fail "a dry run wrote the fold cache"
+  # Without data/<task>/ nothing closes, yet the fold is stored.
+  out=$(run_autoclose "$dir") || fail "autoclose failed"
+  [ -z "$out" ] || fail "closed without proof the task existed: $out"
+  cache="$dir/state/.decision-autoclose-open/retired1"
+  [ -f "$cache" ] || fail "the fold of an unchanged retired log was not stored"
+  # The close conditions are rechecked on every pass: the data dir appearing closes it.
+  mkdir -p "$dir/data/retired1"
+  out=$(run_autoclose "$dir" --dry-run) || fail "dry run failed"
+  case "$out" in *"would-close: retired1 [key=old-q]"*) ;; *) fail "a stored fold stopped the close from being rechecked: $out" ;; esac
+  # A byte-identical log reuses the stored fold (proved by planting a marker in it)...
+  sed 's/old-q/planted-q/' "$cache" > "$cache.new" && mv "$cache.new" "$cache"
+  out=$(run_autoclose "$dir" --dry-run) || fail "dry run failed"
+  case "$out" in *"would-close: retired1 [key=planted-q]"*) ;; *) fail "an unchanged log did not reuse its stored fold: $out" ;; esac
+  # ...and any change to the log refolds it from the log itself.
+  printf 'needs-decision [key=new-q]: another\n' >> "$dir/state/retired1.status"
+  out=$(run_autoclose "$dir" --dry-run) || fail "dry run failed"
+  case "$out" in *"[key=old-q]"*"[key=new-q]"*) ;; *) fail "a changed log was not refolded: $out" ;; esac
+  case "$out" in *planted-q*) fail "a changed log kept the stale stored fold: $out" ;; esac
+  pass "an unchanged retired log reuses its stored fold, a changed one refolds, and close conditions are rechecked"
+}
+
 test_gone_task_decision_is_closed
 test_live_task_decision_is_never_closed
 test_task_without_data_dir_is_not_proof
@@ -133,3 +163,4 @@ test_dry_run_changes_nothing_and_default_key_closes
 test_pending_reply_to_retired_destination_closes
 test_pending_reply_to_live_destination_stays_open
 test_pending_reply_without_task_data_stays_open
+test_unchanged_log_reuses_its_fold_and_a_changed_log_refolds
