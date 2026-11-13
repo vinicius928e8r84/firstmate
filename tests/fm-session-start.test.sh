@@ -2651,6 +2651,68 @@ EOF
   pass "--reemit reprints the digest without repeating startup's mutating sweeps and still drains queued wakes"
 }
 
+test_reemit_prints_the_fleet_card_first_and_the_switch_removes_it() {
+  local rec root home fakebin out first
+  rec=$(new_world reemit-card)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf 'window=w:1\nkind=ship\nmode=local-only\nyolo=off\n' > "$home/state/card-ship.meta"
+  printf 'done [at=%s]: ready in branch fm/card-ship\n' "$(date +%s)" > "$home/state/card-ship.status"
+  append_wake "$home/state" signal task-c "done: queued for the card" || fail "seed wake failed"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT "$SESSION_START" --reemit)
+  first=$(printf '%s\n' "$out" | sed -n '1p')
+  case "$first" in "FLEET CARD"*) ;; *) fail "the re-emit did not open with the fleet card: $first" ;; esac
+  assert_contains "$out" "branch fm/card-ship card-ship (needs the captain's word)" "the card did not carry the ship ready for the captain"
+  assert_contains "$out" "queue: 1 row(s), 1 distinct key(s)" "the card did not size the notice queue"
+  case "$out" in *"FLEET CARD"*"SESSION START (CONTEXT RE-EMIT)"*) ;; *) fail "the card did not precede the digest" ;; esac
+
+  out=$(FM_SESSION_START_FLEET_CARD=0 FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT "$SESSION_START" --reemit)
+  assert_not_contains "$out" "FLEET CARD" "FM_SESSION_START_FLEET_CARD=0 did not remove the card"
+  assert_contains "$out" "SESSION START (CONTEXT RE-EMIT)" "the switch removed the digest as well"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT "$SESSION_START")
+  assert_not_contains "$out" "FLEET CARD" "a full start (not a re-emit) must not print the card"
+  pass "a re-emit opens with the fleet card, FM_SESSION_START_FLEET_CARD=0 removes it, and a full start is unchanged"
+}
+
+test_a_slow_wake_drain_is_cut_by_its_own_stage_bound() {
+  local rec root home fakebin w bindir out status=0
+  rec=$(new_world drain-bound)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  w=${root%/root}
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  # A copy of bin/ whose wake drain is slow, so only the stage bound can save the digest.
+  bindir="$w/bin"
+  cp -R "$ROOT/bin" "$bindir"
+  cp -R "$ROOT/docs" "$w/docs"
+  printf '#!/usr/bin/env bash\nsleep 4\nprintf "SLOW-DRAIN-FINISHED\\n"\n' > "$bindir/fm-wake-drain.sh"
+  chmod +x "$bindir/fm-wake-drain.sh"
+
+  out=$(FM_SESSION_START_DRAIN_TIMEOUT=1 FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT "$bindir/fm-session-start.sh") || status=$?
+  expect_code 0 "$status" "a cut drain must not fail the start"
+  assert_contains "$out" "WAKE DRAIN CUT AT 1s" "the cut drain was not disclosed"
+  assert_not_contains "$out" "SLOW-DRAIN-FINISHED" "the slow drain was not cut"
+  assert_not_contains "$out" "STARTUP TRUNCATED - SESSION START" "the drain bound must leave the whole-digest bound untouched"
+  assert_contains "$out" "NEXT STEP" "the stages after the drain did not run"
+
+  out=$(FM_SESSION_START_DRAIN_TIMEOUT=0 FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT "$bindir/fm-session-start.sh")
+  assert_contains "$out" "SLOW-DRAIN-FINISHED" "FM_SESSION_START_DRAIN_TIMEOUT=0 did not restore the unbounded drain"
+  assert_not_contains "$out" "WAKE DRAIN CUT" "the undo switch still cut the drain"
+  pass "a slow wake drain is cut by its own stage bound and the later stages still run; FM_SESSION_START_DRAIN_TIMEOUT=0 undoes it"
+}
+
 test_agents_baseline_stays_at_true_start_and_reemits_on_every_drifted_pi_compact() {
   local rec root home fakebin startup compact_equal compact_first compact_second clear_out resume_out reset_out baseline baseline_after expected_hash refresh_line bootstrap_line
   rec=$(new_world agents-refresh)
@@ -3705,6 +3767,8 @@ test_read_only_pi_compact_refreshes_against_its_own_session_identity
 test_codex_unreachable_reset_sources_do_not_claim_instruction_refresh
 test_agents_baseline_requires_sha256_and_successful_completion
 test_reemit_keeps_repair_ownership_with_the_lock_holder
+test_reemit_prints_the_fleet_card_first_and_the_switch_removes_it
+test_a_slow_wake_drain_is_cut_by_its_own_stage_bound
 test_compact_task_line_names_identity_liveness_and_newest_event
 test_compact_backlog_shortens_rows_and_counts_ready
 test_compact_secondmates_print_one_line_per_route

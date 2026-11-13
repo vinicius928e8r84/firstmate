@@ -236,6 +236,13 @@
 # still exits 0. The child
 # records its progress in FM_SESSION_START_STAGE_FILE, which is also the flag
 # that tells a child it is the child - the parent never recurses.
+# Two things keep one slow part from costing the rest. A context re-emit prints
+# bin/fm-fleet-card.sh first, outside that bound (FM_SESSION_START_FLEET_CARD=0
+# removes it; FM_SESSION_START_CARD_TIMEOUT bounds it), so the state a compaction
+# cannot carry survives a truncation. And the wake-queue drain has its own stage
+# bound, FM_SESSION_START_DRAIN_TIMEOUT (default 45s, 0 removes it): a drain that
+# hits it is disclosed, leaves every row queued and unacknowledged, and the later
+# stages still run inside the whole-digest bound.
 # Hosts without timeout, gtimeout, or perl use the shared pure-Bash watchdog, so
 # the digest never runs without the same hard bound and process-group cleanup.
 #
@@ -348,6 +355,21 @@ if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
     # Without a breadcrumb the bound still holds; only the banner's precision
     # is lost, so the child still runs bounded.
     SESSION_START_STAGE_FILE=/dev/null
+  fi
+  # A context re-emit prints the fleet card FIRST, outside the bounded child
+  # (bin/fm-fleet-card.sh: plain files, no lock, a fixed process count), so the
+  # state a compaction summary cannot carry arrives even when a later stage is
+  # cut by the bound below. Its own short bound keeps it from ever being the slow
+  # stage; FM_SESSION_START_FLEET_CARD=0 restores the digest without a card.
+  if [ "$REEMIT" -eq 1 ] && [ "${FM_SESSION_START_FLEET_CARD:-1}" != 0 ] && [ -x "$SCRIPT_DIR/fm-fleet-card.sh" ]; then
+    CARD_BOUND=${FM_SESSION_START_CARD_TIMEOUT:-10}
+    case "$CARD_BOUND" in ''|*[!0-9]*) CARD_BOUND=10 ;; esac
+    [ "$CARD_BOUND" -gt 0 ] 2>/dev/null || CARD_BOUND=10
+    fm_run_timed "$CARD_BOUND" env FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+      "$SCRIPT_DIR/fm-fleet-card.sh"
+    CARD_RC=$?
+    [ "$CARD_RC" -eq 0 ] || printf 'FLEET CARD UNAVAILABLE (exit %s); the digest below is the whole record.\n' "$CARD_RC"
+    printf '\n'
   fi
   if [ "$REEMIT" -eq 1 ]; then
     if [ -n "$SESSION_SOURCE" ]; then
@@ -1156,12 +1178,29 @@ else
   fi
   # The drain prints its own WAKE_ACK_REQUIRED line for the rows it presents,
   # so the guard it runs need not tell this turn to drain them again.
-  DRAIN_OUT=$(FM_OPEN_DECISIONS_VIEW=all FM_GUARD_QUEUE_PRESENTED="${FM_GUARD_QUEUE_PRESENTED:-1}" \
-    "$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
+  # The drain gets its own stage bound (FM_SESSION_START_DRAIN_TIMEOUT, default
+  # 45s; 0 removes it), so one slow queue can no longer spend the whole digest
+  # budget and cut every later stage. A cut drain loses nothing: its rows stay
+  # queued until acknowledged, and the notice below names the command that
+  # presents them.
+  DRAIN_BOUND=${FM_SESSION_START_DRAIN_TIMEOUT:-45}
+  case "$DRAIN_BOUND" in ''|*[!0-9]*) DRAIN_BOUND=45 ;; esac
+  if [ "$DRAIN_BOUND" -gt 0 ]; then
+    DRAIN_OUT=$(fm_run_timed "$DRAIN_BOUND" env FM_OPEN_DECISIONS_VIEW=all FM_GUARD_QUEUE_PRESENTED="${FM_GUARD_QUEUE_PRESENTED:-1}" \
+      "$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
+  else
+    DRAIN_OUT=$(FM_OPEN_DECISIONS_VIEW=all FM_GUARD_QUEUE_PRESENTED="${FM_GUARD_QUEUE_PRESENTED:-1}" \
+      "$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
+  fi
+  DRAIN_RC=$?
   if [ -n "$DRAIN_OUT" ]; then
     printf '%s\n' "$DRAIN_OUT"
-  else
+  elif [ "$DRAIN_RC" -ne 124 ]; then
     printf '(no queued wakes)\n'
+  fi
+  if [ "$DRAIN_RC" -eq 124 ]; then
+    printf 'WAKE DRAIN CUT AT %ss (its own stage bound): the queue is intact and nothing was acknowledged.\n' "$DRAIN_BOUND"
+    printf 'Run bin/fm-wake-drain.sh yourself after this digest; a queue that stays slow is a fleet problem to report.\n'
   fi
 fi
 

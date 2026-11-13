@@ -3021,6 +3021,12 @@ FM_OPEN_DECISIONS_VIEW=changed   # what the wake drain's OPEN DECISIONS section 
 FM_WAKE_DRAIN_ROWS=             # `full` prints each presented wake row as the five-field queue row; unset prints the shared reason once and per row only seq, kind and file (bin/fm-supervise-daemon.sh sets full)
 FM_SESSION_START_QUEUED_LIMIT=20   # plain queued backlog rows in the session-start digest; in-flight, held, and blocked rows are never bounded and done rows are never listed; the compact tasks-axi view counts them in one line unless this is set
 FM_SESSION_START_ENDPOINT_TIMEOUT=10   # seconds bounding each per-task endpoint liveness read in the session-start digest (bin/fm-session-start.sh); nonpositive or invalid values fall back to 10; a read that hits the bound or dies becomes that task's own endpoint error (`ep=error(...)`, or an `endpoint: error` line in the full task view) and the digest continues
+FM_SESSION_START_FLEET_CARD=1   # 0 stops a context re-emit from printing the fleet card (bin/fm-fleet-card.sh) before the digest
+FM_SESSION_START_CARD_TIMEOUT=10   # seconds bounding that card on its own, so it can never be the slow stage
+FM_SESSION_START_DRAIN_TIMEOUT=45   # seconds bounding the digest's wake-queue drain on its own, so one slow queue cannot spend the whole FM_SESSION_START_TIMEOUT; a cut drain is disclosed in the digest and leaves every row queued. 0 removes this bound
+FM_CARD_MAX_BYTES=5000   # ceiling for the fleet card; lower-priority sections shorten first and the open decisions never do (also `bin/fm-fleet-card.sh --max-bytes N`)
+FM_CARD_QUEUED_ROWS=5   # queued backlog rows the fleet card lists
+FM_CARD_TZ=   # time zone the fleet card uses for "asked today" (unset: the host's)
 FM_WAKE_DEDUP=1   # 0 makes a publisher that re-announces durable state (bin/fm-procevent.sh) append a wake row on every pass again, even when an identical row is still queued
 FM_BACKLOG_ROW_TIMEOUT_SECS=10   # seconds bounding each backlog row read (bin/fm-backlog-transition-lib.sh) and the tasks-axi replay of each captain-hold Done-archive row (bin/fm-captain-hold.sh, which stops with 124 on a replay timeout); the archive scan itself is not bounded; nonpositive or invalid values fall back to 10; the first backlog read bound hit latches the sweep so later reads return immediately, each still naming its own item
 FM_BOOTSTRAP_DETECT_ONLY=0   # internal/read-only session-start mode: skip bootstrap's mutating sweeps and print advisory TANGLE wording

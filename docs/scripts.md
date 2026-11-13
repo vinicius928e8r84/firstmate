@@ -8,6 +8,7 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | Script                   | Purpose                                                                              |
 | ------------------------ | ------------------------------------------------------------------------------------ |
 | `fm-session-start.sh`    | Compose lock, bootstrap, and wake drain into the single ordered session-start digest |
+| `fm-fleet-card.sh`       | Print the compact fleet card (notices, open decisions, merge queue, holds, captain asks, page answers, queued and in-flight work) from plain files, first on a context re-emit |
 | `fm-sessionstart-nudge.sh` | Print the native session-start hook nudge when the primary has not already run the digest |
 | `fm-sessionstart-run.sh` | Route a native session-open hook to the full digest, a context re-emit, or the nudge |
 | `fm-operational-input.sh` | Construct and parse the canonical cross-language operational-input protocol |
