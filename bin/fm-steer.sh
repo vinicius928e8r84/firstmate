@@ -10,7 +10,9 @@
 #              exit 6, nothing sent). A lease main already held before is left held; only a lease taken here is released
 #   3 send     data/tools/fm-say.sh [--again] [--paths-ok] <target> [--resolve-key KEY]... <text>: it dedups a resend, hides
 #              the supervisor noise and proves the record reached the target's inbox
-#   4 result   fm-say's own final line, unchanged: DELIVERED | UNKNOWN | FAILED | DUPLICATE-REFUSED | TYPED
+#   4 wakes    a `WAKES-WAITING ...` line from fm-say (how many supervisor wakes are queued and for how long) is passed on
+#              to stderr first; it is the one fm-say note kept, because a steer must not hide that wakes are waiting
+#   5 result   fm-say's own final line on stdout, unchanged: DELIVERED | UNKNOWN | FAILED | DUPLICATE-REFUSED | TYPED
 # Exit: fm-say's (0 delivered or typed, 1 failed, 3 unknown - do not resend blindly, 4 duplicate refused, 5 path missing on the remote),
 #       2 usage, 6 lease held by the other supervisor.
 # Env: FM_HOME (explicit, as for bin/fm-send.sh), FM_STEER_SAY (default $FM_HOME/data/tools/fm-say.sh), FM_STEER_LEASE (default bin/fm-lease.sh).
@@ -22,7 +24,7 @@ LEASE=${FM_STEER_LEASE:-$HERE/fm-lease.sh}
 usage() { sed -n 2,3p "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 target=${1:-}; [ -n "$target" ] || usage
-case "$target" in -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case "$target" in -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 shift
 file=""; say_args=(); keys=()
 while [ $# -gt 0 ]; do
@@ -47,6 +49,7 @@ if ! "$LEASE" claim "$target" --actor main >/dev/null 2>&1; then
 fi
 out=$("$SAY" "${say_args[@]}" "$target" "${keys[@]}" "$text" 2>&1); rc=$?
 [ $held_before = 1 ] || "$LEASE" release "$target" --actor main >/dev/null 2>&1
+printf '%s\n' "$out" | grep '^WAKES-WAITING ' >&2
 result=$(printf '%s\n' "$out" | grep -E '^(DELIVERED|TYPED|UNKNOWN|FAILED|DUPLICATE-REFUSED|PATH-MISSING-REMOTE)' | tail -1)
 [ -n "$result" ] || result="FAILED $target: fm-say printed no result (exit $rc): $(printf '%s\n' "$out" | tail -1 | cut -c1-160)"
 echo "$result"

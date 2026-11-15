@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Behavioral coverage for bin/fm-steer.sh with stand-in lease and fm-say tools: the lease is claimed before and
 # released after the send, a lease main already held is left alone, a lease the other supervisor holds stops the
-# steer before anything is sent, the message reaches fm-say whole, and fm-say's final line and exit status are the result.
+# steer before anything is sent, the message reaches fm-say whole, fm-say's final line and exit status are the result,
+# and fm-say's WAKES-WAITING line about queued supervisor wakes survives on stderr while its other notes stay hidden.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -27,6 +28,7 @@ S
 echo "say \$*" >> '$H/calls'
 printf '%s' "\$*" > '$H/say.text'
 echo "note: supervisor warning hidden" >&2
+[ -z "\${SAY_WAKES:-}" ] || echo "WAKES-WAITING \$SAY_WAKES" >&2
 echo "\${SAY_OUT-DELIVERED pm-1 record=/x/1.msg}"
 exit "\${SAY_RC:-0}"
 S
@@ -81,7 +83,24 @@ test_results_and_usage() {
   pass "results: fm-say's status and line pass through, empty and silent cases refuse, stdin works, FM_HOME explicit"
 }
 
+test_waiting_wakes_survive() {
+  local err
+  new_home wakes
+  out=$(SAY_WAKES="3 wake(s) queued, oldest 42 min" "$STEER" pm-1 --file "$H/msg.txt" 2>"$H/err"); rc=$?
+  err=$(cat "$H/err")
+  expect_code 0 "$rc" "delivered exit with wakes waiting"
+  assert_equals "DELIVERED pm-1 record=/x/1.msg" "$out" "stdout stays fm-say's one result line"
+  assert_equals "WAKES-WAITING 3 wake(s) queued, oldest 42 min" "$err" \
+    "the waiting-wakes line reaches the caller on stderr, and only that line"
+  SAY_WAKES="1 wake(s) queued, oldest 7 min" SAY_OUT="UNKNOWN pm-1: no inbox record" SAY_RC=3 run pm-1 --file "$H/msg.txt" --again
+  expect_code 3 "$rc" "a bad result keeps its exit status with wakes waiting"
+  assert_equals "WAKES-WAITING 1 wake(s) queued, oldest 7 min
+UNKNOWN pm-1: no inbox record" "$out" "the waiting-wakes line comes first and the result line stays last"
+  pass "waiting wakes: fm-say's WAKES-WAITING line is passed on, before the result line"
+}
+
 test_delivered
+test_waiting_wakes_survive
 test_lease_rules
 test_results_and_usage
 
