@@ -1353,7 +1353,7 @@ test_pi_refuses_model_absent_from_live_listing() {
 
 test_pi_accepts_listed_model_forms() {
   local rec id out status m n=0
-  for m in claude-bridge/claude-sonnet-5 claude-sonnet-5 claude-sonnet-5:high openai-codex/gpt-5.6-sol; do
+  for m in claude-bridge/claude-sonnet-5 anthropic/claude-sonnet-5:high gpt-5.6-sol gpt-5.6-sol:high openai-codex/gpt-5.6-sol; do
     n=$((n + 1))
     id=profile-pi-listed-z8c$n
     rec=$(make_spawn_case "profile-pi-listed-$n" pi "$id")
@@ -1365,7 +1365,31 @@ test_pi_accepts_listed_model_forms() {
     expect_code 0 "$status" "pi spawn should accept listed model form $m: $out"
     assert_contains "$(cat "$LAUNCH_LOG")" "--model '$m'" "pi launch lost listed model $m"
   done
-  pass "pi accepts exact, bare, provider-prefixed, and thinking-suffixed listed models"
+  pass "pi accepts provider-prefixed, single-provider bare, and thinking-suffixed listed models"
+}
+
+test_pi_refuses_bare_model_listed_by_several_providers() {
+  local rec id out status m n=0
+  for m in claude-sonnet-5 claude-sonnet-5:high; do
+    n=$((n + 1))
+    id=profile-pi-ambiguous-z8e$n
+    rec=$(make_spawn_case "profile-pi-ambiguous-$n" pi "$id")
+    read_case_record "$rec"
+    FM_TEST_PI_MODELS=$PI_LISTING \
+      out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+        --model "$m" 2>&1)
+    status=$?
+    expect_code 1 "$status" "pi spawn should refuse bare model $m listed by anthropic and claude-bridge: $out"
+    assert_contains "$out" "is listed by more than one provider" \
+      "bare-model refusal did not say why $m is refused"
+    assert_contains "$out" "claude-bridge/claude-sonnet-5" \
+      "bare-model refusal did not name the claude-bridge form to use"
+    assert_contains "$out" "anthropic/claude-sonnet-5" \
+      "bare-model refusal did not list the other provider that would have been guessed"
+    [ ! -s "$LAUNCH_LOG" ] || fail "bare-model refusal must happen before launch"
+    [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "bare-model refusal left a task record"
+  done
+  pass "pi refuses a bare model id that several providers list, naming the provider-prefixed forms"
 }
 
 test_pi_unavailable_listing_does_not_block_spawn() {
@@ -2832,6 +2856,7 @@ test_pi_threads_model_and_max_effort
 test_pi_tui_mode_probe_is_safe_for_old_and_new_pi
 test_pi_refuses_model_absent_from_live_listing
 test_pi_accepts_listed_model_forms
+test_pi_refuses_bare_model_listed_by_several_providers
 test_pi_unavailable_listing_does_not_block_spawn
 test_pi_signed_threads_shared_pi_profile_and_preserves_identity
 test_pi_signed_missing_binary_refuses_before_endpoint_or_metadata

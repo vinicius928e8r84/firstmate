@@ -308,8 +308,8 @@
 #   verified, because an unknown value exits the launch.
 #   For pi and pi-signed, the requested --model is checked against the executable's
 #   `--model <m> --list-models` table before any endpoint exists (pi_model_validate): a model
-#   matching no listed id or <provider>/<id> refuses the spawn, and an unreadable
-#   listing launches unvalidated with a notice.
+#   matching no listed id or <provider>/<id>, or a bare id that more than one provider
+#   lists, refuses the spawn, and an unreadable listing launches unvalidated with a notice.
 #   For omp (Oh My Pi), fm-spawn resolves the `omp` executable from PATH once and
 #   refuses when it is absent. Every omp launch clears the foreign harness
 #   markers (omp publishes none of its own), sets the Firstmate-owned
@@ -2619,7 +2619,12 @@ agy_model_validate() {  # <agy-bin> <model>
 # (a bare claude-sonnet-5-5 did exactly that). The check mirrors Pi's own
 # matching, an exact id, an exact <provider>/<id>, or a case-insensitive
 # substring of either, so it only refuses a pattern Pi itself cannot resolve; a
-# trailing :<thinking> level is stripped first. An unreadable or unparseable
+# trailing :<thinking> level is stripped first. A bare id that more than one
+# provider lists is refused as well: Pi then either stops on the ambiguity or
+# takes whichever provider is signed in, which for a Claude id is the native
+# login instead of claude-bridge (a worker that dies on its first turn), and
+# firstmate never guesses a provider. The refusal names every
+# <provider>/<id> form, claude-bridge first. An unreadable or unparseable
 # listing establishes nothing and launches unvalidated, and the probe runs under
 # the shared hard bound (bin/fm-timeout-lib.sh) with stdin detached. The
 # listing is requested with the same --model the launch will carry because a pi
@@ -2627,7 +2632,7 @@ agy_model_validate() {  # <agy-bin> <model>
 # model runs a pinned bridge build that lists the 5.5 models plain pi lacks), so
 # the listing must come from the build the worker would actually run.
 pi_model_validate() { # <pi-bin> <model>
-  local bin=$1 model=$2 listing rc=0 bound=${FM_PI_MODELS_TIMEOUT:-15} pattern rows hints
+  local bin=$1 model=$2 listing rc=0 bound=${FM_PI_MODELS_TIMEOUT:-15} pattern rows hints owners
   case "$bound" in '' | *[!0-9]* | 0*) bound=15 ;; esac
   [ -n "$model" ] && [ "$model" != default ] || return 0
   pattern=$model
@@ -2641,6 +2646,20 @@ pi_model_validate() { # <pi-bin> <model>
   fi
   rows=$(printf '%s\n' "$listing" | awk 'hdr && NF >= 2 { print $1 "/" $2 } $1 == "provider" && $2 == "model" { hdr = 1 }')
   [ -n "$rows" ] || return 0
+  case "$pattern" in
+  */*) ;;
+  *)
+    owners=$(printf '%s\n' "$rows" | awk -v p="$pattern" '
+      BEGIN { p = tolower(p) }
+      { id = tolower($0); sub(/^[^\/]*\//, "", id) }
+      id == p { if ($0 ~ /^claude-bridge\//) first = $0; else rest = rest (rest == "" ? "" : ", ") $0; n++ }
+      END { if (n > 1) print (first == "" ? "" : first (rest == "" ? "" : ", ")) rest }')
+    if [ -n "$owners" ]; then
+      echo "error: pi model '$model' is listed by more than one provider, so the bare id leaves the provider to whichever login Pi finds; pass <provider>/<id> (Claude models need the claude-bridge/ prefix): $owners" >&2
+      return 1
+    fi
+    ;;
+  esac
   if printf '%s\n' "$rows" | awk -v p="$pattern" '
     BEGIN { p = tolower(p) }
     { sel = tolower($0); id = sel; sub(/^[^\/]*\//, "", id) }
