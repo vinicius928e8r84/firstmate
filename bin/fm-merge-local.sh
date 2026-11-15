@@ -15,6 +15,14 @@
 # merge, so a captain approval must be recorded as an `answer --release` before
 # this entrypoint is invoked. The lock ends when the fast-forward returns;
 # docs/captain-hold-lifecycle.md owns the accepted merge-to-cleanup residual.
+# A landing never reaches CI, so before the fast-forward it runs the branch's own
+# bin/fm-lint.sh (the lint owner) on the shell files the branch changes, in a copy
+# of the branch tree, and refuses when that lint fails. Only the changed files are
+# linted, so a finding already in an untouched file cannot hold a landing; a project
+# whose branch has no bin/fm-lint.sh is not linted. A missing or wrong ShellCheck
+# refuses too, and the lint's message names bin/fm-install-shellcheck.sh. The lint
+# runs with FM_LINT_REQUIRE_BOUNDS=1 (CI's setting) so a very large script such as
+# bin/fm-spawn.sh takes the lint's own memory fallback instead of being killed.
 # Usage: fm-merge-local.sh <task-id>
 set -eu
 
@@ -135,6 +143,21 @@ case "$hold_status" in
     exit 1
     ;;
 esac
+lint_tree=$(mktemp -d "${TMPDIR:-/tmp}/fm-merge-lint.XXXXXX")
+lint_files=()
+if git -C "$PROJ" cat-file -e "$BRANCH:bin/fm-lint.sh" 2>/dev/null; then
+  git -C "$PROJ" archive "$BRANCH" | tar -x -C "$lint_tree"
+  while IFS= read -r -d '' changed; do
+    [[ "$changed" =~ ^(bin|bin/backends|tests)/[^/]+\.sh$ ]] || continue
+    if [ -f "$lint_tree/$changed" ]; then lint_files+=("$changed"); fi
+  done < <(git -C "$PROJ" diff --name-only --diff-filter=ACMR -z "$DEFAULT" "$BRANCH" --)
+  if [ "${#lint_files[@]}" -gt 0 ] && ! ( cd "$lint_tree" && FM_LINT_REQUIRE_BOUNDS=1 bash bin/fm-lint.sh "${lint_files[@]}" ) >&2; then
+    rm -rf "$lint_tree"
+    echo "error: lint refused the landing of $BRANCH: fix the findings above (or install ShellCheck with bin/fm-install-shellcheck.sh) on the branch, then retry" >&2
+    exit 1
+  fi
+fi
+rm -rf "$lint_tree"
 merge_status=0
 git -C "$PROJ" merge --ff-only "$BRANCH" >/dev/null || merge_status=$?
 fm_lock_release "$MERGE_CONTROL_LOCK" || true

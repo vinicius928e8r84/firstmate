@@ -502,6 +502,48 @@ EOF
   pass "fm-merge-local: a registry change cannot redirect an in-flight local-only task"
 }
 
+# A local-only landing never reaches CI, so fm-merge-local runs the project's own bin/fm-lint.sh on the
+# shell files the branch changes, in a copy of the branch tree, and refuses the fast-forward when it fails.
+# The fixture's lint is a stand-in that fails on a marker word, or when run without CI's bounded mode; a project without bin/fm-lint.sh is not linted.
+test_local_merge_refuses_a_branch_that_fails_lint() {
+  local home proj id main out rc before mk
+  home="$TMP_ROOT/local-merge-lint/home"
+  proj="$TMP_ROOT/local-merge-lint/proj"
+  mkdir -p "$home/state" "$home/data" "$proj/bin"
+  git -C "$proj" init -q || fail "could not initialize lint fixture"
+  git -C "$proj" config user.email test@example.com
+  git -C "$proj" config user.name test
+  # shellcheck disable=SC2016  # the single quotes are deliberate: the stand-in lint script's own text
+  printf '#!/usr/bin/env bash\n[ "${FM_LINT_REQUIRE_BOUNDS:-}" = 1 ] || { echo "lint: not run with bounds" >&2; exit 1; }\nfor f in "$@"; do ! grep -q BROKEN "$f" || { echo "lint: $f is BROKEN" >&2; exit 1; }; done\n' > "$proj/bin/fm-lint.sh"
+  printf '#!/usr/bin/env bash\necho fine\n' > "$proj/bin/old.sh"
+  git -C "$proj" add bin || fail "could not stage lint fixture"
+  git -C "$proj" commit -qm base || fail "could not commit lint fixture"
+  main=$(git -C "$proj" branch --show-current)
+  for mk in broken clean; do
+    id=local-merge-lint-$mk
+    git -C "$proj" checkout -qb "fm/$id" "$main" || fail "could not create lint fixture branch"
+    if [ "$mk" = broken ]; then printf '#!/usr/bin/env bash\necho BROKEN\n' > "$proj/bin/new.sh"
+    else printf '#!/usr/bin/env bash\necho ok\n' > "$proj/bin/new.sh"; fi
+    git -C "$proj" add bin/new.sh || fail "could not stage lint fixture branch"
+    git -C "$proj" commit -qm "add new.sh ($mk)" || fail "could not commit lint fixture branch"
+    git -C "$proj" checkout -q "$main" || fail "could not restore lint fixture default branch"
+    printf 'project=%s\nmode=local-only\nbranch=fm/%s\n' "$proj" "$id" > "$home/state/$id.meta"
+    before=$(git -C "$proj" rev-parse HEAD)
+    rc=0; out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$MERGE_LOCAL" "$id" 2>&1) || rc=$?
+    if [ "$mk" = broken ]; then
+      expect_code 1 "$rc" "a branch that fails lint must not land: $out"
+      assert_contains "$out" "bin/new.sh is BROKEN" "the refusal must carry the lint's own finding"
+      assert_contains "$out" "lint" "the refusal must say lint refused the landing"
+      [ "$(git -C "$proj" rev-parse HEAD)" = "$before" ] || fail "a lint-failing branch moved the default branch"
+      git -C "$proj" branch -qD "fm/$id"
+    else
+      expect_code 0 "$rc" "a branch that passes lint must land: $out"
+      [ "$(git -C "$proj" rev-parse HEAD)" != "$before" ] || fail "a lint-clean branch did not land"
+    fi
+  done
+  pass "fm-merge-local: lint failure on a changed shell file refuses the landing; a clean branch lands"
+}
+
 # A registered name may contain spaces, and the lookup must match the whole
 # name rather than only its first whitespace-delimited token (issue #1977).
 # The longer "foo bar" row is listed before the "foo" row so a leading-prefix
@@ -1753,6 +1795,7 @@ test_promotion_persists_the_selected_ship_branch
 test_promotion_branch_command_is_shell_safe
 test_local_merge_uses_the_recorded_ship_branch
 test_project_mode_matches_whole_multiword_names
+test_local_merge_refuses_a_branch_that_fails_lint
 test_project_mode_maps_the_conditional_policy
 test_project_mode_binds_the_forge_orthogonally
 test_project_mode_refuses_only_a_malformed_forge_binding
