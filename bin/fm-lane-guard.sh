@@ -137,6 +137,16 @@ record_spawn_failure() { # <id> <rc> [kind project backend harness scheduled-loo
     "$id" "$rc" "$(now)" "$kind" "$project" "$backend" "$harness" "$scheduled" "$(spawn_stderr_text)" > "$f.tmp" && mv "$f.tmp" "$f"
 }
 fget() { sed -n "s/^$2=//p" "$1" | head -1; }
+# The reason an alert shows from a stored stderr value (newlines folded to a literal \n): the LAST error/fatal line
+# when there is one - a spawn prints placement and warning chatter before the line that says why it failed - else the
+# whole value; at most 400 characters, from the end. ${v: -400} alone is empty for a value shorter than 400.
+spawn_alert_reason() {  # <stored stderr value>
+  local v=$1 line
+  line=$(printf '%s' "$v" | sed 's/\\n/\n/g' | grep -E '^(error|fatal)' | tail -n1)
+  [ -z "$line" ] || v=$line
+  [ "${#v}" -le 400 ] || v=${v: -400}
+  printf '%s' "$v"
+}
 scan_spawn() {
   local f id rc at kind project backend harness scheduled meta errtxt
   [ -d "$FAILDIR" ] || return 0
@@ -150,7 +160,7 @@ scan_spawn() {
       mv "$f" "$f.warned"; continue
     fi
     mv "$f" "$f.warned"
-    alert "spawn-$id-$at" 1 "${scheduled:+scheduled loop $scheduled: }worker creation failed: task $id exited $rc at $(date -u -d "@${at:-0}" +%FT%TZ) (kind=${kind:-?} project=${project:-?} backend=${backend:-?} harness=${harness:-?}); ${errtxt:+stderr: ${errtxt: -400}; }see state/spawn-failures/ for the full record"
+    alert "spawn-$id-$at" 1 "${scheduled:+scheduled loop $scheduled: }worker creation failed: task $id exited $rc at $(date -u -d "@${at:-0}" +%FT%TZ) (kind=${kind:-?} project=${project:-?} backend=${backend:-?} harness=${harness:-?}); ${errtxt:+stderr: $(spawn_alert_reason "$errtxt"); }see state/spawn-failures/ for the full record"
   done
   find "$FAILDIR" -name '*.warned' -mtime +7 -delete 2>/dev/null
 }

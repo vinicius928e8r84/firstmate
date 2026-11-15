@@ -65,6 +65,19 @@ grep -q '^stderr=a*\\nlast words' "$ef"; check stderr-tail-kept $? 0
 grep -q 'first line' "$ef"; check stderr-truncated $? 1
 [ "$(sed -n 's/^stderr=//p' "$ef" | wc -c)" -le 2100 ]; check stderr-bounded $? 0
 rm -f "$ef"
+# the alert must carry the reason: a short stderr (under 400 chars) used to print `stderr: ;` because ${v: -400}
+# is empty when the value is shorter than 400, and a long one led with placement chatter and cut the final error line
+rm -f "$T/state/spawn-failures"/*.fail*
+printf 'error: another Treehouse slot allocation or return is in progress for /p; refusing to race it\n' > "$T/err.txt"
+FM_LG_STDERR_FILE="$T/err.txt" "$LG" record-spawn-failure shorterr 1 ship proj herdr pi
+out=$("$LG" scan spawn); printf '%s' "$out" | grep -q 'stderr: error: another Treehouse slot allocation'; check alert-short-stderr-kept $? 0
+{ printf 'placement (dry-run): none type=scout skipped: principal (not admitting (cpu: load 4.79 on 4 cores; load: load 4.79, max-load1 6 (clearing 1 of 3))) skipped: pc (lane facts unreadable) \n'
+  printf 'warning: no exact herdr presentation token match for longerr; leaving any stale space untouched and spawning flat and then some more words to pad this line out past the cut\n'
+  printf 'error: treehouse get did not enter an isolated worktree within 60s (last seen %s: it is the spawning project itself; spawning project %s); inspect window vps:w3:p3X\n' "'/home/factory/firstmate/projects/PerpetualMiner'" "'/home/factory/firstmate/projects/PerpetualMiner'"; } > "$T/err.txt"
+FM_LG_STDERR_FILE="$T/err.txt" "$LG" record-spawn-failure longerr 1 ship proj herdr pi
+out=$("$LG" scan spawn); printf '%s' "$out" | grep -q 'stderr: error: treehouse get did not enter an isolated worktree within 60s'; check alert-leads-with-final-error $? 0
+printf '%s' "$out" | grep -q 'placement (dry-run)'; check alert-drops-chatter $? 1
+rm -f "$T/state/spawn-failures"/*; rm -f "$T/state/.lane-guard-alerts" "$T/asks.calls"
 "$LG" record-spawn-failure ok1 1 ship proj herdr pi; : > "$T/state/ok1.meta"   # a later spawn published its record
 "$LG" scan spawn >/dev/null; check spawn-recovered-quiet "$?" 0
 "$LG" record-spawn-failure '../bad' 1 >/dev/null 2>&1; check spawn-bad-id "$?" 1
