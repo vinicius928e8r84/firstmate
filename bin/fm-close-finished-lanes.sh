@@ -12,7 +12,12 @@
 #
 # A lane is closed only when ALL hold; otherwise it is left alone and reported as
 # `kept: <id> <reason>` (`skipped: <id> secondmate` for persistent secondmates, never touched):
-#   - bin/fm-crew-state.sh reports its current state as done (a status log line is never trusted);
+#   - bin/fm-crew-state.sh reports its current state as done, or reports unknown while the task's
+#     endpoint is positively dead or gone (herdr/tmux/rex agent state dead or missing) and the
+#     status log's current line is `done:`. Crew-state never trusts a status line over a possibly
+#     live agent, so every finished lane whose agent exited stayed `unknown` forever and nobody
+#     closed it (22 tasks, median 34 h, retro 1115); a live, busy, unreachable or unverified
+#     endpoint still keeps the lane. The merged-evidence and teardown guards below still apply;
 #   - a scout has its report at data/<id>/report.md; a ship has positive merged evidence: its recorded
 #     pr= reads merged on the forge (open, closed or unreadable keeps it, so bin/fm-pr-merge.sh still has
 #     its record), or - with no pr= recorded - the first PR URL in its status log reads merged the same
@@ -29,7 +34,8 @@
 # The budget also bounds the scan: tasks not yet checked when it runs out are kept.
 # Output ends with `lanes: N closed, M kept, K skipped` (`would be closed` under --dry-run).
 # Env: FM_HOME; test seams FM_LANE_CLOSE_CREW_STATE_CMD, FM_LANE_CLOSE_TEARDOWN_CMD,
-#   FM_LANE_CLOSE_HOLD_CMD, FM_LANE_CLOSE_PR_CMD <pr-url> (prints the state, exit 0 only when merged)
+#   FM_LANE_CLOSE_HOLD_CMD, FM_LANE_CLOSE_PR_CMD <pr-url> (prints the state, exit 0 only when merged),
+#   FM_LANE_CLOSE_AGENT_CMD <meta> (prints alive|dead|missing|unverified|...)
 #   (each defaults to the sibling bin/ script).
 # Exit: 0 (also when lanes were kept), 64 usage.
 set -uo pipefail
@@ -63,6 +69,7 @@ crew_state=${FM_LANE_CLOSE_CREW_STATE_CMD:-$SCRIPT_DIR/fm-crew-state.sh}
 teardown=${FM_LANE_CLOSE_TEARDOWN_CMD:-$SCRIPT_DIR/fm-teardown.sh}
 hold=${FM_LANE_CLOSE_HOLD_CMD:-$SCRIPT_DIR/fm-captain-hold.sh}
 pr_cmd=${FM_LANE_CLOSE_PR_CMD:-}
+agent_cmd=${FM_LANE_CLOSE_AGENT_CMD:-}
 
 mkdir -p "$STATE"
 exec 8> "$STATE/.lane-close.lock"
@@ -70,6 +77,23 @@ flock -n 8 || { echo "lanes: another run holds the lock, nothing done"; exit 0; 
 
 meta_value() {  # <meta> <key>
   grep "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+# Print the task endpoint's agent state (alive|dead|missing|unverified|...) from its metadata.
+agent_state() {  # <meta>
+  if [ -n "$agent_cmd" ]; then "$agent_cmd" "$1" 2>/dev/null; return 0; fi
+  # shellcheck disable=SC2016  # expands inside the child bash
+  timeout 30 bash -c '. "$1"; fm_backend_agent_state "$(fm_backend_of_meta "$2")" "$(fm_backend_target_of_meta "$2")"' \
+    _ "$SCRIPT_DIR/fm-backend.sh" "$1" 2>/dev/null || printf unknown
+}
+
+# 0 when the task's current status line is a `done:` and its endpoint is positively dead or gone.
+finished_by_status_log() {  # <id> <meta> <kind>
+  local cur
+  cur=$(status_current_line "$STATE/$1.status" "$3" 2>/dev/null)
+  [ "$(status_line_verb "$cur")" = "done" ] || return 1
+  case "$(agent_state "$2")" in dead|missing) return 0 ;; esac
+  return 1
 }
 
 # Print the PR's state and exit 0 only when it is merged; anything unreadable prints unknown.
@@ -160,6 +184,7 @@ for meta in "$STATE"/*.meta; do
   fi
   line=$("$crew_state" "$id" 2>/dev/null | head -n1)
   st=${line#state: }; st=${st%% *}
+  if [ "$st" = unknown ] && finished_by_status_log "$id" "$meta" "$kind"; then st="done"; fi
   if [ "$st" != "done" ]; then
     echo "kept: $id not finished (state: ${st:-unknown})"; kept=$((kept + 1)); continue
   fi

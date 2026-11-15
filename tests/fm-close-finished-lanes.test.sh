@@ -38,7 +38,13 @@ SH
 # fake PR reader: prints the fixture $W/pr/<last url segment>, exits 0 only for merged
 v=\$(cat "$W/pr/\${1##*/}" 2>/dev/null || echo unknown); echo "\$v"; [ "\$v" = merged ]
 SH
-  chmod +x "$W/pr-cmd" "$W/crew-state" "$W/hold-cmd" "$W/teardown"
+  mkdir -p "$W/agent"
+  cat > "$W/agent-cmd" <<SH
+#!/usr/bin/env bash
+# fake endpoint probe: prints the fixture $W/agent/<task id> (default alive)
+id=\$(basename "\$1" .meta); cat "$W/agent/\$id" 2>/dev/null || echo alive
+SH
+  chmod +x "$W/agent-cmd" "$W/pr-cmd" "$W/crew-state" "$W/hold-cmd" "$W/teardown"
 }
 
 # add_task <id> <kind> <state> [meta-extra...]
@@ -53,7 +59,7 @@ add_task() {
 # run_close [args]: REAL_PR_READER set (even empty) swaps the fake PR reader for the real one.
 run_close() {
   HOME="$TMP_ROOT/h" FM_HOME="$W/home" FM_LANE_CLOSE_CREW_STATE_CMD="$W/crew-state" \
-    FM_LANE_CLOSE_TEARDOWN_CMD="$W/teardown" FM_LANE_CLOSE_HOLD_CMD="$W/hold-cmd" FM_LANE_CLOSE_PR_CMD="${REAL_PR_READER:+}${REAL_PR_READER-$W/pr-cmd}" \
+    FM_LANE_CLOSE_TEARDOWN_CMD="$W/teardown" FM_LANE_CLOSE_HOLD_CMD="$W/hold-cmd" FM_LANE_CLOSE_AGENT_CMD="$W/agent-cmd" FM_LANE_CLOSE_PR_CMD="${REAL_PR_READER:+}${REAL_PR_READER-$W/pr-cmd}" \
     bash "$CLOSE" "$@" 2>&1
 }
 
@@ -258,6 +264,44 @@ SH
   pass "a PR URL in the status line counts as merged evidence only when merged"
 }
 
+# Retro 1115: 22 finished lanes sat for a median 34 h because crew-state reports `unknown` for
+# every task whose agent exited (herdr pane shell remains, or the pane is gone), so a closer that
+# demanded state=done never saw one of them. A `done:` status line plus a positively dead or gone
+# endpoint is finished; a live, unreachable or unverified endpoint is not.
+test_done_status_with_dead_endpoint_closes() {
+  make_world dead
+  add_task d1 ship unknown "pr=https://example.test/o/r/pull/81"
+  add_task d2 ship unknown "pr=https://example.test/o/r/pull/82"
+  add_task d3 ship unknown "pr=https://example.test/o/r/pull/83"
+  add_task d4 ship unknown "pr=https://example.test/o/r/pull/84"
+  add_task d5 ship unknown "pr=https://example.test/o/r/pull/85"
+  add_task d6 scout unknown
+  mkdir -p "$W/home/data/d6"; echo report > "$W/home/data/d6/report.md"
+  for n in 81 82 83 84 85; do echo merged > "$W/pr/$n"; done
+  echo dead > "$W/agent/d1"; echo missing > "$W/agent/d2"
+  echo alive > "$W/agent/d3"; echo unverified > "$W/agent/d4"
+  echo dead > "$W/agent/d6"
+  printf 'working [at=2]: back on it\n' > "$W/home/state/d5.status"; echo dead > "$W/agent/d5"
+  out=$(run_close --apply)
+  assert_contains "$out" "closed: d1" "done status + dead agent closes"
+  assert_contains "$out" "closed: d2" "done status + gone endpoint closes"
+  assert_contains "$out" "closed: d6" "a finished scout with a report and a dead agent closes"
+  assert_contains "$out" "kept: d3 not finished (state: unknown)" "a live agent keeps the lane"
+  assert_contains "$out" "kept: d4 not finished (state: unknown)" "an unverified endpoint keeps the lane"
+  assert_contains "$out" "kept: d5 not finished (state: unknown)" "a current non-done status keeps the lane"
+  pass "a done status line with a dead or gone endpoint is finished"
+}
+
+test_done_status_dead_endpoint_still_needs_merge_evidence() {
+  make_world deadnomerge
+  add_task e1 ship unknown "pr=https://example.test/o/r/pull/91"
+  echo open > "$W/pr/91"; echo dead > "$W/agent/e1"
+  out=$(run_close --apply)
+  assert_contains "$out" "kept: e1 PR not merged (open)" "the merge-evidence guard still applies"
+  assert_absent "$W/td.log" "nothing torn down"
+  pass "dead endpoint does not bypass the merged-evidence guard"
+}
+
 test_usage_error() {
   make_world usage
   run_close --bogus > /dev/null; rc=$?
@@ -276,6 +320,8 @@ test_prless_ship_needs_branch_on_local_default
 test_archive_copy_failure_keeps_the_lane
 test_real_pr_reader_call_shape
 test_pr_found_only_in_status_line
+test_done_status_with_dead_endpoint_closes
+test_done_status_dead_endpoint_still_needs_merge_evidence
 test_usage_error
 
 echo '# all fm-close-finished-lanes tests passed'
