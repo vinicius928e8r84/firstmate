@@ -826,6 +826,7 @@ test_failed_scheduled_spawn_is_recorded_even_when_deferred() {
   home="$case_dir/home"
   printf '%s\n' 14 "scheduled-reserve 1" > "$home/config/lane-capacity"
   write_live "$home" sched-a "$case_dir/project" "scheduled=weekly-retro"
+  : > "$home/state/.lane-guard-last"   # a live watcher's scan mark: it, not the record-time scan, raises the alert
   out=$(spawn_scheduled "$case_dir" task-s "$case_dir/unused") || rc=$?
   expect_code "$DEFER_EXIT" "$rc" "the full reserve did not defer: $out"
   records=("$home"/state/spawn-failures/task-s.*.fail)

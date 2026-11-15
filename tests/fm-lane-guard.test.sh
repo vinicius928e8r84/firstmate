@@ -13,6 +13,7 @@ cat > "$T/data/tools/fm-asks.sh" <<'A'
 echo "$*" >> "$FM_HOME/asks.calls"
 A
 chmod +x "$T/data/tools/fm-asks.sh"
+: > "$T/state/.lane-guard-last"   # a live watcher's scan mark: the watcher scan, not the record-time scan, is under test
 fail=0
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1 (got '$2' want '$3')"; fail=1; fi; }
 alerts() { [ -f "$T/state/.lane-guard-alerts" ] && wc -l < "$T/state/.lane-guard-alerts" || echo 0; }
@@ -81,6 +82,26 @@ rm -f "$T/state/spawn-failures"/*; rm -f "$T/state/.lane-guard-alerts" "$T/asks.
 "$LG" record-spawn-failure ok1 1 ship proj herdr pi; : > "$T/state/ok1.meta"   # a later spawn published its record
 "$LG" scan spawn >/dev/null; check spawn-recovered-quiet "$?" 0
 "$LG" record-spawn-failure '../bad' 1 >/dev/null 2>&1; check spawn-bad-id "$?" 1
+
+# ---- the alert must not wait for the watcher: the scan is driven only by the watcher cycle (.lane-guard-last is
+# touched every 120 s while it runs). Retro 1115: the watcher was down 11-12 09:25..19:28 and 11-13 21:35..11-15 11:31,
+# so 22 failures alerted 8-40 h late. A failure recorded while that mark is stale alerts at once; a fresh mark leaves it
+# to the watcher scan.
+rm -f "$T/state/spawn-failures"/* "$T/state/.lane-guard-alerts" "$T/asks.calls"
+: > "$T/state/.lane-guard-last"
+printf 'error: boom fresh\n' > "$T/err.txt"
+FM_LG_STDERR_FILE="$T/err.txt" "$LG" record-spawn-failure freshcase 1 ship proj herdr pi >/dev/null
+check record-fresh-guard-waits "$(alerts)" 0
+touch -d '2 hours ago' "$T/state/.lane-guard-last"
+printf 'error: boom stale\n' > "$T/err.txt"
+FM_LG_STDERR_FILE="$T/err.txt" "$LG" record-spawn-failure stalecase 1 ship proj herdr pi >/dev/null
+check record-stale-guard-alerts-now "$(grep -c 'task stalecase exited' "$T/state/.lane-guard-alerts")" 1
+grep -q 'boom stale' "$T/state/.lane-guard-alerts"; check record-stale-alert-has-error $? 0
+: > "$T/state/.lane-guard-last"
+rm -f "$T/state/spawn-failures"/*.warned
+"$LG" scan spawn >/dev/null; check record-stale-then-scan-quiet "$(grep -c 'task stalecase exited' "$T/state/.lane-guard-alerts")" 1
+printf '%s' "$(cat "$T/state/.lane-guard-alerts")" | grep -q 'task freshcase exited'; check record-fresh-still-alerts-at-scan $? 0
+rm -f "$T/state/spawn-failures"/* "$T/state/.lane-guard-alerts" "$T/asks.calls"
 
 # ---- scheduled loops: a refused (75) scheduled spawn is a missed run and is warned about; the helper's alert and clear
 rm -f "$T/state/.lane-guard-alerts" "$T/asks.calls" "$T/state/spawn-failures"/*

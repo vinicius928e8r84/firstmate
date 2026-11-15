@@ -28,7 +28,8 @@
 # The RunPod key (RUNPOD_API_KEY in FM_RUNPOD_ENV, default ~/.config/runpod.env) goes to curl on stdin only and is never printed.
 # Env: FM_HOME FM_STATE_OVERRIDE FM_CONFIG_OVERRIDE FM_LG_NOW (epoch, tests) FM_SLOT_REQUEST_MAX_SEC
 #   FM_SLOT_REQUEST_GRACE_SEC FM_SLOT_REQUEST_ROOT (tests: only requests whose cwd is under it) FM_POD_API FM_POD_GRAPHQL FM_RUNPOD_ENV FM_POD_AUTO_DIR FM_POD_QUEUE_DIR
-#   FM_POD_WATCH_QUEUE_SEC FM_POD_WATCH_RETRY_SEC FM_LG_ASKS (fm-asks path, tests) FM_SW_NO_NOTIFY.
+#   FM_POD_WATCH_QUEUE_SEC FM_POD_WATCH_RETRY_SEC FM_LG_ASKS (fm-asks path, tests) FM_SW_NO_NOTIFY FM_LG_RECORD_SCAN_AFTER
+#   (seconds the watcher's scan mark may be stale before record-spawn-failure scans at once, default 600).
 # Exit: 0 nothing new, 1 at least one alert was raised.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -243,7 +244,16 @@ case "${1:-}" in
     clear_alert "$1"; exit 0 ;;
   record-spawn-failure) shift; [ $# -ge 2 ] || { echo "usage: fm-lane-guard.sh record-spawn-failure <task-id> <exit-code> [kind project backend harness scheduled-loop]" >&2; exit 64; }
     USAGE_KIND=record-spawn-failure; USAGE_OUTCOME=recorded
-    record_spawn_failure "$@"; exit $? ;;
+    record_spawn_failure "$@" || exit $?
+    # The watcher cycle touches .lane-guard-last at least every FM_LANE_GUARD_INTERVAL seconds and runs the scan; when
+    # that mark is stale the watcher is not running (supervision was down 10-38 h in retro 1115), so alert now, from
+    # the failing spawn, rather than whenever a watcher next arms. A fresh mark leaves the alert to the watcher scan.
+    last_epoch=$(stat -c %Y "$S/.lane-guard-last" 2>/dev/null || echo 0)
+    if [ $(( $(now) - last_epoch )) -gt "${FM_LG_RECORD_SCAN_AFTER:-600}" ]; then
+      exec 9>"$S/.lane-guard.lock"
+      if flock -w 20 9; then scan_spawn; fi
+    fi
+    exit 0 ;;
   scan)
     USAGE_KIND=scan-${2:-all}
     mkdir -p "$S"; exec 9>"$S/.lane-guard.lock"; flock -n 9 || { USAGE_OUTCOME=busy; exit 0; }
