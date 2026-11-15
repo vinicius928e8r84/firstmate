@@ -79,11 +79,11 @@ is_get_request() {
   return 0
 }
 end_request() { # <pid> <start>: exact pid only
-  local pid=$1 start=$2 i
+  local pid=$1 start=$2
   is_get_request "$pid" "$start" || return 1
   kill -TERM "$pid" 2>/dev/null
   kill -CONT "$pid" 2>/dev/null   # a request stopped on its tty keeps TERM pending until continued
-  for i in $(seq 1 $((SLOT_GRACE * 4))); do
+  for _ in $(seq 1 $((SLOT_GRACE * 4))); do
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.25
   done
@@ -173,7 +173,7 @@ scan_pod() {
   local qmax=${FM_POD_WATCH_QUEUE_SEC:-600} retry=${FM_POD_WATCH_RETRY_SEC:-900}
   local api=${FM_POD_API:-https://rest.runpod.io/v1} gql=${FM_POD_GRAPHQL:-https://api.runpod.io/graphql}
   local envf=${FM_RUNPOD_ENV:-$HOME/.config/runpod.env}
-  local m oldest_job="" oldest_age=0 age n=0 pod key marker last status bal out code body start_rc
+  local m oldest_job="" oldest_age=0 age n=0 pod key marker last status bal code body
 
   for m in "$qdir"/*.queued; do
     [ -e "$m" ] || continue

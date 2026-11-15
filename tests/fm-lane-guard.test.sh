@@ -4,6 +4,7 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd); LG=$ROOT/bin/fm-lane-guard.sh
 T=$(mktemp -d); pids=()
+# shellcheck disable=SC2329  # runs from the EXIT trap
 cleanup() { for p in "${pids[@]}"; do pkill -KILL -P "$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; done; rm -rf "$T"; }
 trap cleanup EXIT
 export FM_SLOT_REQUEST_ROOT=$T HOME=$T/home FM_SW_NO_NOTIFY=1 FM_HOME=$T FM_STATE_OVERRIDE=$T/state FM_CONFIG_OVERRIDE=$T/config
@@ -60,11 +61,11 @@ grep -q '^add --key lane-guard-spawn-gone' "$T/asks.calls"; check spawn-ask $? 0
 # stderr text: redacted, newline-folded, truncated to the tail
 printf 'first line\nlogin https://u:pw0rd@h/x token=abc123XYZ Bearer tok.en-9 ghp_abcdefghij1234\n%s\nlast words\n' "$(head -c 5000 /dev/zero | tr '\0' 'a')" > "$T/err.txt"
 FM_LG_STDERR_FILE="$T/err.txt" "$LG" record-spawn-failure errcase 1 ship; ef=$(ls "$T"/state/spawn-failures/errcase.*.fail)
-[ "$(grep -c '' "$ef")" = 9 ]; check stderr-one-line-field $? 0
+check stderr-one-line-field "$([ "$(grep -c '' "$ef")" = 9 ] && echo 0 || echo 1)" 0
 grep -q 'pw0rd\|abc123XYZ\|tok.en-9\|ghp_abc' "$ef"; check stderr-no-secret $? 1
 grep -q '^stderr=a*\\nlast words' "$ef"; check stderr-tail-kept $? 0
 grep -q 'first line' "$ef"; check stderr-truncated $? 1
-[ "$(sed -n 's/^stderr=//p' "$ef" | wc -c)" -le 2100 ]; check stderr-bounded $? 0
+check stderr-bounded "$([ "$(sed -n 's/^stderr=//p' "$ef" | wc -c)" -le 2100 ] && echo 0 || echo 1)" 0
 rm -f "$ef"
 # the alert must carry the reason: a short stderr (under 400 chars) used to print `stderr: ;` because ${v: -400}
 # is empty when the value is shorter than 400, and a long one led with placement chatter and cut the final error line
