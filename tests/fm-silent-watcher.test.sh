@@ -41,6 +41,11 @@ touch "$T/state/HOLD"; check hold-queue "$(run "$alive")" 0; check hold-dead "$(
 rm -f "$T/state/HOLD" "$T/state/.silent-watcher.incident"
 printf 'until=%s\nchecked=%s\n' $((NOW+3600)) "$NOW" > "$T/state/.quota-silence"
 check quota-hold-queue "$(run "$alive")" 0
+# a hold record left behind after the quota came back (2026-11-13 to 11-15) must not mute the queue alarm
+check quota-hold-stale-record "$(FM_SW_QUOTA_STATUS="echo clear" run "$alive")" 1
+tail -1 "$T/state/.silent-watcher-alerts" | grep -q 'undelivered'; check quota-hold-stale-reason $? 0
+grep -q '^until=0$' "$T/state/.quota-silence"; check quota-hold-stale-record-ended $? 0
+rm -f "$T/state/.silent-watcher.incident"
 printf 'until=0\nchecked=%s\n' "$NOW" > "$T/state/.quota-silence"
 check quota-hold-over "$(run "$alive")" 1
 # exhausted weekly quota: ONE ask with the renewal in Fortaleza time, no repeat until the quota reads clear

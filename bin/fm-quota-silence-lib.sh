@@ -15,7 +15,12 @@
 # Exhausted is the all_models scope reading runway exhausted_now or zero
 # percent remaining, and the hold lasts until the earliest reset of the windows
 # limiting it. A reset time already past never holds, so a stale snapshot cannot
-# keep the watcher quiet after the limit lifted.
+# keep the watcher quiet after the limit lifted. A standing hold is re-read on
+# the same cadence, at wake time and inside the hold loop: an account that reads
+# available again (a renewal, a switched login) ends the hold at once, a later
+# reset moves it, and an unreadable quota-axi keeps the hold a readable one set.
+# Without that re-read, one exhaustion read on 2026-11-13 held every wake for
+# two days after the quota came back ten minutes later.
 #
 # The wake rows are already durable when the hold starts (fm_wake_append runs
 # before wake()), so nothing is lost: the watcher keeps its beacon fresh, sleeps
@@ -28,7 +33,7 @@
 # undelivered-wake alarm while a hold stands.
 #
 # Env: FM_QUOTA_SILENCE_AXI (quota-axi command, tests), FM_QUOTA_SILENCE_RECHECK
-# (seconds between quota-axi reads while not holding, default 300),
+# (seconds between quota-axi reads, holding or not, default 300),
 # FM_QUOTA_SILENCE_SLICE (seconds per sleep slice, default 30).
 # The caller sets STATE and CONFIG and provides triage_log (bin/fm-push-transition-lib.sh).
 
@@ -107,19 +112,32 @@ EOF
 
 # fm_quota_silence_until -> prints the epoch the hold ends when one stands now.
 fm_quota_silence_until() {
-  local target now until checked recheck found
+  local target now until checked recheck found rc=0
   target=$(fm_quota_silence_target)
   [ -n "$target" ] || return 0
   [ ! -e "$STATE/.afk" ] || return 0
   now=$(date +%s)
   until=$(fm_quota_silence_cached until)
-  if [ "$until" -gt "$now" ]; then
-    printf '%s\n' "$until"
-    return 0
-  fi
   checked=$(fm_quota_silence_cached checked)
   recheck=${FM_QUOTA_SILENCE_RECHECK:-300}
   case "$recheck" in ''|*[!0-9]*|0) recheck=300 ;; esac
+  if [ "$until" -gt "$now" ]; then
+    if [ $((now - checked)) -ge "$recheck" ]; then
+      found=$(fm_quota_silence_read "$target") || rc=$?
+      case "$found" in ''|*[!0-9]*) found=0 ;; esac
+      if [ "$rc" -eq 3 ]; then
+        found=$until
+      elif [ "$found" -le "$now" ]; then
+        fm_quota_silence_store 0 "$now"
+        triage_log "quota-silence: the account reads available again; the hold until $(date -u -d "@$until" +%Y-%m-%dT%H:%MZ) ends now"
+        return 0
+      fi
+      fm_quota_silence_store "$found" "$now"
+      until=$found
+    fi
+    printf '%s\n' "$until"
+    return 0
+  fi
   [ $((now - checked)) -ge "$recheck" ] || return 0
   found=$(fm_quota_silence_read "$target")
   case "$found" in ''|*[!0-9]*) found=0 ;; esac
@@ -141,6 +159,9 @@ fm_quota_silence_hold() {
   while :; do
     now=$(date +%s)
     [ "$until" -gt "$now" ] || break
+    # Re-read on the recheck cadence: the account may be back long before the recorded reset.
+    until=$(fm_quota_silence_until)
+    case "$until" in ''|*[!0-9]*) break ;; esac
     if [ "$logged" -eq 0 ]; then
       triage_log "quota-silence: holding wake '$reason' until $(date -u -d "@$until" +%Y-%m-%dT%H:%MZ) (usage limit); rows stay queued"
       logged=1

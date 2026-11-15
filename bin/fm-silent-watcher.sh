@@ -6,7 +6,9 @@
 #   stale    - state/.last-watcher-beat older than FM_SW_BEAT_MAX (default 900 s = 3x the 300 s guard grace)
 #   queue    - state/.wake-queue has lines and the oldest is older than FM_SW_QUEUE_MAX (default 900 s)
 #              (skipped while state/HOLD is in force: a held fleet is supposed to be quiet,
-#              and while a usage-limit hold stands in state/.quota-silence)
+#              and while a usage-limit hold stands in state/.quota-silence. A hold record
+#              still standing while the quota reads clear outlived its exhaustion: it is ended
+#              here, so it mutes nothing and no other reader of the record waits on it)
 # Alert: one per incident (debounced by state/.silent-watcher.incident). The alert is appended to
 #   state/.silent-watcher-alerts (outbox, one line per incident) and registered as a captain ask with
 #   bin/../data/tools/fm-asks.sh add --key silent-watcher (deterministic; the ask shows in the owner's
@@ -58,6 +60,14 @@ case "$qline" in
     fi ;;
   clear)
     rm -f "$QPEND"
+    # A hold record still standing now outlived its exhaustion (2026-11-13: two days). End it for every reader
+    # that trusts the record without a quota read of its own: the queue alarm below, scheduled loops, the Pi rearm.
+    qstale=$(sed -n 's/^until=//p' "$S/.quota-silence" 2>/dev/null | tail -1)
+    case "$qstale" in ''|*[!0-9]*) qstale=0 ;; esac
+    if [ "$qstale" -gt "$NOW" ]; then
+      printf 'until=0\nchecked=%s\n' "$NOW" > "$S/.quota-silence.sw.$$" && mv -f "$S/.quota-silence.sw.$$" "$S/.quota-silence"
+      log "quota-silence: the quota reads clear; ended the hold record that stood until $(date -u -d "@$qstale" +%FT%TZ)"
+    fi
     if [ -e "$QMARK" ]; then
       rm -f "$QMARK"; log "quota back"
       [ -x "$ASKS" ] && FM_HOME=$F "$ASKS" 'done' quota-zero >/dev/null 2>&1

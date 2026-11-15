@@ -1004,7 +1004,9 @@ Exhausted means the `all_models` scope reads `exhausted_now` or zero percent rem
 The wake rows are already queued when the hold starts, so nothing is lost: the watcher keeps its liveness beacon fresh, sleeps, and then delivers the one wake it held, which the drain presents with every row queued meanwhile.
 An away record, an unreadable `quota-axi`, or removing the file ends or skips the hold.
 `state/.quota-silence` caches the verdict (`until=`, `checked=`) and the silent-watcher cron skips its undelivered-wake alarm while it stands.
-`FM_QUOTA_SILENCE_RECHECK` tunes the read rate while not holding.
+That cron ends a record still standing when its own quota read is clear, so scheduled loops and the queue alarm never wait on an exhaustion that is over.
+A standing hold is re-read at the same rate: an account that reads available again ends the hold at once, a later reset moves it, and an unreadable `quota-axi` keeps it.
+`FM_QUOTA_SILENCE_RECHECK` tunes that read rate, holding or not.
 `bin/fm-quota-silence.sh status` prints the same verdict (`exhausted <epoch>`, `clear`, or `unknown`) for the Pi limit resume described under the `FM_LIMIT_RESUME` setting below, and reads `claude` when the file is absent.
 
 The file is a home-local preference and is not inherited by secondmate homes.
@@ -3309,7 +3311,7 @@ FM_LIMIT_RESUME_MAX_ATTEMPTS=4   # resume turns spent per cut; a turn that goes 
 FM_COMPACT_SHAPE=   # Pi primary compaction shape (.pi/extensions/fm-compact-shape.ts, whose header owns what the summarizer receives, the 8000-byte summary cap and the fallback to Pi's default): 1 on, 0 off; unset is on except for a claude-bridge model, because bridge releases before 0.9.3 summarize in their own hook first. Only the session that owns the fleet lock shapes
 FM_COMPACT_SUMMARY_CACHE=   # 1 gives the compaction summary request the provider's own prompt cache back; unset, it sets DISABLE_PROMPT_CACHING in the stream's provider env so the one-off summary input is not written to a one-hour cache (.pi/extensions/fm-compact-shape.ts)
 FM_SKILL_ONCE=   # Pi primary skill loading (.pi/extensions/fm-skill-once.ts, whose header owns the rewrite): 0 turns it off, so every /skill: command pastes the full skill as Pi does by default. Only the session that owns the fleet lock is rewritten; config/skill-shortcuts chooses the shortcut skills
-FM_QUOTA_SILENCE_RECHECK=300   # seconds between quota-axi reads while the watcher is not holding its wake for a usage limit (config/quota-silence)
+FM_QUOTA_SILENCE_RECHECK=300   # seconds between quota-axi reads for the watcher's usage-limit wake hold, holding or not (config/quota-silence)
 FM_WAKE_SHADOW=1   # shadow log of check and signal wakes presented by the drain (state/wake-shadow.jsonl, bin/fm-wake-shadow.sh header owns the fields); observational, 0 disables it
 FM_WAKE_SHADOW_MAX_BYTES=4194304   # size at which the shadow log rotates once to wake-shadow.jsonl.1
 FM_WATCH_CYCLE_LOG_MAX_BYTES=262144   # size cap for the arm-owned watcher lifecycle ledger

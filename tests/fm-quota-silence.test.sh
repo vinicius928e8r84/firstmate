@@ -109,6 +109,69 @@ test_nothing_holds_without_an_exhausted_configured_account() {
   pass "no config, a healthy quota, a past reset, a dead quota-axi, and an away record all wake at once"
 }
 
+# bounded_wake <dir> <max-seconds> -> run_wake's line, or "TIMEOUT" when the wake is still held after <max-seconds>
+bounded_wake() {
+  local dir=$1 max=$2 out="$1/wake.out" pid waited=0
+  : > "$out"
+  run_wake "$dir" > "$out" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$max" ]; do sleep 1; waited=$((waited + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    # A removed config ends a hold within one slice, so the held wake does not outlive the test.
+    rm -f "$dir/config/quota-silence"
+    wait "$pid" 2>/dev/null
+    echo TIMEOUT
+    return 0
+  fi
+  wait "$pid" 2>/dev/null
+  cat "$out"
+}
+
+test_stale_hold_record_ends_when_the_account_reads_available() {
+  local dir out now
+  # The record of 2026-11-13: an exhaustion read once, the quota back minutes later, and the cached reset two days
+  # ahead. Every later wake was held on the record alone.
+  dir=$(new_case stale-record)
+  printf 'claude\n' > "$dir/config/quota-silence"
+  now=$(date +%s)
+  printf 'until=%s\nchecked=%s\n' $((now + 3600)) $((now - 7200)) > "$dir/state/.quota-silence"
+  fake_axi "$dir" 40 3600
+  out=$(bounded_wake "$dir" 8)
+  [ "$out" != TIMEOUT ] || fail "a hold record left from an earlier exhaustion still held the wake although the account reads available"
+  [ "${out%% *}" -le 3 ] || fail "the wake waited on a stale hold record: $out"
+  [ "${out#* }" = "signal: x.status" ] || fail "the released wake lost its reason: $out"
+  grep -q '^until=0' "$dir/state/.quota-silence" || fail "the stale hold record was not cleared: $(cat "$dir/state/.quota-silence")"
+  [ "$(wc -l < "$dir/calls")" -eq 1 ] || fail "the stale record was not re-read exactly once: $(cat "$dir/calls")"
+  pass "a hold record older than the recheck gap is re-read, and an available account ends the hold at once"
+}
+
+test_running_hold_ends_when_the_account_comes_back() {
+  local dir out
+  dir=$(new_case comes-back)
+  printf 'claude\n' > "$dir/config/quota-silence"
+  fake_axi "$dir" 0 3600
+  ( sleep 3; fake_axi "$dir" 40 3600 ) &
+  out=$(FM_QUOTA_SILENCE_RECHECK=1 bounded_wake "$dir" 15)
+  wait
+  [ "$out" != TIMEOUT ] || fail "a running hold never noticed the account came back"
+  [ "${out%% *}" -ge 2 ] || fail "the wake was not held while the account was exhausted: $out"
+  grep -q '^until=0' "$dir/state/.quota-silence" || fail "the hold record was not cleared when the account came back"
+  pass "a running hold re-reads the quota and ends as soon as the account reads available"
+}
+
+test_unreadable_quota_keeps_a_standing_hold() {
+  local dir out now
+  dir=$(new_case unreadable-hold)
+  printf 'claude\n' > "$dir/config/quota-silence"
+  now=$(date +%s)
+  printf 'until=%s\nchecked=%s\n' $((now + 4)) $((now - 7200)) > "$dir/state/.quota-silence"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/quota-axi"
+  out=$(bounded_wake "$dir" 15)
+  [ "$out" != TIMEOUT ] || fail "the hold outlived its recorded reset"
+  [ "${out%% *}" -ge 2 ] || fail "an unreadable quota-axi dropped a hold that a readable one had set: $out"
+  pass "an unreadable quota-axi keeps a standing hold until its recorded reset"
+}
+
 test_account_key_scopes_the_hold() {
   local dir out
   dir=$(new_case key)
@@ -143,3 +206,6 @@ test_status_helper_reports_exhausted_clear_and_unknown
 test_cached_hold_does_not_reread_quota
 test_nothing_holds_without_an_exhausted_configured_account
 test_account_key_scopes_the_hold
+test_stale_hold_record_ends_when_the_account_reads_available
+test_running_hold_ends_when_the_account_comes_back
+test_unreadable_quota_keeps_a_standing_hold
