@@ -2253,13 +2253,13 @@ asks_mirror() {
   if [ "$action" = add ]; then
     "$tool" add --key "hold-$id" "${title:-$id}${reason:+: $reason}" >/dev/null 2>&1 || true
   else
-    "$tool" done "hold-$id" >/dev/null 2>&1 || true
+    "$tool" 'done' "hold-$id" >/dev/null 2>&1 || true
   fi
 }
 
 case "${1:-}" in
   hold) shift; ( command_hold "$@" ); rc=$?; [ "$rc" -ne 0 ] || asks_mirror add "$@"; exit "$rc" ;;
-  answer) shift; ( command_answer "$@" ); rc=$?; [ "$rc" -ne 0 ] || asks_mirror done "${1:-}"; exit "$rc" ;;
+  answer) shift; ( command_answer "$@" ); rc=$?; [ "$rc" -ne 0 ] || asks_mirror 'done' "${1:-}"; exit "$rc" ;;
   answers) shift; command_answers "$@" ;;
   reconcile-requests) shift; command_reconcile_requests "$@" ;;
   bind) shift; command_bind "$@" ;;

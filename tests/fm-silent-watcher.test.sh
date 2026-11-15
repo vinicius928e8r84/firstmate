@@ -16,6 +16,8 @@ run() { FM_HOME=$T FM_SW_NOW=$NOW FM_SW_PGREP="$1" bash "$SW"; echo $?; }
 alive="echo 123"; dead="true"
 setbeat() { touch -d "@$1" "$T/state/.last-watcher-beat"; }
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1 (got $2 want $3)"; fail=1; fi; }
+present() { [ -e "$1" ]; }
+absent() { local f; for f in "$@"; do [ ! -e "$f" ] || return 1; done; }
 alerts() { [ -f "$T/state/.silent-watcher-alerts" ] && wc -l < "$T/state/.silent-watcher-alerts" || echo 0; }
 # healthy
 setbeat $((NOW-60)); printf '%s\tx\n' $((NOW-120)) > "$T/state/.wake-queue"
@@ -102,7 +104,7 @@ grep -q 'Alerta do vigia \[alert\]' "$T/inbox.notes"; check fallback-carries-ale
 ! grep -rq 'secretkey\|6a797cf0' "$T/state" "$T/inbox.notes"; check no-secret-or-id-leak $? 0
 export FAKE_CODE=200 FAKE_BODY=''
 nrun $((NOW+5100)) "$alive"                        # a delivered notice clears the streak
-[ ! -e "$T/state/.webhook-notify.fails" ] && [ ! -e "$T/state/.webhook-notify.degraded" ]; check success-clears-streak $? 0
+absent "$T/state/.webhook-notify.fails" "$T/state/.webhook-notify.degraded"; check success-clears-streak $? 0
 grep -q 'notify recovered' "$T/state/.silent-watcher.log"; check success-logs-recovery $? 0
 # --- simulated zero quota, end to end: real fm-quota-silence.sh over a fake quota-axi, the webhook dead (the
 # --- owner's automation disabled), then fixed. The owner's notice must not die with the channel.
@@ -123,23 +125,23 @@ qrun() { # <now>: a healthy watcher run reading the real quota probe through the
   HOME=$W/home PATH=$W/bin:$PATH FM_HOME=$T FM_SW_NOW=$1 FM_SW_PGREP="$alive" FM_QUOTA_SILENCE_AXI=$W/bin/quota-axi FM_NOTIFY_INBOX=$W/inbox.sh env -u FM_SW_NO_NOTIFY -u FM_SW_QUOTA_STATUS bash "$SW" >/dev/null; }
 rm -f "$T/state/".silent-watcher* "$T/state/".webhook-notify.* "$T/state/.quota-exhausted-notified" "$T/state/.quota-notice-pending" "$T/inbox.notes" "$T/asks.calls"
 Q0=$(date +%s)
-fake_axi 60; FAKE_CODE=400 FAKE_BODY='{"success":false,"error":"Automation x is disabled"}'; export FAKE_CODE FAKE_BODY
-qrun $Q0; check qsim-clear-no-ask "$(asks_n)" 0; check qsim-clear-no-note "$(notes)" 0
+fake_axi 60; export FAKE_CODE=400 FAKE_BODY='{"success":false,"error":"Automation x is disabled"}'
+qrun "$Q0"; check qsim-clear-no-ask "$(asks_n)" 0; check qsim-clear-no-note "$(notes)" 0
 fake_axi 0
-qrun $Q0                                           # quota zero, webhook refuses (http 400)
+qrun "$Q0"                                         # quota zero, webhook refuses (http 400)
 check qsim-zero-ask "$(asks_n)" 1
 grep -q 'Renova em' "$T/asks.calls"; check qsim-zero-ask-renewal $? 0
 check qsim-zero-inbox-note-at-once "$(notes)" 1    # first failure: no streak yet, the critical notice still reaches the inbox
 grep -q 'NAO saiu pelo webhook' "$T/inbox.notes"; check qsim-note-says-undelivered $? 0
 grep -q 'http=400' "$T/state/.silent-watcher.log"; check qsim-logs-status $? 0
-[ -e "$T/state/.quota-notice-pending" ]; check qsim-pending-kept $? 0
+present "$T/state/.quota-notice-pending"; check qsim-pending-kept $? 0
 qrun $((Q0+300)); qrun $((Q0+600))                 # later runs: no second ask, no inbox spam, the webhook is retried
 check qsim-no-repeat-ask "$(asks_n)" 1; check qsim-no-repeat-note "$(notes)" 1
-[ -e "$T/state/.quota-notice-pending" ]; check qsim-still-pending $? 0
+present "$T/state/.quota-notice-pending"; check qsim-still-pending $? 0
 check qsim-retry-not-counted "$(cat "$T/state/.webhook-notify.fails")" 1
 export FAKE_CODE=200 FAKE_BODY=''                  # the owner re-enabled the automation
 qrun $((Q0+900))
-[ ! -e "$T/state/.quota-notice-pending" ]; check qsim-delivered-late-clears-pending $? 0
+absent "$T/state/.quota-notice-pending"; check qsim-delivered-late-clears-pending $? 0
 grep -q 'quota notice delivered late' "$T/state/.silent-watcher.log"; check qsim-logs-late-delivery $? 0
 check qsim-late-no-new-ask "$(asks_n)" 1
 fake_axi 60
