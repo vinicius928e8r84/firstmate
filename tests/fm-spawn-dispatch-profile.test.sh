@@ -1392,6 +1392,47 @@ test_pi_refuses_bare_model_listed_by_several_providers() {
   pass "pi refuses a bare model id that several providers list, naming the provider-prefixed forms"
 }
 
+test_pi_refuses_a_provider_listed_in_the_local_refusal_file() {
+  local rec id out status m n=0
+  for m in anthropic/claude-sonnet-5 Anthropic/claude-sonnet-5:high; do
+    n=$((n + 1))
+    id=profile-pi-refused-z8g$n
+    rec=$(make_spawn_case "profile-pi-refused-$n" pi "$id")
+    read_case_record "$rec"
+    printf '# providers this install never launches a Pi worker on\n\nanthropic\n' > "$HOME_DIR/config/pi-refused-providers"
+    FM_TEST_PI_MODELS=$PI_LISTING \
+      out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+        --model "$m" 2>&1)
+    status=$?
+    expect_code 1 "$status" "pi spawn should refuse $m named in config/pi-refused-providers: $out"
+    assert_contains "$out" "config/pi-refused-providers" "refusal did not name the file that refuses the provider"
+    assert_contains "$out" "claude-bridge/claude-sonnet-5" "refusal did not name the claude-bridge/ form to use"
+    [ ! -s "$LAUNCH_LOG" ] || fail "provider refusal must happen before launch"
+    [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "provider refusal left a task record"
+  done
+  for m in claude-bridge/claude-sonnet-5 openai-codex/gpt-5.6-sol; do
+    n=$((n + 1))
+    id=profile-pi-refused-ok-z8g$n
+    rec=$(make_spawn_case "profile-pi-refused-ok-$n" pi "$id")
+    read_case_record "$rec"
+    printf 'anthropic\n' > "$HOME_DIR/config/pi-refused-providers"
+    FM_TEST_PI_MODELS=$PI_LISTING \
+      out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+        --model "$m" 2>&1)
+    status=$?
+    expect_code 0 "$status" "pi spawn should still accept $m when only anthropic is refused: $out"
+  done
+  n=$((n + 1)); id=profile-pi-refused-none-z8g$n
+  rec=$(make_spawn_case "profile-pi-refused-none" pi "$id")
+  read_case_record "$rec"
+  FM_TEST_PI_MODELS=$PI_LISTING \
+    out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+      --model anthropic/claude-sonnet-5 2>&1)
+  status=$?
+  expect_code 0 "$status" "without config/pi-refused-providers the anthropic provider stays valid: $out"
+  pass "pi refuses a model of a provider in config/pi-refused-providers, naming claude-bridge/; no file refuses nothing"
+}
+
 test_pi_unavailable_listing_does_not_block_spawn() {
   local rec id out status
   id=profile-pi-nolisting-z8d
@@ -2857,6 +2898,7 @@ test_pi_tui_mode_probe_is_safe_for_old_and_new_pi
 test_pi_refuses_model_absent_from_live_listing
 test_pi_accepts_listed_model_forms
 test_pi_refuses_bare_model_listed_by_several_providers
+test_pi_refuses_a_provider_listed_in_the_local_refusal_file
 test_pi_unavailable_listing_does_not_block_spawn
 test_pi_signed_threads_shared_pi_profile_and_preserves_identity
 test_pi_signed_missing_binary_refuses_before_endpoint_or_metadata

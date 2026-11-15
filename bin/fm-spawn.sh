@@ -310,6 +310,8 @@
 #   `--model <m> --list-models` table before any endpoint exists (pi_model_validate): a model
 #   matching no listed id or <provider>/<id>, or a bare id that more than one provider
 #   lists, refuses the spawn, and an unreadable listing launches unvalidated with a notice.
+#   A model of a provider named in the local config/pi-refused-providers (one provider per
+#   line, # comments, absent file refuses nothing) is refused first, without the listing.
 #   For omp (Oh My Pi), fm-spawn resolves the `omp` executable from PATH once and
 #   refuses when it is absent. Every omp launch clears the foreign harness
 #   markers (omp publishes none of its own), sets the Firstmate-owned
@@ -2632,13 +2634,20 @@ agy_model_validate() {  # <agy-bin> <model>
 # model runs a pinned bridge build that lists the 5.5 models plain pi lacks), so
 # the listing must come from the build the worker would actually run.
 pi_model_validate() { # <pi-bin> <model>
-  local bin=$1 model=$2 listing rc=0 bound=${FM_PI_MODELS_TIMEOUT:-15} pattern rows hints owners
+  local bin=$1 model=$2 listing rc=0 bound=${FM_PI_MODELS_TIMEOUT:-15} pattern rows hints owners refused
   case "$bound" in '' | *[!0-9]* | 0*) bound=15 ;; esac
   [ -n "$model" ] && [ "$model" != default ] || return 0
   pattern=$model
   case "$pattern" in
   *:off | *:minimal | *:low | *:medium | *:high | *:xhigh) pattern=${pattern%:*} ;;
   esac
+  if [ -f "$CONFIG/pi-refused-providers" ] && [ "${pattern#*/}" != "$pattern" ]; then
+    refused=$(awk -v p="${pattern%%/*}" 'BEGIN { p = tolower(p) } { sub(/#.*/, ""); gsub(/[ \t\r]/, "") } tolower($0) == p { print "yes"; exit }' "$CONFIG/pi-refused-providers" 2>/dev/null)
+    if [ -n "$refused" ]; then
+      echo "error: pi model '$model' names provider '${pattern%%/*}', which config/pi-refused-providers refuses on this install; Claude models need the claude-bridge/ prefix: claude-bridge/${pattern#*/}" >&2
+      return 1
+    fi
+  fi
   listing=$(fm_run_timed "$bound" "$bin" --model "$model" --list-models 2>/dev/null </dev/null) || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "notice: '$(basename "$bin") --list-models' is unavailable (exit $rc); launching with --model '$model' unvalidated" >&2

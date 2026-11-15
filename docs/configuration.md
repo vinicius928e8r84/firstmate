@@ -253,6 +253,12 @@ The branch prompt's "Verdict: routine or captain" section owns the distinction b
 The generated [Pi supervision protocol](supervision-protocols/pi.md) owns main's event ownership, acknowledgement duty, and conversational treatment for merged outcomes, while the persisted entry itself owns captain visibility.
 A task-level routine no-change outcome or a no-change heartbeat explicitly reported with `silent=true` is delivered without a rendered note; the branch prompt owns task-level eligibility, and every other routine outcome still appends a rendered, sailboat-prefixed note.
 
+## Refused Pi providers (config/pi-refused-providers)
+
+Gitignored `config/pi-refused-providers` lists, one per line, the providers this install never launches a Pi worker on; blank lines and `#` comments are ignored, and an absent file refuses nothing.
+`bin/fm-spawn.sh` refuses a Pi or pi-signed `--model <provider>/<id>` whose provider is listed, before any endpoint exists, and the message names the `claude-bridge/<id>` form to pass instead.
+An install whose native Anthropic login is not usable lists `anthropic`, so a Claude model only launches through the `claude-bridge/` prefix.
+
 ## Worker context cap (config/worker-context-cap)
 
 A worker session re-reads its whole context on every model call, so a long task pays for a large context hundreds of times.
