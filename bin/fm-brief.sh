@@ -485,10 +485,18 @@ The one exception is `respond`: it sent its answer before it began waiting, so r
 A wait your shell can watch this way needs no `paused:` line, except your own pipeline run, a long foreground command, or your own validation round, which you declare once just before its blocking hold: append `paused:` once just before its first blocking command, then stay in the command, and never append it again as you reissue that command.
 EOF
 WAIT_SECTION=${WAIT_SECTION%$'\n'}
+# Waiting for a PR's checks, in every ship and scout brief whether or not config/wait-no-turns is set: the
+# `# Waiting` section above is that flag's, and no home sets it, so 508 PerpetualMiner briefs carried no wait
+# guidance and those workers polled CI with `sleep` plus a check, one turn per look (retro 1115, item 7).
+CI_WAIT_SECTION="# Waiting for CI
+Never wait for a PR's checks with \`sleep\` followed by a status check, and never re-issue a polling loop by hand: every look is a turn that resends your whole context.
+Wait with ONE call: \`$FM_ROOT/bin/fm-ci-wait.sh <pr-url> [--timeout SECS]\`. It blocks until the checks settle and exits 0 when all passed, 1 when one failed (it prints which), 3 when checks were still pending at its bound (default 540 s): then run the same command again, with no status check in between.
+Pass your shell tool a timeout a little above \`--timeout\`."
 WAIT_BLOCK=
 if [ -e "$CONFIG/wait-no-turns" ]; then
   WAIT_BLOCK="$WAIT_SECTION"$'\n\n'
 fi
+WAIT_BLOCK="$WAIT_BLOCK$CI_WAIT_SECTION"$'\n\n'
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""

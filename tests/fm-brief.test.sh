@@ -1265,6 +1265,32 @@ test_wait_no_turns_absent_keeps_the_previous_brief() {
   pass "fm-brief: without config/wait-no-turns the brief and drive text stay as they were"
 }
 
+# Retro 1115 item 7: PerpetualMiner workers waited on CI with `sleep` plus a check, one turn per look (288 single
+# polls, 24 h of sleep, 273 hand-reissued loops in 7 days) because the only wait guidance sat behind
+# config/wait-no-turns, which no home sets (0 of 508 PerpetualMiner briefs carried it).
+test_ship_and_scout_briefs_name_the_blocking_ci_wait_without_the_flag() {
+  local home id brief
+  home="$TMP_ROOT/ci-wait-off"
+  mkdir -p "$home/data"
+  [ ! -e "$home/config/wait-no-turns" ]
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-ci-ship some-proj --mode no-mistakes >/dev/null 2>&1 \
+    || fail "fm-brief.sh ship scaffold exited non-zero"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-ci-scout some-proj --scout >/dev/null 2>&1 \
+    || fail "fm-brief.sh scout scaffold exited non-zero"
+  for id in brief-ci-ship brief-ci-scout; do
+    brief="$home/data/$id/brief.md"
+    assert_grep "bin/fm-ci-wait.sh <pr-url>" "$brief" "$id: the blocking CI wait is not named without the flag"
+    assert_grep "followed by a status check" "$brief" "$id: the sleep-then-check pattern is not forbidden"
+    assert_no_grep "end your turn at once" "$brief" "$id: the CI wait must not drag in the flag's waiting section"
+  done
+  : > "$home/config/wait-no-turns" 2>/dev/null || { mkdir -p "$home/config"; : > "$home/config/wait-no-turns"; }
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-ci-flag some-proj --mode no-mistakes >/dev/null 2>&1 \
+    || fail "fm-brief.sh ship scaffold exited non-zero"
+  [ "$(grep -c 'fm-ci-wait.sh <pr-url>' "$home/data/brief-ci-flag/brief.md")" = 1 ] \
+    || fail "with the flag the CI wait must appear exactly once"
+  pass "fm-brief: every ship and scout brief names the blocking CI wait, flag or not"
+}
+
 test_worker_role_scope() {
   local kind home brief
   home="$TMP_ROOT/worker-role"
@@ -1673,6 +1699,7 @@ test_scout_lavish_line_follows_presentation_floor
 test_inbox_listing_command_is_safe_on_empty_inbox
 test_workers_wait_without_spending_turns
 test_wait_no_turns_absent_keeps_the_previous_brief
+test_ship_and_scout_briefs_name_the_blocking_ci_wait_without_the_flag
 test_home_brief_include_is_appended_last
 test_base_branch_is_rendered_and_bounded
 test_ship_branch_prefix_defaults_to_legacy_fm
