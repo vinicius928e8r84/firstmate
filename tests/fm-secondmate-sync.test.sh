@@ -441,6 +441,11 @@ test_bootstrap_sweep_nudges_only_instruction_change() {
     "nudge send should use the marked fm-send secondmate path"
   assert_contains "$(cat "$w/home/state/sm-instr.inbox/001.msg")" "firstmate was updated to the latest - please re-read your AGENTS.md" \
     "nudge send should enqueue the exact re-read message"
+  assert_contains "$(cat "$w/home/state/sm-instr.inbox/001.msg")" "do not write a status line to acknowledge" \
+    "the re-read nudge must tell the mate not to acknowledge in status"
+  [ ! -e "$w/home/state/pending-replies" ] || [ -z "$(ls -A "$w/home/state/pending-replies" 2>/dev/null)" ] \
+    || fail "a re-read nudge must not arm a pending-reply expectation"
+  [ ! -s "$w/home/state/sm-instr.status" ] || fail "a re-read nudge must leave the status file untouched"
   assert_contains "$(cat "$log")" "Firstmate instruction waiting" \
     "nudge send should ring the doorbell at the secondmate pane"
   marker_dir="$w/home/state/.secondmate-nudge-pending"

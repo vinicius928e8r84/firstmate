@@ -304,7 +304,7 @@ test_routine_steer_never_closes() {
   fm_write_meta "$home/state/t3.meta" "window=sess:fm-t3" "kind=ship"
   printf 'needs-decision [key=schema]: split or embed\n' > "$home/state/t3.status"
 
-  run_send "$fb" "$home" "$log" t3 "unrelated nudge, keep going"; rc=$?
+  run_send "$fb" "$home" "$log" t3 --override-open-decision "test: routine steer must not close" "unrelated nudge, keep going"; rc=$?
   expect_code 0 "$rc" "a routine steer should still succeed"
   printf 'working: resumed\n' >> "$home/state/t3.status"
 
@@ -905,6 +905,33 @@ test_decision_answer_partition_relocates_under_the_record() {
   pass "fm-send --resolve-key: a decision answer refuses the attended branch before sending, a blocked: key stays steering, and the away-posture record relocates the answer"
 }
 
+test_open_decision_gate_refuses_reissue_and_override_is_audited() {
+  local dir fb log home rc err
+  dir="$TMP_ROOT/gate"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  home=$(setup_home gate)
+  fm_write_meta "$home/state/t1.meta" "window=sess:fm-t1" "kind=ship"
+  printf 'blocked [key=refusal]: worker declined the request\n' > "$home/state/t1.status"
+
+  err=$(env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" t1 "do it anyway" 2>&1 >/dev/null); rc=$?
+  expect_code 1 "$rc" "a plain steer around an open blocker must be refused"
+  assert_contains "$err" "[key=refusal] blocked: worker declined the request" "the refusal must print the open key and text"
+  [ ! -e "$home/state/t1.inbox/001.msg" ] || fail "a refused steer must not reach the inbox"
+
+  run_send "$fb" "$home" "$log" t1 --override-open-decision "captain ordered it" "do it anyway"; rc=$?
+  expect_code 0 "$rc" "the named override flag must let an ordered steer through"
+  grep -qF "do it anyway" "$home/state/t1.inbox/001.msg" || fail "override send did not reach the inbox"
+  grep -qF "task=t1 keys=refusal reason=captain ordered it" "$home/state/send-override.log" \
+    || fail "override must leave an audit line"
+
+  run_send "$fb" "$home" "$log" t1 --resolve-key refusal "closing it"; rc=$?
+  expect_code 0 "$rc" "answering with --resolve-key is never gated"
+  run_send "$fb" "$home" "$log" t1 "next order"; rc=$?
+  expect_code 0 "$rc" "once the key is resolved, plain steers flow again"
+  pass "fm-send: open blocker refuses a plain reissue, override is audited, resolve reopens the path"
+}
+
 test_answer_send_closes_open_decision
 test_answer_close_is_self_announced
 test_separate_resolve_key_answers_do_not_rewake
@@ -929,3 +956,4 @@ test_stamped_close_line_stays_within_the_status_line_cap
 test_failed_close_recovery_command_is_shell_safe
 test_remote_reserved_pending_reply_key_closes_locally
 test_decision_answer_partition_relocates_under_the_record
+test_open_decision_gate_refuses_reissue_and_override_is_audited

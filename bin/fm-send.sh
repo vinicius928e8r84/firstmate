@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Steer a task by durable record: write the message into the task's steering
 # inbox and ring a constant doorbell line into its terminal, best-effort.
-# Usage: fm-send.sh <target> [--resolve-key <key>]... [--fire-and-forget <delivery-id>] <text...>
+# Usage: fm-send.sh <target> [--resolve-key <key>]... [--override-open-decision <reason>] [--fire-and-forget <delivery-id>] <text...>
 #   <target> may be an exact task id, a legacy fm-<id> task label resolved
 #   through this home's state/<id>.meta, or an explicit well-formed backend
 #   target. fm-send refuses unresolved guesses rather than falling back to a
@@ -210,6 +210,16 @@
 # working:, or done: event still cannot clear a captain decision. The flag is
 # refused with --key, with an explicit backend target (no task ledger in this
 # home), and with an empty message.
+#
+# Open-decision gate: a text steer to a crewmate or scout task WITHOUT
+# --resolve-key is refused while that task's status log still holds an open
+# blocked: or needs-decision: key of its own (status_own_open_decisions), and
+# the refusal prints each open key and its text. Reissuing orders around an
+# unanswered blocker only loops; answer it with --resolve-key, or resolve it.
+# Secondmates, reserved supervisor keys, --key, and fire-and-forget are exempt.
+# The captain-ordered escape hatch is the named flag --override-open-decision
+# <reason>: the send proceeds and one audit line (epoch, task, open keys,
+# reason) is appended to $STATE/send-override.log.
 #
 # After a successful TYPED-plane submit fm-send pauses FM_SEND_SETTLE seconds
 # (default 1, 0 disables) before returning: submit confirmation only proves the
@@ -491,6 +501,7 @@ fi
 # message exactly as before, so ordinary sends are byte-identical.
 RESOLVE_KEYS=
 FIRE_AND_FORGET_ID=
+OVERRIDE_OPEN_DECISION=
 fm_send_add_resolve_key() { # <key>
   local k=$1
   case "$k" in
@@ -520,6 +531,14 @@ while :; do
   --resolve-key=*)
     fm_send_add_resolve_key "${1#--resolve-key=}" || exit 1
     shift
+    ;;
+  --override-open-decision)
+    [ $# -ge 2 ] && [ -n "$2" ] || {
+      echo "error: --override-open-decision requires a nonempty reason" >&2
+      exit 1
+    }
+    OVERRIDE_OPEN_DECISION=$2
+    shift 2
     ;;
   --fire-and-forget)
     [ $# -ge 2 ] || {
@@ -717,6 +736,31 @@ if [ -n "$RESOLVE_KEYS" ]; then
       exit 1
     fi
   done
+fi
+
+# Open-decision gate (header contract): refuse a plain steer to a crewmate or
+# scout whose own blocked:/needs-decision: key is still unresolved.
+if [ -z "$RESOLVE_KEYS" ] && [ -z "$FIRE_AND_FORGET_ID" ] && [ -n "$TARGET_SELECTOR" ] &&
+  [ -n "$TARGET_META" ] && [ "$MARK_FROM_FIRSTMATE" != 1 ] && [ "${1:-}" != "--key" ] && [ -n "$*" ]; then
+  GATE_TASK_ID=$(fm_send_id_from_meta "$TARGET_META")
+  GATE_OPEN=$(status_own_open_decisions "$STATE/$GATE_TASK_ID.status")
+  if [ -n "$GATE_OPEN" ]; then
+    if [ -n "$OVERRIDE_OPEN_DECISION" ]; then
+      GATE_KEYS=$(printf '%s\n' "$GATE_OPEN" | cut -f1 | tr '\n' ' ')
+      printf '%s task=%s keys=%s reason=%s\n' "$(date +%s)" "$GATE_TASK_ID" "${GATE_KEYS% }" \
+        "$(printf '%s' "$OVERRIDE_OPEN_DECISION" | tr '\n\r\t' '   ')" >>"$STATE/send-override.log" || {
+        echo "error: could not write the --override-open-decision audit line to $STATE/send-override.log; nothing was sent" >&2
+        exit 1
+      }
+    else
+      echo "error: $GATE_TASK_ID still has an open decision or blocker; refusing to reissue an order around it. Answer it with --resolve-key <key>, or resolve it first. Open:" >&2
+      printf '%s\n' "$GATE_OPEN" | while IFS=$'\t' read -r gk gv gt; do
+        echo "  [key=$gk] $gv: $gt" >&2
+      done
+      echo "If the captain explicitly ordered this send anyway, resend with --override-open-decision '<reason>' (audited in $STATE/send-override.log). Nothing was sent." >&2
+      exit 1
+    fi
+  fi
 fi
 
 # Close each answered decision in this home's ledger, only after the answer is

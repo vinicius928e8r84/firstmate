@@ -149,7 +149,7 @@ first_reported_line() {  # <text>
 fall_back_to_nudge() {  # <id> <reason>
   local id=$1 reason=$2 out
   if out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-    "$SCRIPT_DIR/fm-send.sh" "$id" "$FM_SECOND_MATE_NUDGE_MESSAGE" 2>&1); then
+    "$SCRIPT_DIR/fm-send.sh" "$id" --fire-and-forget "$(fm_secondmate_nudge_delivery_id "$id")" "$FM_SECOND_MATE_NUDGE_MESSAGE $FM_SECOND_MATE_NUDGE_NOREPLY" 2>&1); then
     nudged_count=$((nudged_count + 1))
     printf 'nudged: %s: %s\n' "$id" "$reason"
   else

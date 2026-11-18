@@ -17,6 +17,16 @@
 FM_SECOND_MATE_NUDGE_MESSAGE='firstmate was updated to the latest - please re-read your AGENTS.md to pick up the new instructions.'
 FM_REMOTE_SECOND_MATE_NUDGE_MESSAGE='Firstmate instructions or inherited config changed on this host. Re-read AGENTS.md and the inherited config files before further work.'
 
+# Re-read nudges go out on fm-send's fire-and-forget plane: it creates no
+# pending-reply expectation, so the mate has nothing to answer and an
+# acknowledgement never lands in status (where it would wake main). The id is
+# a fresh 16-hex delivery id per call. The stored retry-marker messages above
+# stay byte-stable; the no-reply suffix is added only on the wire.
+FM_SECOND_MATE_NUDGE_NOREPLY='No reply is expected: do not write a status line to acknowledge this.'
+fm_secondmate_nudge_delivery_id() { # <id>
+  printf '%s:%s:%s:%s' "$1" "$$" "$(date +%s%N 2>/dev/null || date +%s)" "$RANDOM" | sha256sum | cut -c1-16
+}
+
 fm_secondmate_nudge_marker_path() { # <state-dir> <id>
   local state=$1 id=$2
   case "$id" in *[!/A-Za-z0-9._-]*|''|*/*) return 1 ;; esac
