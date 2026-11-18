@@ -7,6 +7,7 @@
 #        fm-control.sh <task-id> relaunch [--harness <name>] [--model <name>]
 #                                         [--effort <level>]
 #                                         (--note <text> | --note-file <path>)
+#                                         [--task-file <path> --role <slug>]
 #
 # Why this exists, and how it differs from fm-send.sh. bin/fm-send.sh is the
 # DATA plane: conversational text for the agent to read, always routing-marked
@@ -88,6 +89,14 @@
 #              inherits the local copy but none of the conversation; a
 #              secondmate reconciles its own home's records at startup, so its
 #              standing charter is never rewritten.
+#              --task-file gives a ship or scout a DIFFERENT task: its
+#              `## Captain's intent` and `## Firstmate spec` replace the
+#              brief's `# Task` section before the note is appended, so the
+#              replacement reads the new task in its brief rather than the old
+#              one plus a pointer to its inbox. --role names the new kind of
+#              work; after the replacement is confirmed it lands in the status
+#              file as `working [at=<epoch>] [role=<slug>]: ...`, so cost per
+#              kind of work stays countable when a task id is reused.
 #              Records a durable checkpoint and that note, exits the old agent,
 #              then delegates the launch to its single owner,
 #              bin/fm-spawn.sh --relaunch. A failure before publication keeps
@@ -154,6 +163,8 @@ esac
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+# shellcheck source=bin/fm-brief-heading-lib.sh
+. "$SCRIPT_DIR/fm-brief-heading-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never
 # drive a crewmate's lifecycle (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -258,6 +269,8 @@ MODEL_SET=0
 EFFORT_SET=0
 NOTE=
 NOTE_SET=0
+TASK_FILE=
+ROLE=
 control_want_value=
 for control_arg in "$@"; do
   if [ -n "$control_want_value" ]; then
@@ -274,6 +287,8 @@ for control_arg in "$@"; do
         NOTE=$(cat "$control_arg")
         NOTE_SET=1
         ;;
+      task_file) TASK_FILE=$control_arg ;;
+      role) ROLE=$control_arg ;;
     esac
     control_want_value=
     continue
@@ -293,6 +308,10 @@ for control_arg in "$@"; do
       NOTE=$(cat "${control_arg#--note-file=}")
       NOTE_SET=1
       ;;
+    --task-file) control_want_value=task_file ;;
+    --task-file=*) TASK_FILE=${control_arg#--task-file=} ;;
+    --role) control_want_value=role ;;
+    --role=*) ROLE=${control_arg#--role=} ;;
     *) die "unexpected argument '$control_arg'" ;;
   esac
 done
@@ -306,7 +325,21 @@ if [ "$VERB" = relaunch ]; then
   fm_hold_refuse "relaunch of $RAW_ID" || exit "$FM_HOLD_EXIT"
 else
   [ "$HARNESS_SET" = 0 ] && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] && [ "$NOTE_SET" = 0 ] \
-    || die "--harness, --model, --effort, and --note apply to 'relaunch' only"
+    && [ -z "$TASK_FILE" ] && [ -z "$ROLE" ] \
+    || die "--harness, --model, --effort, --note, --task-file, and --role apply to 'relaunch' only"
+fi
+if [ -n "$TASK_FILE" ] || [ -n "$ROLE" ]; then
+  [ -n "$TASK_FILE" ] && [ -n "$ROLE" ] \
+    || die "--task-file and --role go together: a new task names its kind of work, and a role names the task it labels"
+  printf '%s' "$ROLE" | grep -Eq '^[a-z0-9][a-z0-9-]*$' \
+    || die "--role '$ROLE' must be a lowercase slug (letters, digits, dashes)"
+  [ -f "$TASK_FILE" ] && [ -r "$TASK_FILE" ] || die "--task-file '$TASK_FILE' is not a readable file"
+  TASK_BODY=$(cat "$TASK_FILE")
+  for task_heading in "## Captain's intent" "## Firstmate spec"; do
+    task_part=$(printf '%s\n' "$TASK_BODY" | fm_brief_heading_parse - "$task_heading" body)
+    [ -n "$(printf '%s' "$task_part" | tr -d '[:space:]')" ] \
+      || die "--task-file '$TASK_FILE' needs a nonempty '$task_heading' section"
+  done
 fi
 [ "$HARNESS_SET" = 0 ] || [ -n "$NEW_HARNESS" ] || die "--harness requires a non-empty value"
 [ "$MODEL_SET" = 0 ] || [ -n "$NEW_MODEL" ] || die "--model requires a non-empty value"
@@ -1136,12 +1169,21 @@ record_note() {
     ship|scout)
       cp -p "$RELAUNCH_BRIEF" "$BRIEF_PRIOR" \
         || die "could not preserve task $ID's instructions before recording the progress note"
+      if [ -n "$TASK_FILE" ]; then
+        replace_task_section "$RELAUNCH_BRIEF" \
+          || die "could not put the new task from $TASK_FILE into task $ID's instructions"
+      fi
       {
         echo
         echo "## Progress note ($stamp)"
         echo
-        echo "This task was relaunched. Continue from here; the local copy and every"
-        echo "uncommitted change are exactly as the previous worker left them."
+        if [ -n "$TASK_FILE" ]; then
+          echo "This task was relaunched with the new task above (role: $ROLE). The local"
+          echo "copy and every uncommitted change are exactly as the previous worker left them."
+        else
+          echo "This task was relaunched. Continue from here; the local copy and every"
+          echo "uncommitted change are exactly as the previous worker left them."
+        fi
         echo
         inbox_q=$(printf '%s' "$STATE/$ID.inbox" | sed "s/'/'\\\\''/g")
         echo "First, check your instruction inbox: list it with"
@@ -1154,6 +1196,24 @@ record_note() {
         || die "could not append the progress note to task $ID's instructions"
       ;;
   esac
+}
+
+# replace_task_section <brief>: swap the body of the unfenced `# Task` section
+# (through the next unfenced level-1 heading) for the --task-file content, so
+# the scaffold around it - setup, rules, definition of done - stays as it was.
+replace_task_section() {
+  local brief=$1 tmp="$1.task.${BASHPID:-$$}"
+  printf '%s\n' "$TASK_BODY" | awk -v taskfile=/dev/stdin '
+    BEGIN { while ((getline l < taskfile) > 0) body = body l "\n" }
+    {
+      if ($0 ~ /^ ? ? ?(```|~~~)/) fenced = !fenced
+      if (!fenced && $0 == "# Task" && !done) { print; printf "%s\n", body; skip = 1; done = 1; next }
+      if (skip && !fenced && $0 ~ /^# /) skip = 0
+      if (!skip) print
+    }
+    END { if (!done) exit 3 }
+  ' "$brief" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$brief" || { rm -f "$tmp"; return 1; }
 }
 
 do_relaunch() {
@@ -1178,6 +1238,8 @@ do_relaunch() {
     secondmate)
       # The charter in the secondmate's own home is its instruction source and
       # stays untouched.
+      [ -z "$TASK_FILE" ] \
+        || die "--task-file applies to a ship or scout; a secondmate's charter is its standing instructions"
       RELAUNCH_BRIEF=
       ;;
     *)
@@ -1242,6 +1304,10 @@ do_relaunch() {
 
   journal_write complete "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
   RELAUNCH_ACTIVE=0
+  if [ -n "$ROLE" ]; then
+    printf 'working [at=%s] [role=%s]: relaunched with a new task\n' "$(date +%s)" "$ROLE" >> "$STATE/$ID.status" \
+      || echo "warning: $ID relaunched, but its status file did not take the role=$ROLE line" >&2
+  fi
   echo "relaunched $ID harness=$TARGET_HARNESS from=$PRIOR_RECORDED_HARNESS model=$TARGET_MODEL effort=$TARGET_EFFORT backend=$BACKEND endpoint=$T worktree=$WT"
 }
 

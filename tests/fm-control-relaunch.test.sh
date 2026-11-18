@@ -640,6 +640,45 @@ test_relaunch_note_inbox_listing_is_safe_on_empty_inbox() {
   pass "fm-control relaunch: the progress note's inbox listing is silent on an empty inbox"
 }
 
+test_relaunch_with_a_task_file_swaps_the_task_and_records_the_role() {
+  local dir out rc brief task
+  dir=$(new_case newtask rl2c)
+  add_ship_task "$dir" rl2c claude
+  printf '%s\n' '# Rules' 'Keep this scaffold line.' >> "$dir/home/data/rl2c/brief.md"
+  task="$dir/new-task.md"
+  printf '%s\n' "## Captain's intent" 'Review the parser PR instead.' '' '## Firstmate spec' 'Report findings only.' > "$task"
+  out=$(run_control "$dir" rl2c relaunch --note "old task shipped" --task-file "$task" --role review); rc=$?
+  expect_code 0 "$rc" "relaunch with a new task should succeed"$'\n'"$out"
+  brief="$dir/home/data/rl2c/brief.md"
+  assert_grep "Review the parser PR instead." "$brief" "the new task must reach the replacement's instructions"
+  assert_no_grep "Exercise relaunch behavior for rl2c." "$brief" "the old task must leave the instructions"
+  assert_grep "Keep this scaffold line." "$brief" "the scaffold around the task must stay"
+  [ "$(grep -c '^# Task$' "$brief")" = 1 ] || fail "the instructions must keep one # Task section"
+  assert_grep "role: review" "$brief" "the progress note should name the new role"
+  assert_grep '[role=review]: relaunched with a new task' "$dir/home/state/rl2c.status" \
+    "the status file should record the new role once the replacement runs"
+  pass "fm-control relaunch: --task-file swaps the task and --role lands in the status"
+}
+
+test_relaunch_task_file_refusals_leave_everything_untouched() {
+  local dir out rc before task
+  dir=$(new_case badtask rl2d)
+  add_ship_task "$dir" rl2d claude
+  before=$(cat "$dir/home/data/rl2d/brief.md")
+  task="$dir/new-task.md"
+  printf '%s\n' "## Captain's intent" 'Only intent, no spec.' > "$task"
+  out=$(run_control "$dir" rl2d relaunch --note n --task-file "$task" --role review); rc=$?
+  expect_code 1 "$rc" "a task file without a spec should refuse"
+  assert_contains "$out" "Firstmate spec" "the refusal should name the missing section"
+  out=$(run_control "$dir" rl2d relaunch --note n --task-file "$task"); rc=$?
+  expect_code 1 "$rc" "a task file without a role should refuse"
+  assert_contains "$out" "go together" "the refusal should say the two flags pair"
+  [ "$(cat "$dir/home/data/rl2d/brief.md")" = "$before" ] || fail "a refused relaunch must not touch the instructions"
+  [ "$(cat "$dir/fake/command")" = claude ] || fail "a refused relaunch must not stop the agent"
+  [ ! -e "$dir/home/state/rl2d.status" ] || fail "a refused relaunch must not record a role"
+  pass "fm-control relaunch: a malformed --task-file or a missing --role refuses before anything changes"
+}
+
 test_relaunch_requires_a_note_for_a_ship_task() {
   local dir out rc before
   dir=$(new_case nonote rl3)
@@ -3050,6 +3089,8 @@ test_relaunch_serializes_concurrent_durable_metadata_publication
 test_disabled_relaunch_clears_prior_trace_context
 test_relaunch_appends_the_progress_note_to_the_instructions
 test_relaunch_note_inbox_listing_is_safe_on_empty_inbox
+test_relaunch_with_a_task_file_swaps_the_task_and_records_the_role
+test_relaunch_task_file_refusals_leave_everything_untouched
 test_relaunch_requires_a_note_for_a_ship_task
 test_harness_switch_moves_the_record_and_clears_prior_wiring
 test_refused_relaunch_onto_polytoken_keeps_the_project_hook_layer
