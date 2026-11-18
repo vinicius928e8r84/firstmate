@@ -134,4 +134,41 @@ gate "$T0" bogus
 expect_code 2 "$CODE" "an unknown command is an error"
 pass "summary gate: an unknown kind or unwritable state exits 2 and never says suppress"
 
+# 6. compose: the single path to the captain. Open worker questions come first,
+# an identical draft is silent, and a summary is still held to the hour.
+CH="$TMP_ROOT/chome"
+mkdir -p "$CH/state"
+compose() {  # <epoch> <kind> <draft> -> OUT, CODE
+  OUT=$(printf '%s' "$3" | FM_HOME="$CH" FM_SUMMARY_GATE_NOW="$1" "$TOOL" compose "$2" 2>&1)
+  CODE=$?
+}
+printf 'needs-decision [key=api] [at=1]: REST or gRPC?\n' > "$CH/state/t1.status"
+printf 'done [at=2]: shipped\n' > "$CH/state/t2.status"
+compose "$T0" summary "all quiet"
+expect_code 0 "$CODE" "the first compose sends"
+assert_equals "Perguntas de worker abertas:
+- t1 [api] (needs-decision): REST or gRPC?
+
+all quiet" "$OUT" "the open worker question comes before the draft, and a done task is not a question"
+compose "$((T0 + 60))" blocker "all quiet"
+expect_code 1 "$CODE" "an identical draft is suppressed even when urgent"
+assert_equals "" "$OUT" "a suppressed compose prints nothing"
+compose "$((T0 + 120))" blocker "disk full"
+expect_code 0 "$CODE" "a new urgent draft goes through inside the hour"
+assert_equals "disk full" "$OUT" "an already shown question is not repeated"
+compose "$((T0 + 180))" summary "new progress"
+expect_code 1 "$CODE" "a new summary inside the hour is held"
+printf 'blocked [key=ci] [at=3]: CI red\n' > "$CH/state/t3.status"
+compose "$((T0 + 240))" summary "new progress"
+expect_code 0 "$CODE" "a new question is shown even while the summary is held"
+assert_not_contains "$OUT" "new progress" "the held summary stays unsent"
+assert_contains "$OUT" "- t3 [ci] (blocked): CI red" "the new question is presented"
+printf 'resolved [key=api] [at=4]: REST\n' >> "$CH/state/t1.status"
+compose "$((T0 + 3600 + 1))" summary "new progress"
+expect_code 0 "$CODE" "the held summary goes out after the hour"
+assert_not_contains "$OUT" "t1 [api]" "a resolved question is not listed"
+compose "$T0" nonsense "x"
+expect_code 2 "$CODE" "compose with an unknown kind is an error"
+pass "summary gate: compose puts open worker questions first, silences identical drafts, and holds summaries to the hour"
+
 printf '# all fm-summary-gate tests passed\n'

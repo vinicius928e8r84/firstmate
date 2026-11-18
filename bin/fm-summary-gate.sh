@@ -6,6 +6,7 @@
 #   fm-summary-gate.sh decide <kind>   exit 0 and print `send`, or exit 1 and print `suppress`
 #   fm-summary-gate.sh status          print the last summary time and the seconds until the next is allowed
 #   fm-summary-gate.sh mark            record a summary as sent now (one that went out without `decide`)
+#   fm-summary-gate.sh compose <kind>  stdin = the draft message; stdout = exactly what to send the captain
 #
 # <kind> is one of:
 #   summary                   a routine progress or monitoring summary: rate limited
@@ -25,6 +26,17 @@
 # as no summary yet. Treat only an explicit `suppress` as silence: an unknown kind or any
 # error exits 2 and the caller must send, so a broken gate can never swallow a
 # message the captain needs.
+#
+# `compose <kind>` is the one path a captain-bound message takes. Send exactly
+# its stdout; empty stdout with exit 1 means say nothing. It (1) puts every
+# still-open worker question (a needs-decision or blocked status line nobody
+# resolved, read through bin/fm-classify-lib.sh) first, until it has been shown
+# once; (2) drops a draft identical (whitespace aside) to the last one sent, so
+# a repeated notice is silent by code; (3) holds a `summary` draft to the hourly
+# `decide` rule, while merge-ready, blocker, and decision drafts are never held.
+# The last sent draft and question block are hashed in state/.last-sent-msg and
+# state/.last-sent-questions. An error exits 2 and the caller must send the
+# draft as written.
 #
 # Environment: FM_HOME (default: the code root), FM_STATE_OVERRIDE,
 # FM_SUMMARY_GATE_NOW (fixed epoch, tests).
@@ -102,8 +114,67 @@ lock_acquire() {
   trap lock_release EXIT
 }
 
+# <now> -> success iff a summary may go out now; records the mark when it may.
+# The caller holds the lock.
+summary_may_send() {
+  local last
+  last=$(last_summary "$1")
+  if [ "$last" -gt 0 ] && [ "$(($1 - last))" -lt "$GATE_SECS" ]; then return 1; fi
+  write_mark "$1"
+}
+
+hash_text() {  # stdin -> checksum of its whitespace-normalised text
+  tr -s '[:space:]' ' ' | cksum | cut -d' ' -f1,2
+}
+
+# One "- <task> [<key>] (<verb>): <note>" line per still-open worker question.
+open_questions() {
+  local f task key verb note open
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/fm-classify-lib.sh" || return 1
+  for f in "$STATE"/*.status; do
+    [ -f "$f" ] || continue
+    task=$(basename "$f" .status)
+    open=$(status_open_decisions "$f") || continue
+    while IFS=$'\t' read -r key verb note; do
+      case "$verb" in needs-decision|blocked) printf -- '- %s [%s] (%s): %s\n' "$task" "$key" "$verb" "$note" ;; esac
+    done <<EOF
+$open
+EOF
+  done
+}
+
+compose() {  # <kind>; the draft on stdin
+  local kind=$1 draft questions out='' now mh qh
+  case "$kind" in summary|merge-ready|blocker|decision) ;; *) die "unknown kind '$kind' (expected summary, merge-ready, blocker, or decision)" ;; esac
+  draft=$(cat)
+  questions=$(open_questions) || die "cannot read worker status"
+  lock_acquire
+  now=$(now_epoch)
+  if [ -n "$questions" ]; then
+    qh=$(printf '%s' "$questions" | hash_text)
+    if [ "$qh" != "$(cat "$STATE/.last-sent-questions" 2>/dev/null)" ]; then
+      out=$(printf 'Perguntas de worker abertas:\n%s' "$questions")
+      printf '%s\n' "$qh" > "$STATE/.last-sent-questions" || die "cannot write $STATE"
+    fi
+  fi
+  if [ -n "$(printf '%s' "$draft" | tr -d '[:space:]')" ]; then
+    mh=$(printf '%s' "$draft" | hash_text)
+    if [ "$mh" != "$(cat "$STATE/.last-sent-msg" 2>/dev/null)" ]; then
+      if [ "$kind" != summary ] || summary_may_send "$now"; then
+        printf '%s\n' "$mh" > "$STATE/.last-sent-msg" || die "cannot write $STATE"
+        out=${out:+$out$'\n\n'}$draft
+      fi
+    fi
+  fi
+  lock_release
+  [ -n "$out" ] || exit 1
+  printf '%s\n' "$out"
+}
+
 cmd=${1:-}
 case "$cmd" in
+  compose) compose "${2:-}" ;;
   decide)
     kind=${2:-}
     case "$kind" in
@@ -142,5 +213,5 @@ case "$cmd" in
   -h|--help)
     awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
     ;;
-  *) die "usage: fm-summary-gate.sh decide <kind> | status | mark" ;;
+  *) die "usage: fm-summary-gate.sh decide <kind> | status | mark | compose <kind>" ;;
 esac
