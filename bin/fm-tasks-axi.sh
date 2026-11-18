@@ -50,6 +50,15 @@
 #   - a markdown `<data>/backlog.md` that is itself a symlink, because the
 #     first write would replace the link with a private copy, exactly the fork
 #     this command exists to prevent. Lifecycle transitions refuse the same file.
+#
+# Duplicate warning: `add` (or `create`) first compares the new title, as a set
+# of lowercase words, with every delivered task - the live Done rows and the
+# markdown archive beside the backlog - and prints one stderr line per delivered
+# task whose title overlaps at least FM_TASKS_DUP_THRESHOLD percent (default 60,
+# Jaccard) naming its id and title. The add still proceeds: a warning, never a
+# refusal, so the captain decides and nothing legitimate is blocked. Set
+# FM_TASKS_DUP_CHECK=0 to skip the comparison.
+#
 # Otherwise the exit status is tasks-axi's own, unless decoding a read fails;
 # in that case the decoder's nonzero status is returned.
 set -u
@@ -129,6 +138,50 @@ done
 
 command -v tasks-axi >/dev/null 2>&1 || fail "tasks-axi is not on PATH; run bin/fm-bootstrap.sh for the install command"
 
+# Warn (stderr only) when a new title overlaps a delivered task's title.
+fm_tasks_dup_warn() {  # <args of the add command...>
+  local title='' skip=0 a pos=() archive live
+  [ "${FM_TASKS_DUP_CHECK:-1}" != 0 ] || return 0
+  shift
+  for a in "$@"; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$a" in
+      --kind|--repo|--body|--body-file|--blocked-by|--pr|--report|--priority|--prefix) skip=1 ;;
+      --*) ;;
+      *) pos+=("$a") ;;
+    esac
+  done
+  [ "${#pos[@]}" -gt 0 ] || return 0
+  title=${pos[${#pos[@]}-1]}
+  [ "${#pos[@]}" -ge 2 ] || case " $* " in *" --mint "*) ;; *) return 0 ;; esac
+  if [ -n "${FM_BACKLOG_AXI_FILE:-}" ]; then
+    archive="$(dirname "$FM_BACKLOG_AXI_FILE")/done-archive.md"
+  else
+    archive="$DATA/done-archive.md"
+  fi
+  live=$(tasks-axi list --state "done" --limit 1000 2>/dev/null || true)
+  {
+    printf '%s\n' "$live" | awk -F, '/^  [^ ]/ && NF >= 5 { id=$1; sub(/^ +/, "", id); t=$5; for (i=6;i<=NF;i++) t=t "," $i; print id "\t" t }'
+    [ -r "$archive" ] && awk '/^- \[x\] / { l=substr($0,7); i=index(l," - "); if (i>0) { id=substr(l,1,i-1); t=substr(l,i+3); sub(/ \(.*$/, "", t); print id "\t" t } }' "$archive"
+  } | awk -F'\t' -v q="$title" -v th="${FM_TASKS_DUP_THRESHOLD:-60}" '
+    function toks(s, arr,   n, i, w, parts) {
+      s = tolower(s); gsub(/[^a-z0-9]+/, " ", s); n = split(s, parts, " ")
+      for (i = 1; i <= n; i++) { w = parts[i]; if (length(w) >= 2 || w ~ /^[0-9]$/) arr[w] = 1 }
+    }
+    function size(arr,   k, c) { c = 0; for (k in arr) c++; return c }
+    BEGIN { toks(q, Q); nq = size(Q) }
+    {
+      delete R; toks($2, R); nr = size(R)
+      inter = 0; for (k in Q) if (k in R) inter++
+      un = nq + nr - inter
+      if (un > 0 && inter * 100 >= th * un && !($1 in seen)) {
+        seen[$1] = 1
+        printf "fm-tasks-axi: warning: possible duplicate of delivered task %s - \"%s\" - overlaps the new title; confirm with the captain before dispatching (the add proceeded)\n", $1, $2 > "/dev/stderr"
+      }
+    }'
+  return 0
+}
+
 FM_BACKLOG_TRANSITION_ERROR=
 if ! fm_backlog_tasks_axi_addressing "$DATA"; then
   fail "${FM_BACKLOG_TRANSITION_ERROR:-data directory cannot be resolved: $DATA}"
@@ -144,6 +197,11 @@ else
 fi
 
 cd "$FM_BACKLOG_AXI_ROOT" || fail "cannot enter the backlog root $FM_BACKLOG_AXI_ROOT"
+case "${1:-}" in
+  add|create)
+    fm_tasks_dup_warn "$@"
+    ;;
+esac
 case "${1:-}" in
   show|view|list)
     set -o pipefail

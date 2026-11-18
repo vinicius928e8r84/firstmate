@@ -165,6 +165,23 @@ test_wrapper_writes_through_to_home() {
   pass "fm-tasks-axi.sh writes, holds, archives, and reads relative body files through to the home from the code root"
 }
 
+test_add_warns_on_delivered_duplicate() {
+  local dir out rc
+  dir=$(make_split dup-warn)
+  wrapper_from_code "$dir" add wpn-1 "Painel shadcn do admin" >/dev/null || fail "add wpn-1 failed"
+  wrapper_from_code "$dir" start wpn-1 >/dev/null || fail "start wpn-1 failed"
+  wrapper_from_code "$dir" "done" wpn-1 >/dev/null || fail "done wpn-1 failed"
+  out=$(wrapper_from_code "$dir" add wft-1 "painel shadcn do admin (wft12)" 2>&1 >/dev/null); rc=$?
+  expect_code 0 "$rc" "a duplicate warning must never refuse the add"
+  assert_contains "$out" "possible duplicate of delivered task wpn-1" "the overlap with a delivered task was not warned"
+  assert_grep "wft-1" "$dir/home/data/backlog.md" "the warned add did not proceed"
+  out=$(wrapper_from_code "$dir" add other-1 "completely unrelated chore" 2>&1 >/dev/null)
+  assert_not_contains "$out" "duplicate" "an unrelated title was warned"
+  out=$(FM_TASKS_DUP_CHECK=0 wrapper_from_code "$dir" add wft-2 "painel shadcn do admin" 2>&1 >/dev/null)
+  assert_not_contains "$out" "duplicate" "FM_TASKS_DUP_CHECK=0 did not skip the comparison"
+  pass "fm-tasks-axi.sh add warns about a delivered near-duplicate title but still adds"
+}
+
 test_wrapper_overrides_ambient_file() {
   local dir
   dir=$(make_split wrapper-ambient)
@@ -245,6 +262,7 @@ test_guard_silent_for_single_home
 if [ "$HAVE_TASKS_AXI" = 1 ]; then
   test_bare_tasks_axi_fork_is_detected
   test_wrapper_writes_through_to_home
+  test_add_warns_on_delivered_duplicate
   test_wrapper_overrides_ambient_file
   test_wrapper_refusals
   test_wrapper_refuses_add_start

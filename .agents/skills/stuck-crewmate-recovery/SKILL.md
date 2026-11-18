@@ -1,7 +1,7 @@
 ---
 name: stuck-crewmate-recovery
 description: >-
-  Load when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer, after observing a defeated Claude or Codex bypass, and when a live crewmate reports its no-mistakes pipeline dead, unreachable, or timed out.
+  Load when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer, after observing a defeated Claude or Codex bypass, when a crewmate declines its task on safety grounds, and when a live crewmate reports its no-mistakes pipeline dead, unreachable, or timed out.
 user-invocable: false
 metadata:
   internal: true
@@ -18,6 +18,12 @@ Interrupt, stop, and relaunch a worker through `bin/fm-control.sh <task-id> inte
 That plane covers workers running in this home; a remotely placed secondmate is refused by name and reconciled through `secondmate-provisioning` instead.
 Load `harness-adapters` before a resume command or a harness-specific skill invocation, and whenever the adapter's own quirks matter.
 The target window's harness is recorded as `harness=` in `state/<id>.meta`.
+
+## Reasoned safety refusal
+
+A crewmate that declines its task with a stated safety reason (circumventing a third party's verification, handling other people's identities, and the like) has not stalled, so do not redispatch, rewrite the brief to soften its wording, or hand the task to another worker.
+Close the task, record the refusal and its reason, and escalate to the captain with `needs-decision`, recommending against running it.
+Only the captain's explicit instruction reopens it, and then as a new task; `bin/fm-send.sh --override-open-decision <reason>` is the audited way to steer a task past its own open blocker.
 
 ## Managed approval failover
 
