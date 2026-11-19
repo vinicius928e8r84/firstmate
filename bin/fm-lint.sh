@@ -215,8 +215,10 @@ fm_lint_classify_root() {  # <rc> <root-stderr-file>
         # The perl watchdog exits 124 on its own bound, so a bare 137 is a real
         # SIGKILL of the child; GNU/BSD timeout instead report 137 when their
         # configured kill had to fire at the bound.
+        # With nothing of ours having killed it, that SIGKILL is the kernel
+        # OOM killer, so it is a memory failure and takes the lighter retry.
         if [ "${FM_LINT_INTERNAL_BOUNDED:-}" = perl ]; then
-          printf 'signal:KILL\n'; return 0
+          printf 'memory\n'; return 0
         fi
         printf 'timeout\n'; return 0
         ;;

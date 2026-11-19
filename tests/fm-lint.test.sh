@@ -1632,6 +1632,51 @@ SH
   pass "memory failures retry without source following, exclude cross-file codes, and preserve a real fallback finding"
 }
 
+test_oom_sigkill_falls_back_without_external_sources() {
+  if ! fm_lint_bounds_supported; then
+    pass "SKIP (host cannot enforce the bounded envelope): OOM SIGKILL fallback check"
+    return
+  fi
+  local tmp fakebin fixture log out rc
+  tmp=$(fm_test_tmproot fm-lint-oom-sigkill)
+  fakebin=$(fm_fakebin "$tmp")
+  fixture="$tmp/spawn.sh"
+  log="$tmp/flags.log"
+  printf '#!/usr/bin/env bash\n# shellcheck source=lib.sh\nexit 0\n' > "$fixture"
+  # The kernel OOM killer ends the source-following run with SIGKILL (rc=137),
+  # leaving no runtime memory message; the light run is clean.
+  cat > "$fakebin/shellcheck" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf 'ShellCheck - shell script analysis tool\nversion: 0.11.0\n'
+  exit 0
+fi
+for arg in "$@"; do
+  if [ "$arg" = --external-sources ]; then
+    printf 'follow\n' >> "$FM_TEST_ATTEMPT_LOG"
+    kill -KILL $$
+  fi
+done
+printf 'fallback\n' >> "$FM_TEST_ATTEMPT_LOG"
+exit 0
+SH
+  chmod +x "$fakebin/shellcheck"
+  : > "$log"
+  rc=0
+  out=$(PATH="$fakebin:$PATH" FM_LINT_JOBS=1 FM_LINT_REQUIRE_BOUNDS=1 \
+    FM_TEST_ATTEMPT_LOG="$log" "$LINT" --telemetry "$tmp/t.tsv" "$fixture" 2>&1) || rc=$?
+  [ "$rc" -eq 0 ] || fail "an OOM SIGKILL did not fall back to the lighter mode (exit $rc)"$'\n'"$out"
+  [ "$(cat "$log")" = "$(printf 'follow\nfallback')" ] \
+    || fail "the SIGKILLed root did not retry once without external sources"$'\n'"$(cat "$log")"
+  assert_contains "$out" "hit the memory ceiling with --external-sources (reason=memory rc=137)" \
+    "the SIGKILL fallback was not disclosed"
+  assert_contains "$out" "fallback passed with cross-file codes excluded" \
+    "the narrower fallback result was not disclosed"
+  awk -F '\t' '$1 == "end" && $3 ~ /spawn\.sh$/ && $9 == 0 && $10 == "memory-fallback" { found=1 } END { exit !found }' \
+    "$tmp/t.roots.tsv" || fail "the SIGKILL fallback was not recorded as memory-fallback"
+  pass "a SIGKILLed source-following root falls back to the lighter mode with a warning"
+}
+
 test_memory_fallback_spends_only_the_remaining_root_deadline() {
   if ! fm_lint_bounds_supported; then
     pass "SKIP (host cannot enforce the bounded envelope): fallback deadline check"
@@ -2052,6 +2097,7 @@ test_worker_trees_stop_on_signal
 test_root_deadline_names_the_root_and_reaps_the_tree
 test_root_memory_limit_reports_a_named_death
 test_memory_failure_retries_without_external_sources
+test_oom_sigkill_falls_back_without_external_sources
 test_memory_fallback_spends_only_the_remaining_root_deadline
 test_memory_evidence_outranks_findings_and_signal_reasons
 test_source_excerpt_with_oom_text_stays_findings
