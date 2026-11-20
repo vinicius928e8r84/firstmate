@@ -445,7 +445,7 @@ family_for_basename() {
     fm-remote-entrypoint.test.sh|fm-remote-secondmate-parent-binding.test.sh|\
     fm-send-remote-delivery.test.sh|fm-spawn-pool-base-freshen.test.sh|\
     fm-test-fixture-cleanup.test.sh|fm-test-fixtures.test.sh|\
-    fm-fleet-card.test.sh|\
+    fm-fleet-card.test.sh|fm-cloudroom.test.sh|\
     fm-voice-relay.test.sh|fm-wake-drain-open-decisions-cursor.test.sh|\
     fm-wake-drain-merge-ready.test.sh|fm-wake-drain-open-decisions.test.sh|fm-wake-drain-outcome-backstop.test.sh|\
     fm-wake-drain-probe.test.sh)
@@ -748,6 +748,7 @@ tests/fm-claude-budget.test.sh 13083
 tests/fm-claude-stop-autoarm-live-e2e.test.sh 73
 tests/fm-claude-stop-autoarm.test.sh 61189
 tests/fm-claude-trust.test.sh 12010
+tests/fm-cloudroom.test.sh 1500
 tests/fm-cmux-claude-composer-live-e2e.test.sh 77
 tests/fm-codex-continuity-live-e2e.test.sh 108
 tests/fm-codex-hook-layer-live-e2e.test.sh 108

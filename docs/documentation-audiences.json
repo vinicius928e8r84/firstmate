@@ -629,6 +629,14 @@
     {
       "path": ".agents/skills/validation-supervision/SKILL.md",
       "audience": "agent-runtime"
+    },
+    {
+      "path": "docs/cloudroom-backend.md",
+      "audience": "operator-current"
+    },
+    {
+      "path": ".agents/skills/firstmate-cloudroom/SKILL.md",
+      "audience": "agent-runtime"
     }
   ]
 }
