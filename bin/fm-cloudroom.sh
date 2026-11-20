@@ -90,7 +90,7 @@ $(cat "$task")
 
 # Setup
 Repository: $repo
-Clone it under /code (\`gh repo clone\` or \`git clone\`), cd into it, and work there. Install only what the task needs.
+Clone it fresh into \`\$HOME/fm-$id\` (\`gh repo clone $repo \$HOME/fm-$id\`), cd into it, and work only there. Ignore any copy already under /code: it is a stale snapshot without git history. Install only what the task needs.
 $deliver
 
 # Status reporting (mandatory)

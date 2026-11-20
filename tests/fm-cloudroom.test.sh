@@ -53,6 +53,7 @@ test_spawn_records_meta_and_refuses_duplicate() {
   assert_contains "$(cat "$FAKE_ROOM_LOG")" "--model haiku" "spawn passes the model"
   assert_contains "$(cat "$FAKE_ROOM_LOG")" "--reasoning-level low" "spawn passes the effort"
   assert_contains "$(cat "$FM_HOME/data/t1/cloudroom-prompt.md")" "Fix the flaky login test." "prompt embeds the task"
+  assert_contains "$(cat "$FM_HOME/data/t1/cloudroom-prompt.md")" "gh repo clone you/app \$HOME/fm-t1" "prompt clones fresh"
 
   # A second spawn of the same id refuses.
   if "$CR" spawn t1 --repo you/app --task-file "$TMP_ROOT/task.md" >/dev/null 2>&1; then
