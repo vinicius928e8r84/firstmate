@@ -184,6 +184,10 @@ sync_one() {  # <id>: append status lines from the newest reply, once per reply
   out=$("$ROOM" thread output "$thr" 2>/dev/null) || { echo "$id: unreadable (room-cli thread output failed)" >&2; return 1; }
   state=$(printf '%s' "$out" | jq -r '.state // "unknown"')
   reply=$(printf '%s' "$out" | jq -r '.reply // ""')
+  # Only a finished turn is read: a mid-turn reply is partial and may still grow.
+  case "$state" in
+    running|working|active|queued|starting) echo "$id: $state (turn in progress)"; return 0 ;;
+  esac
   [ -n "$reply" ] || { echo "$id: $state (no reply yet)"; return 0; }
   hash=$(printf '%s' "$reply" | cksum | cut -d' ' -f1)
   seen="$STATE/$id.cloudroom-seen"
@@ -191,7 +195,7 @@ sync_one() {  # <id>: append status lines from the newest reply, once per reply
     echo "$id: $state (no new reply)"; return 0
   fi
   lines=$(printf '%s\n' "$reply" | sed 's/^[[:space:]]*//' | grep -E "$STATUS_RE" || true)
-  if [ -z "$lines" ] && [ "$state" != working ]; then
+  if [ -z "$lines" ]; then
     lines="blocked [at=$(date +%s)]: worker ended a turn without a status line; read it with fm-cloudroom.sh peek $id"
   fi
   if [ -n "$lines" ]; then
@@ -203,8 +207,7 @@ sync_one() {  # <id>: append status lines from the newest reply, once per reply
     printf '%s\n' "$reply" > "$DATA/$id/report.md"
     echo "$id: report saved to $DATA/$id/report.md"
   fi
-  # Only a finished turn is final; a mid-turn reply may still grow.
-  [ "$state" = working ] || echo "$hash" >> "$seen"
+  echo "$hash" >> "$seen"
 }
 
 cmd_sync() {

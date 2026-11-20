@@ -75,6 +75,12 @@ test_sync_appends_once_and_flags_missing_status() {
   after=$(wc -l < "$STATE/t1.status")
   [ "$before" = "$after" ] && : "sync does not re-append a seen reply" || fail "sync does not re-append a seen reply"
 
+  # A mid-turn reply is never read, even without a status line.
+  reply running 'Now branch protection, rulesets, merge settings.'
+  out=$("$CR" sync t1)
+  assert_contains "$out" "turn in progress" "sync skips a running turn"
+  assert_not_contains "$(tail -n 1 "$STATE/t1.status")" "blocked" "running turn is not flagged blocked"
+
   # A finished turn with no status line becomes a blocked event.
   reply idle 'I did some stuff.'
   "$CR" sync t1 >/dev/null
