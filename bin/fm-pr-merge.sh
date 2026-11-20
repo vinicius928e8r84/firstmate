@@ -1057,9 +1057,15 @@ github_read_required_contexts() {
 }
 
 github_required_checks_missing() {
-  local json=$1 required=$2 producers=$3
-  printf '%s' "$json" | jq -r --argjson required "$required" --argjson producers "$producers" '
-    if (.statusCheckRollup | type) != "array" then error("no check rollup") else . end
+  local json=$1 required=$2 producers=$3 tmp rc=0
+  # Producers and requirements travel in files: a head with many check runs
+  # makes them too large for one argv word (Linux caps one at 128 KB).
+  tmp=$(mktemp -d) || return 1
+  printf '%s' "$required" > "$tmp/required"
+  printf '%s' "$producers" > "$tmp/producers"
+  printf '%s' "$json" | jq -r --slurpfile required_file "$tmp/required" --slurpfile producers_file "$tmp/producers" '
+    $required_file[0] as $required | $producers_file[0] as $producers
+    | if (.statusCheckRollup | type) != "array" then error("no check rollup") else . end
     | .statusCheckRollup as $reported
     | $required
     | map(. as $requirement
@@ -1073,7 +1079,9 @@ github_required_checks_missing() {
             .context == $requirement.context
           end) | not)
       | .context) | unique[]
-  ' 2>/dev/null || return 1
+  ' 2>/dev/null || rc=1
+  rm -rf "$tmp"
+  return "$rc"
 }
 
 # Pre-merge conditions from a live PR view, base requirements, and head producers.
@@ -1185,7 +1193,7 @@ EOF
       || ! producers=$(printf '%s' "$runs" | jq -sc --arg head "$live_head" '
         [ .[] | if (.check_runs | type) == "array" then .check_runs[] else error("invalid check runs") end
           | if (.name | type) == "string" and (.app.id | type) == "number" and .head_sha == $head
-            then . else error("invalid check producer") end ]' 2>/dev/null); then
+            then {name, app: {id: .app.id}} else error("invalid check producer") end ]' 2>/dev/null); then
       producers='[]'
       refusals="$refusals  - required check producers at head $live_head could not be read
 "

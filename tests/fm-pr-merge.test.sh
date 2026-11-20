@@ -4437,6 +4437,35 @@ test_required_producer_identity() {
   pass "fm-pr-merge enforces required producer identity and named waivers"
 }
 
+# A head with many check runs must not push the producer list past the
+# single-argument size limit: 2000 runs is well over 400 KB of raw check runs.
+test_required_producers_survive_a_very_large_check_run_list() {
+  local case_dir head kind
+  head=a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8
+  for kind in classic ruleset; do
+    case_dir=$(make_case "required-producer-large-$kind")
+    add_gh_mocks "$case_dir" "$head"
+    write_github_required "$case_dir" "$kind:ci"
+    if [ "$kind" = classic ]; then
+      jq '.protection.required_status_checks.checks[0].app_id = 15368' \
+        "$case_dir/github-branch.json" > "$case_dir/updated.json"
+      mv "$case_dir/updated.json" "$case_dir/github-branch.json"
+    else
+      jq '.[1].parameters.required_status_checks[0].integration_id = 15368' \
+        "$case_dir/github-required-rules.json" > "$case_dir/updated.json"
+      mv "$case_dir/updated.json" "$case_dir/github-required-rules.json"
+    fi
+    jq -n --arg head "$head" '{check_runs: ([range(0; 2000) | {name: ("job-\(.)"), app: {id: 15368, slug: "github-actions", description: ("x" * 120)}, head_sha: $head, output: {summary: ("y" * 80)}}]
+      + [{name: "ci", app: {id: 15368}, head_sha: $head}])}' > "$case_dir/github-runs.json"
+    [ "$(wc -c < "$case_dir/github-runs.json")" -gt 400000 ] || fail "large producer fixture is under 400 KB"
+    run_required_case "$case_dir" 112 --attended-override -- --admin
+    expect_code 0 "$RC" "large-producers-$kind: $(cat "$case_dir/stderr")"
+    assert_no_grep 'check rollup could not be read' "$case_dir/stderr" "large producer list broke the rollup read"
+    assert_grep 'pr merge' "$case_dir/gh.log" "large producer list did not merge"
+  done
+  pass "fm-pr-merge reads required producers from a check-run list above 400 KB"
+}
+
 # A commit status carries no app id to compare, so an app-bound required context
 # that arrives as a green status matches by name, while the same context left
 # unreported still refuses.
@@ -4968,6 +4997,7 @@ test_allow_missing_waives_only_the_named_unreported_check
 test_allow_missing_follows_the_allow_red_rules
 
 test_required_producer_identity
+test_required_producers_survive_a_very_large_check_run_list
 test_app_bound_required_status_context_matches_by_name
 test_required_partial_reads_report_all_failures
 test_allow_red_refused_on_forgejo
