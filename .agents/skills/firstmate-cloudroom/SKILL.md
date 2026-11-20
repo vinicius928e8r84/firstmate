@@ -17,6 +17,7 @@ Inside Cloudroom, a crewmate is a Cloudroom child thread with its own cloud sand
 ## Boundary
 
 - Cloudroom forbids starting `claude`, `codex`, or any agent CLI from a shell in its sandbox, and forbids harness-native subagents. So in a Cloudroom primary, never use `bin/fm-spawn.sh` with a local terminal backend; dispatch every local crewmate through `bin/fm-cloudroom.sh spawn`.
+- The supervision host also launches a background agent CLI, so a Cloudroom home keeps `config/supervision-host-off` present; create it at session start when missing.
 - Remote secondmates on SSH hosts (the VPS fleet) keep their ordinary path: `secondmate-provisioning`, `fm-on.sh`, `fm-send.sh`. Their own workers stay on that host.
 - Each cloud worker spends the captain's Cloud Credits; check `room-cli usage` before a large fan-out and mention cost when much is running.
 

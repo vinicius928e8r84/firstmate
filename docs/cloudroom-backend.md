@@ -32,6 +32,7 @@ Cloudroom messages the parent thread whenever a child finishes a turn, which is 
 - Ship tasks deliver as `direct-PR`; `no-mistakes` and `local-only` need a local worktree.
 - No secondmate spawns through Cloudroom; remote secondmates use SSH.
 - A cloud sandbox stops background jobs after two hours, so the bash watcher is not a durable wake source there; the Cloudroom completion message is.
+- The [supervision host](supervision-host.md) starts a background agent CLI, which Cloudroom forbids; a Cloudroom home runs with `config/supervision-host-off`.
 - Workers spend Cloud Credits.
 
 ## Verification
